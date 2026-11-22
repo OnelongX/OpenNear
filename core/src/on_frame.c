@@ -152,6 +152,71 @@ on_err_t on_frame_pack(const on_mac_hdr_t *hdr,
     return ON_OK;
 }
 
+on_err_t on_frame_pack_implicit(const on_mac_hdr_t *hdr,
+                                const uint8_t *payload, size_t payload_len,
+                                uint8_t *out_buf, size_t out_cap, size_t *out_len) {
+    if (!hdr || !out_buf || !out_len) return ON_ERR_INVALID_ARG;
+    if (payload_len > ON_MAX_PAYLOAD_LEN) return ON_ERR_TOO_LONG;
+    size_t total = ON_IMPLICIT_HDR_LEN + payload_len + ON_PAYLOAD_CRC_LEN;
+    if (out_cap < total) return ON_ERR_NO_MEM;
+
+    uint8_t virt6[ON_MAC_HDR_LEN];
+    on_err_t rc = on_hdr_pack(hdr, virt6);
+    if (rc != ON_OK) return rc;
+
+    /* Byte 0: [7:4] sf_seq_low | [3:2] type[1:0] | [1] sec_en | [0] is_sub_g */
+    out_buf[0] = (uint8_t)(((hdr->sf_seq_low & 0x0Fu) << 4) |
+                           ((hdr->type & 0x03u) << 2)       |
+                           ((hdr->sec_en ? 1u : 0u) << 1)   |
+                           (hdr->is_sub_g ? 1u : 0u));
+    /* Byte 1: Virtual Hdr_CRC8 covering (src_id, dst_id, slot_idx, sf_seq_low, FrameCtrl) */
+    out_buf[1] = virt6[5];
+
+    if (payload_len > 0u) {
+        if (!payload) return ON_ERR_INVALID_ARG;
+        memcpy(out_buf + ON_IMPLICIT_HDR_LEN, payload, payload_len);
+    }
+    uint16_t crc16 = on_crc16_ccitt(out_buf + ON_IMPLICIT_HDR_LEN, payload_len);
+    put_u16_le(out_buf + ON_IMPLICIT_HDR_LEN + payload_len, crc16);
+    *out_len = total;
+    return ON_OK;
+}
+
+on_err_t on_frame_unpack_implicit(const uint8_t *in_buf, size_t in_len,
+                                  uint16_t implied_src_id, uint16_t implied_dst_id,
+                                  uint8_t implied_slot_idx,
+                                  on_mac_hdr_t *hdr,
+                                  const uint8_t **payload_ptr, size_t *payload_len) {
+    if (!in_buf || !hdr || !payload_ptr || !payload_len) return ON_ERR_INVALID_ARG;
+    if (in_len < ON_IMPLICIT_HDR_LEN + ON_PAYLOAD_CRC_LEN) return ON_ERR_TOO_SHORT;
+
+    hdr->version    = ON_PROTO_VERSION;
+    hdr->sf_seq_low = (uint8_t)((in_buf[0] >> 4) & 0x0Fu);
+    hdr->type       = (uint8_t)((in_buf[0] >> 2) & 0x03u);
+    hdr->sec_en     = ((in_buf[0] >> 1) & 0x01u) != 0u;
+    hdr->is_sub_g   = (in_buf[0] & 0x01u) != 0u;
+    hdr->src_id     = implied_src_id & ON_SHORT_ID_MASK;
+    hdr->dst_id     = implied_dst_id & ON_SHORT_ID_MASK;
+    hdr->slot_idx   = implied_slot_idx & 0x0Fu;
+
+    uint8_t virt6[ON_MAC_HDR_LEN];
+    on_hdr_pack(hdr, virt6);
+    if (in_buf[1] != virt6[5]) {
+        return ON_ERR_HDR_CRC;
+    }
+
+    size_t plen = in_len - ON_IMPLICIT_HDR_LEN - ON_PAYLOAD_CRC_LEN;
+    uint16_t rx_crc   = get_u16_le(in_buf + ON_IMPLICIT_HDR_LEN + plen);
+    uint16_t calc_crc = on_crc16_ccitt(in_buf + ON_IMPLICIT_HDR_LEN, plen);
+    if (rx_crc != calc_crc) {
+        return ON_ERR_PAY_CRC;
+    }
+
+    *payload_ptr = in_buf + ON_IMPLICIT_HDR_LEN;
+    *payload_len = plen;
+    return ON_OK;
+}
+
 on_err_t on_frame_unpack(const uint8_t *in_buf, size_t in_len,
                          on_mac_hdr_t *hdr,
                          const uint8_t **payload_ptr, size_t *payload_len) {

@@ -120,6 +120,24 @@ on_err_t on_frame_unpack(const uint8_t *in_buf, size_t in_len,
                          on_mac_hdr_t *hdr,
                          const uint8_t **payload_ptr, size_t *payload_len);
 
+/*
+ * v4.0 NearLink SLB-Style 2-Byte Implicit-Address TDMA Frame Codec:
+ * Elides the 24-bit (src_id, dst_id) and slot_idx from the air inside bound D-TDMA slots,
+ * shrinking the MAC header from 6 bytes to 2 bytes (66.7% header reduction) while binding
+ * implied_src_id, implied_dst_id, and implied_slot_idx into Byte 1's virtual Hdr_CRC8!
+ */
+#define ON_IMPLICIT_HDR_LEN  2u
+
+on_err_t on_frame_pack_implicit(const on_mac_hdr_t *hdr,
+                                const uint8_t *payload, size_t payload_len,
+                                uint8_t *out_buf, size_t out_cap, size_t *out_len);
+
+on_err_t on_frame_unpack_implicit(const uint8_t *in_buf, size_t in_len,
+                                  uint16_t implied_src_id, uint16_t implied_dst_id,
+                                  uint8_t implied_slot_idx,
+                                  on_mac_hdr_t *hdr,
+                                  const uint8_t **payload_ptr, size_t *payload_len);
+
 /* Typed payload codecs (little-endian wire encoding) */
 on_err_t on_sync_payload_pack(const on_sync_payload_t *p, uint8_t *out, size_t cap, size_t *len);
 on_err_t on_sync_payload_unpack(const uint8_t *in, size_t len, on_sync_payload_t *p);

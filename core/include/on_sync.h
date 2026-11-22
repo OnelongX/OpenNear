@@ -34,10 +34,13 @@ typedef struct {
     int64_t  link_delay_ns;
     int64_t  ant_delay_ns;    /* v3.1: Calibrated board-level RF balun/antenna group delay */
 
-    /* PI Controller tuning */
-    double   kp;              /* Proportional phase gain (0..1) */
-    double   ki;              /* Integral frequency gain (ppb per ns error per second) */
-    double   max_rate_ppb;    /* Clamp for crystal tolerance (default +/- 200,000 ppb = +/- 200 ppm) */
+    /* PI + Second-Order Alpha-Beta-Gamma (Thermal Drift Acceleration) Controller */
+    double   kp;                /* Proportional phase gain (0..1) */
+    double   ki;                /* Integral frequency gain (ppb per ns error per second) */
+    double   ka;                /* v4.0: Second-order thermal drift-acceleration gain (ppb/s) */
+    double   drift_accel_ppb_s; /* v4.0: Tracked crystal frequency drift rate (ppb/s) */
+    bool     accel_en;          /* v4.0: Enable 3-state [phase, skew, drift_accel] tracking */
+    double   max_rate_ppb;      /* Clamp for crystal tolerance (default +/- 200,000 ppb = +/- 200 ppm) */
 
     /* Telemetry */
     int64_t  last_err_ns;
@@ -83,6 +86,13 @@ void    on_sync_on_missed_beacon(on_sync_ctx_t *ctx);
  */
 void    on_sync_apply_followup(on_sync_ctx_t *ctx, int16_t prev_tx_err_ns);
 void    on_sync_set_ant_delay_ns(on_sync_ctx_t *ctx, int64_t ant_delay_ns);
+
+/*
+ * v4.0 Second-Order Alpha-Beta-Gamma Clock Drift-Acceleration Tracker:
+ * Tracks [phase_offset_ns, rate_ppb, drift_accel_ppb_s] to eliminate quadratic holdover error
+ * during rapid crystal thermal ramping (e.g. cold boot or continuous PA TX heating).
+ */
+void    on_sync_enable_accel_tracker(on_sync_ctx_t *ctx, bool enable, double ka);
 
 #ifdef __cplusplus
 }

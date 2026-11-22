@@ -45,6 +45,33 @@ uint32_t   on_sf_subg_cra_start_us(const on_sf_cfg_t *cfg);
 /* C-RA micro-slot timing (micro_slot = 0 or 1) */
 uint32_t   on_sf_cra_slot_start_us(const on_sf_cfg_t *cfg, uint8_t micro_slot);
 
+/*
+ * v4.0 Multi-Gear Dynamic Superframe Profiles (NearLink SLB/SLE multi-rate scheduling):
+ * - ON_SF_GEAR_FAST_500US : 500 us (2,000 Hz) ultra-low-latency 2k/4k esports HID / control
+ * - ON_SF_GEAR_AUDIO_1MS  : 1,000 us (1,000 Hz) lossless spatial audio & industrial PLC
+ * - ON_SF_GEAR_MESH_4MS   : 4,000 us (250 Hz) full 4-phase multi-hop Sub-G & low-power sensor
+ */
+typedef enum {
+    ON_SF_GEAR_FAST_500US = 0,
+    ON_SF_GEAR_AUDIO_1MS  = 1,
+    ON_SF_GEAR_MESH_4MS   = 2
+} on_sf_gear_t;
+
+on_err_t   on_sf_cfg_set_gear(on_sf_cfg_t *cfg, on_sf_gear_t gear);
+
+/*
+ * v4.0 Dynamic Super-Slot Aggregation:
+ * Checks how many contiguous idle D-TDMA slots starting at `own_slot` can be merged into
+ * a single burst Super-Slot (up to `max_merge`) without colliding with allocated peers.
+ */
+uint8_t    on_sf_max_contiguous_slots(const on_sf_cfg_t *cfg,
+                                      uint16_t tdma_bitmap,
+                                      uint8_t own_slot,
+                                      uint8_t max_merge);
+
+uint32_t   on_sf_superslot_air_budget_us(const on_sf_cfg_t *cfg,
+                                         uint8_t merged_slots);
+
 #ifdef __cplusplus
 }
 #endif

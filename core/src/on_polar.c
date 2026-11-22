@@ -10,6 +10,7 @@
 static bool     s_polar_inited = false;
 static bool     s_is_info[ON_POLAR_N];
 static uint8_t  s_info_indices[ON_POLAR_K];
+static uint8_t  s_order[ON_POLAR_N];
 
 static void polar_init_tables(void) {
     if (s_polar_inited) return;
@@ -43,6 +44,8 @@ static void polar_init_tables(void) {
         }
         order[j + 1] = key;
     }
+
+    memcpy(s_order, order, sizeof(s_order));
 
     /* Select the top K most reliable bit channels */
     for (uint32_t idx = ON_POLAR_N - ON_POLAR_K; idx < ON_POLAR_N; ++idx) {
@@ -461,4 +464,150 @@ on_err_t on_polar_decode_block_fixed(const int16_t llr_q4[ON_POLAR_N],
         }
     }
     return ON_ERR_DECODE_FAIL;
+}
+
+static void build_rate_mask(size_t msg_bytes, bool is_info[ON_POLAR_N], uint8_t info_idx[ON_POLAR_MAX_K], uint32_t *out_k) {
+    polar_init_tables();
+    uint32_t K = (uint32_t)(msg_bytes * 8u + 8u);
+    memset(is_info, 0, ON_POLAR_N * sizeof(bool));
+    for (uint32_t idx = ON_POLAR_N - K; idx < ON_POLAR_N; ++idx) {
+        is_info[s_order[idx]] = true;
+    }
+    uint32_t k = 0u;
+    for (uint32_t i = 0u; i < ON_POLAR_N; ++i) {
+        if (is_info[i]) {
+            info_idx[k++] = (uint8_t)i;
+        }
+    }
+    *out_k = K;
+}
+
+on_err_t on_polar_encode_rate(const uint8_t *msg, size_t msg_bytes,
+                              uint8_t coded_bits[ON_POLAR_N]) {
+    if (!msg || !coded_bits || msg_bytes < 1u || msg_bytes > ON_POLAR_MAX_MSG_BYTES) {
+        return ON_ERR_INVALID_ARG;
+    }
+    bool is_info[ON_POLAR_N];
+    uint8_t info_idx[ON_POLAR_MAX_K];
+    uint32_t K = 0u;
+    build_rate_mask(msg_bytes, is_info, info_idx, &K);
+
+    uint8_t payload_crc[ON_POLAR_MAX_MSG_BYTES + 1u];
+    memcpy(payload_crc, msg, msg_bytes);
+    payload_crc[msg_bytes] = on_crc8(msg, msg_bytes);
+
+    memset(coded_bits, 0, ON_POLAR_N);
+    for (uint32_t k = 0u; k < K; ++k) {
+        uint8_t byte_val = payload_crc[k >> 3u];
+        uint8_t bit_val  = (uint8_t)((byte_val >> (7u - (k & 7u))) & 1u);
+        coded_bits[info_idx[k]] = bit_val;
+    }
+    polar_transform(coded_bits);
+    return ON_OK;
+}
+
+on_err_t on_polar_decode_rate_fixed(const int16_t llr_q4[ON_POLAR_N],
+                                    size_t msg_bytes,
+                                    uint8_t *msg_out) {
+    if (!llr_q4 || !msg_out || msg_bytes < 1u || msg_bytes > ON_POLAR_MAX_MSG_BYTES) {
+        return ON_ERR_INVALID_ARG;
+    }
+    bool is_info[ON_POLAR_N];
+    uint8_t info_idx[ON_POLAR_MAX_K];
+    uint32_t K = 0u;
+    build_rate_mask(msg_bytes, is_info, info_idx, &K);
+
+    scl_path_q4_t paths[ON_POLAR_LIST_SIZE];
+    scl_path_q4_t next_paths[ON_POLAR_LIST_SIZE];
+    uint32_t num_paths = 1u;
+
+    memset(&paths[0], 0, sizeof(paths[0]));
+    for (uint32_t i = 0u; i < ON_POLAR_N; ++i) {
+        paths[0].llr[STAGE_OFF(ON_POLAR_LOG2_N) + i] = sat_i16(llr_q4[i]);
+    }
+
+    for (uint32_t phi = 0u; phi < ON_POLAR_N; ++phi) {
+        for (uint32_t p = 0u; p < num_paths; ++p) {
+            scl_q4_update_llrs(&paths[p], phi);
+        }
+        if (!is_info[phi]) {
+            for (uint32_t p = 0u; p < num_paths; ++p) {
+                paths[p].pm += pm_penalty_q4(paths[p].llr[STAGE_OFF(0)], 0u);
+                scl_q4_update_betas(&paths[p], phi, 0u);
+            }
+        } else {
+            scl_cand_q4_t cands[ON_POLAR_LIST_SIZE * 2u];
+            uint32_t nc = 0u;
+            for (uint32_t p = 0u; p < num_paths; ++p) {
+                int16_t leaf = paths[p].llr[STAGE_OFF(0)];
+                cands[nc].parent_idx = p;
+                cands[nc].bit = 0u;
+                cands[nc].pm  = paths[p].pm + pm_penalty_q4(leaf, 0u);
+                nc++;
+                cands[nc].parent_idx = p;
+                cands[nc].bit = 1u;
+                cands[nc].pm  = paths[p].pm + pm_penalty_q4(leaf, 1u);
+                nc++;
+            }
+            for (uint32_t i = 1u; i < nc; ++i) {
+                scl_cand_q4_t key = cands[i];
+                int32_t j = (int32_t)i - 1;
+                while (j >= 0 && cands[j].pm > key.pm) {
+                    cands[j + 1] = cands[j];
+                    j--;
+                }
+                cands[j + 1] = key;
+            }
+            uint32_t keep = (nc < ON_POLAR_LIST_SIZE) ? nc : ON_POLAR_LIST_SIZE;
+            for (uint32_t k = 0u; k < keep; ++k) {
+                next_paths[k] = paths[cands[k].parent_idx];
+                next_paths[k].pm = cands[k].pm;
+                scl_q4_update_betas(&next_paths[k], phi, cands[k].bit);
+            }
+            for (uint32_t k = 0u; k < keep; ++k) paths[k] = next_paths[k];
+            num_paths = keep;
+        }
+    }
+
+    for (uint32_t i = 1u; i < num_paths; ++i) {
+        scl_path_q4_t key = paths[i];
+        int32_t j = (int32_t)i - 1;
+        while (j >= 0 && paths[j].pm > key.pm) {
+            paths[j + 1] = paths[j];
+            j--;
+        }
+        paths[j + 1] = key;
+    }
+
+    for (uint32_t p = 0u; p < num_paths; ++p) {
+        uint8_t payload_crc[ON_POLAR_MAX_MSG_BYTES + 1u];
+        memset(payload_crc, 0, sizeof(payload_crc));
+        for (uint32_t k = 0u; k < K; ++k) {
+            if (paths[p].u_bits[info_idx[k]]) {
+                payload_crc[k >> 3u] |= (uint8_t)(1u << (7u - (k & 7u)));
+            }
+        }
+        if (on_crc8(payload_crc, msg_bytes) == payload_crc[msg_bytes]) {
+            memcpy(msg_out, payload_crc, msg_bytes);
+            return ON_OK;
+        }
+    }
+    return ON_ERR_DECODE_FAIL;
+}
+
+void on_polar_harq_init(on_polar_harq_buf_t *hb, size_t msg_bytes) {
+    if (!hb) return;
+    memset(hb, 0, sizeof(*hb));
+    hb->msg_bytes = (msg_bytes >= 1u && msg_bytes <= ON_POLAR_MAX_MSG_BYTES) ? msg_bytes : ON_POLAR_MSG_BYTES;
+}
+
+on_err_t on_polar_harq_combine_and_decode(on_polar_harq_buf_t *hb,
+                                          const int16_t rx_llr_q4[ON_POLAR_N],
+                                          uint8_t *msg_out) {
+    if (!hb || !rx_llr_q4 || !msg_out) return ON_ERR_INVALID_ARG;
+    for (uint32_t i = 0u; i < ON_POLAR_N; ++i) {
+        hb->accum_llr_q4[i] = sat_i16((int32_t)hb->accum_llr_q4[i] + (int32_t)rx_llr_q4[i]);
+    }
+    hb->tx_count++;
+    return on_polar_decode_rate_fixed(hb->accum_llr_q4, hb->msg_bytes, msg_out);
 }

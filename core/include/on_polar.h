@@ -26,7 +26,20 @@ extern "C" {
 #define ON_POLAR_MSG_BITS     (ON_POLAR_MSG_BYTES * 8u)   /* 40 bits */
 #define ON_POLAR_CRC_BITS     8u
 #define ON_POLAR_K            (ON_POLAR_MSG_BITS + ON_POLAR_CRC_BITS) /* 48 bits */
+#define ON_POLAR_MAX_MSG_BYTES 11u                        /* Max K = 11*8 + 8 = 96 (Rate 0.75) */
+#define ON_POLAR_MAX_K        (ON_POLAR_MAX_MSG_BYTES * 8u + ON_POLAR_CRC_BITS)
 #define ON_POLAR_LIST_SIZE    8u
+
+/*
+ * v4.0 Soft-Combining HARQ LLR Accumulator (Chase Combining / IR-HARQ):
+ * Retains soft Q4.4 LLRs across failed transmissions and combines them
+ * (L_comb[i] = sat(L_prev[i] + L_new[i])) for +3 dB SNR gain on retransmission.
+ */
+typedef struct {
+    int16_t  accum_llr_q4[ON_POLAR_N];
+    uint8_t  tx_count;
+    size_t   msg_bytes;
+} on_polar_harq_buf_t;
 
 /*
  * Encode 5 message bytes (40 bits) -> appends CRC-8 (total 48 info bits) ->
@@ -49,6 +62,25 @@ on_err_t on_polar_decode_block(const float llr[ON_POLAR_N],
  */
 on_err_t on_polar_decode_block_fixed(const int16_t llr_q4[ON_POLAR_N],
                                      uint8_t msg_out[ON_POLAR_MSG_BYTES]);
+
+/*
+ * v4.0 Multi-Rate Adaptive CA-Polar (N=128, msg_bytes = 4..11 -> K = 40..96, R = 0.31..0.75)
+ * Supports NearLink-style dynamic code-rate adaptation linked with AMC SNR regimes.
+ */
+on_err_t on_polar_encode_rate(const uint8_t *msg, size_t msg_bytes,
+                              uint8_t coded_bits[ON_POLAR_N]);
+on_err_t on_polar_decode_rate_fixed(const int16_t llr_q4[ON_POLAR_N],
+                                    size_t msg_bytes,
+                                    uint8_t *msg_out);
+
+/*
+ * v4.0 Soft-Combining HARQ API:
+ * Accumulates Q4.4 soft LLRs across initial TX and HARQ retransmissions before CA-SCL decoding.
+ */
+void     on_polar_harq_init(on_polar_harq_buf_t *hb, size_t msg_bytes);
+on_err_t on_polar_harq_combine_and_decode(on_polar_harq_buf_t *hb,
+                                          const int16_t rx_llr_q4[ON_POLAR_N],
+                                          uint8_t *msg_out);
 
 #ifdef __cplusplus
 }

@@ -19,22 +19,25 @@ opennear/
 │   │   ├── on_afh.h                 # v3.1 TSCH 自适应跳频 + Wi-Fi 干扰黑名单 + 原子倒计时 + 冷启动扫频
 │   │   ├── on_amc.h                 # v3.1 L1 双波形速率自适应调制编码（2M MSK <-> 4M QPSK <-> 20M OFDM）
 │   │   ├── on_sar.h                 # v3.1 轻量分片重组（最高 1 KB OTA/流）+ 3 级抢占式 QoS 队列
+│   │   ├── on_ranging.h             # v4.0 星闪 2.0 通感一体：16 频点多载波相位差 (MCPD) + ToF 厘米级测距与防中继围栏
 │   │   └── on_node.h                # 完整节点引擎（G / T / 双区 FDMA Sub-G / Lease GC / Backup_ID / Fast HARQ）
 │   └── src/
 ├── hal/
 │   └── on_hal.h                     # 跨平台射频 / 高精定时器 / GPIO 硬件抽象层
-├── sim/                             # 10 节点多跳物理仿真器（导出 CSV + Wireshark PCAP + 仪表盘数据）
+├── sim/                             # 10 节点多跳物理仿真器（支持 CLI 混沌参数注入 + CSV + PCAP + 仪表盘数据）
 │   ├── sim_world.h / sim_world.c
 │   └── main_sim.c
 ├── tests/
-│   └── test_opennear.c              # 15 组全链路自动化单测与集成断言套件（105 项断言）
+│   └── test_opennear.c              # 20 组全链路自动化单测与集成断言套件（125 项断言）
 ├── tools/
-│   ├── dashboard.html               # 交互式 HTML 协议可视化面板（直接双击打开，零服务器依赖）
+│   ├── dashboard.html               # 交互式 HTML 协议可视化与极限破坏性压测工作台
+│   ├── chaos_server.mjs             # 在线调用底层 C11 仿真引擎的交互式混沌压测本地服务器
 │   └── opennear_dissector.lua       # Wireshark Lua 抓包解析插件（DLT_USER0 = 147）
 └── ports/
     ├── esp32_wroom32/               # 路线 C：ESP32-WROOM-32 裸 0xD0 @ 54M + esp_timer 硬件 ACT + TRNG Salt
     ├── nrf52840_bare/               # 路线 A：nRF52840 裸 RADIO+PPI + RTC0 双时钟微安休眠 + 启动/链接脚本
-    └── sdr_fpga_ref/                # 路线 B：CFO(+40ppm)+多径短前导 + 定点 Q4.4 CA-Polar + AMC 基准
+    └── sdr_fpga_ref/                # 路线 B：CFO(+40ppm)+多径短前导 + 定点 Q4.4 CA-Polar + 可综合 Verilog RTL
+        └── rtl/                     # opennear_preamble_correlator.v + opennear_polar_encoder/decoder_n128.v + tb
 ```
 
 ## 快速运行（一键编译与全量验证）

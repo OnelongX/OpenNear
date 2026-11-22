@@ -20,12 +20,24 @@ void on_sync_init(on_sync_ctx_t *ctx) {
     ctx->rtt_calibrated   = false;
     ctx->link_delay_ns    = 0;
     ctx->ant_delay_ns     = 0;
-    ctx->kp               = 0.65;
-    ctx->ki               = 0.05;
-    ctx->max_rate_ppb     = 200000.0; /* +/- 200 ppm crystal bound */
-    ctx->last_err_ns      = 0;
-    ctx->max_abs_err_ns   = 0;
-    ctx->holdover_frames  = 0u;
+    ctx->kp                = 0.65;
+    ctx->ki                = 0.05;
+    ctx->ka                = 0.0;
+    ctx->drift_accel_ppb_s = 0.0;
+    ctx->accel_en          = false;
+    ctx->max_rate_ppb      = 200000.0; /* +/- 200 ppm crystal bound */
+    ctx->last_err_ns       = 0;
+    ctx->max_abs_err_ns    = 0;
+    ctx->holdover_frames   = 0u;
+}
+
+void on_sync_enable_accel_tracker(on_sync_ctx_t *ctx, bool enable, double ka) {
+    if (!ctx) return;
+    ctx->accel_en = enable;
+    ctx->ka       = (ka > 0.0) ? ka : 0.015;
+    if (!enable) {
+        ctx->drift_accel_ppb_s = 0.0;
+    }
 }
 
 void on_sync_reset(on_sync_ctx_t *ctx) {
@@ -37,7 +49,9 @@ int64_t on_sync_local_to_net(const on_sync_ctx_t *ctx, int64_t local_ns) {
         return local_ns;
     }
     double dt_loc = (double)(local_ns - ctx->ref_local_ns);
-    double scaled = dt_loc * (1.0 + ctx->rate_ppb * 1e-9);
+    double dt_sec = dt_loc * 1e-9;
+    double eff_ppb = ctx->rate_ppb + (ctx->accel_en ? (0.5 * ctx->drift_accel_ppb_s * dt_sec) : 0.0);
+    double scaled = dt_loc * (1.0 + eff_ppb * 1e-9);
     int64_t delta_net = (int64_t)llround(scaled);
     return ctx->ref_net_ns + delta_net;
 }
@@ -47,7 +61,9 @@ int64_t on_sync_net_to_local(const on_sync_ctx_t *ctx, int64_t target_net_ns) {
         return target_net_ns;
     }
     double dt_net = (double)(target_net_ns - ctx->ref_net_ns);
-    double inv_scale = 1.0 / (1.0 + ctx->rate_ppb * 1e-9);
+    double dt_sec = dt_net * 1e-9;
+    double eff_ppb = ctx->rate_ppb + (ctx->accel_en ? (0.5 * ctx->drift_accel_ppb_s * dt_sec) : 0.0);
+    double inv_scale = 1.0 / (1.0 + eff_ppb * 1e-9);
     int64_t delta_loc = (int64_t)llround(dt_net * inv_scale);
     return ctx->ref_local_ns + delta_loc;
 }
@@ -106,20 +122,34 @@ int64_t on_sync_on_beacon(on_sync_ctx_t *ctx, int64_t t_tx_net_ns, int64_t t_rx_
         return err_ns;
     }
 
-    /* Steady-state digital NCO TC-PLL PI tracking */
+    /* Steady-state digital NCO TC-PLL PI (+ v4.0 Second-Order Alpha-Beta-Gamma) tracking */
     int64_t dt_loc = t_rx_local_ns - ctx->prev_rx_local_ns;
     ctx->last_dt_loc_ns = dt_loc;
     if (dt_loc > 100000) {
+        double dt_sec = (double)dt_loc * 1e-9;
+
+        /* Propagate frequency by tracked thermal acceleration before rebasing reference */
+        if (ctx->accel_en) {
+            ctx->rate_ppb += ctx->drift_accel_ppb_s * dt_sec;
+        }
+
         /* Re-base reference point to prevent double precision drift over long runs */
         ctx->ref_net_ns   = t_pred_net_ns + (int64_t)llround(ctx->kp * (double)err_ns);
         ctx->ref_local_ns = t_rx_local_ns;
 
         /* Integral NCO fractional rate update (ppb) */
-        double dt_sec = (double)dt_loc * 1e-9;
         double delta_ppb = ctx->ki * ((double)err_ns / dt_sec);
         ctx->rate_ppb += delta_ppb;
         if (ctx->rate_ppb >  ctx->max_rate_ppb) ctx->rate_ppb =  ctx->max_rate_ppb;
         if (ctx->rate_ppb < -ctx->max_rate_ppb) ctx->rate_ppb = -ctx->max_rate_ppb;
+
+        /* Second-order thermal drift-acceleration update (ppb/s) */
+        if (ctx->accel_en && dt_sec > 1e-5) {
+            double delta_accel = ctx->ka * ((double)err_ns / (0.5 * dt_sec * dt_sec));
+            ctx->drift_accel_ppb_s += delta_accel;
+            if (ctx->drift_accel_ppb_s >  500000.0) ctx->drift_accel_ppb_s =  500000.0;
+            if (ctx->drift_accel_ppb_s < -500000.0) ctx->drift_accel_ppb_s = -500000.0;
+        }
     }
 
     ctx->prev_rx_local_ns = t_rx_local_ns;

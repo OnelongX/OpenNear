@@ -17,7 +17,7 @@ void on_sf_cfg_default(on_sf_cfg_t *cfg) {
 
 on_err_t on_sf_cfg_validate(const on_sf_cfg_t *cfg) {
     if (!cfg) return ON_ERR_INVALID_ARG;
-    if (cfg->t_sf_us < 1000u || cfg->t_sf_us > 20000u) return ON_ERR_INVALID_ARG;
+    if (cfg->t_sf_us < 500u || cfg->t_sf_us > 20000u) return ON_ERR_INVALID_ARG;
     if (cfg->sync_end_us > cfg->tdma_start_us) return ON_ERR_INVALID_ARG;
     uint32_t tdma_end = (uint32_t)cfg->tdma_start_us + (uint32_t)cfg->max_slots * cfg->slot_len_us;
     if (tdma_end > cfg->sub_g_start_us) return ON_ERR_INVALID_ARG;
@@ -68,4 +68,71 @@ uint32_t on_sf_subg_cra_start_us(const on_sf_cfg_t *cfg) {
 uint32_t on_sf_cra_slot_start_us(const on_sf_cfg_t *cfg, uint8_t micro_slot) {
     uint32_t half = (uint32_t)(cfg->cra_end_us - cfg->cra_start_us) / 2u;
     return (uint32_t)cfg->cra_start_us + (micro_slot ? half : 0u);
+}
+
+on_err_t on_sf_cfg_set_gear(on_sf_cfg_t *cfg, on_sf_gear_t gear) {
+    if (!cfg) return ON_ERR_INVALID_ARG;
+    switch (gear) {
+        case ON_SF_GEAR_FAST_500US:
+            /* 500 us (2 kHz) ultra-fast HID/control superframe (4M QPSK / 20M OFDM) */
+            cfg->t_sf_us         = 500u;
+            cfg->sync_end_us     = 60u;
+            cfg->tdma_start_us   = 60u;
+            cfg->slot_len_us     = 50u;
+            cfg->max_slots       = 6u;   /* 60..360 us */
+            cfg->sub_g_start_us  = 360u;
+            cfg->sub_g_len_us    = 0u;   /* 1-hop low-latency direct mode */
+            cfg->cra_start_us    = 360u;
+            cfg->cra_end_us      = 440u;
+            cfg->act_start_us    = 440u;
+            cfg->act_fire_off_us = 470u;
+            return on_sf_cfg_validate(cfg);
+
+        case ON_SF_GEAR_AUDIO_1MS:
+            /* 1,000 us (1 kHz) low-latency spatial audio / industrial PLC superframe */
+            cfg->t_sf_us         = 1000u;
+            cfg->sync_end_us     = 100u;
+            cfg->tdma_start_us   = 100u;
+            cfg->slot_len_us     = 80u;
+            cfg->max_slots       = 8u;   /* 100..740 us */
+            cfg->sub_g_start_us  = 740u;
+            cfg->sub_g_len_us    = 0u;
+            cfg->cra_start_us    = 750u;
+            cfg->cra_end_us      = 900u;
+            cfg->act_start_us    = 900u;
+            cfg->act_fire_off_us = 950u;
+            return on_sf_cfg_validate(cfg);
+
+        case ON_SF_GEAR_MESH_4MS:
+        default:
+            on_sf_cfg_default(cfg);
+            return on_sf_cfg_validate(cfg);
+    }
+}
+
+uint8_t on_sf_max_contiguous_slots(const on_sf_cfg_t *cfg,
+                                   uint16_t tdma_bitmap,
+                                   uint8_t own_slot,
+                                   uint8_t max_merge) {
+    if (!cfg || own_slot >= cfg->max_slots || max_merge == 0u) {
+        return 0u;
+    }
+    uint8_t merged = 1u;
+    for (uint8_t s = (uint8_t)(own_slot + 1u);
+         s < cfg->max_slots && merged < max_merge;
+         ++s) {
+        /* If subsequent slot `s` is allocated to another peer, stop merging */
+        if ((tdma_bitmap & (uint16_t)(1u << s)) != 0u) {
+            break;
+        }
+        merged++;
+    }
+    return merged;
+}
+
+uint32_t on_sf_superslot_air_budget_us(const on_sf_cfg_t *cfg,
+                                       uint8_t merged_slots) {
+    if (!cfg || merged_slots == 0u) return 0u;
+    uint32_t raw_us = (uint32_t)merged_slots * (uint32_t)cfg->slot_len_us;
+    return (raw_us > 20u) ? (raw_us - 20u) : raw_us; /* 20 us tail guard */
 }

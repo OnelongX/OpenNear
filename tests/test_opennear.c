@@ -8,6 +8,7 @@
 #include "on_afh.h"
 #include "on_amc.h"
 #include "on_sar.h"
+#include "on_ranging.h"
 #include "on_node.h"
 #include "../sim/sim_world.h"
 
@@ -807,9 +808,205 @@ static void test_v32_fpga_rtl_golden_vectors(void) {
     EXPECT(ones_count > 30u && ones_count < 98u, "Golden Polar codeword has balanced Hamming weight");
 }
 
+/* 17. Test v4.0 Soft-Combining HARQ (Chase LLR Accumulation) + Multi-Rate Adaptive CA-Polar */
+static void test_v40_soft_combining_harq_and_multirate_polar(void) {
+    printf("[TEST 17] v4.0 Soft-Combining HARQ (Chase LLR @ -4.5 dB) + Multi-Rate CA-Polar (K=40..96)...\n");
+
+    /* 1. Verify multi-rate CA-Polar across K=40 (4B), K=64 (7B), K=80 (9B), K=96 (11B, R=0.75) */
+    const size_t rates[4] = { 4u, 7u, 9u, 11u };
+    for (int r = 0; r < 4; ++r) {
+        size_t mb = rates[r];
+        uint8_t msg[ON_POLAR_MAX_MSG_BYTES];
+        for (size_t i = 0u; i < mb; ++i) msg[i] = (uint8_t)(0x37u + i * 19u + r * 7u);
+
+        uint8_t coded[ON_POLAR_N];
+        EXPECT(on_polar_encode_rate(msg, mb, coded) == ON_OK, "Multi-rate Polar encode OK");
+
+        int16_t llr[ON_POLAR_N];
+        for (uint32_t i = 0u; i < ON_POLAR_N; ++i) {
+            llr[i] = coded[i] ? (int16_t)-48 : (int16_t)+48;
+        }
+        uint8_t dec[ON_POLAR_MAX_MSG_BYTES];
+        EXPECT(on_polar_decode_rate_fixed(llr, mb, dec) == ON_OK &&
+               memcmp(dec, msg, mb) == 0,
+               "Multi-rate Polar decode exact recovery");
+    }
+
+    /* 2. Soft-Combining HARQ (Chase Combining) at deep negative SNR (Es/N0 = -4.5 dB) */
+    uint8_t msg5[ON_POLAR_MSG_BYTES] = { 0xDE, 0xAD, 0xBE, 0xEF, 0x42 };
+    uint8_t coded[ON_POLAR_N];
+    on_polar_encode_block(msg5, coded);
+
+    uint64_t rng = 0x9988776655443322ULL;
+    double es_n0_lin = pow(10.0, -4.5 / 10.0); /* -4.5 dB */
+    double sigma = sqrt(1.0 / (2.0 * es_n0_lin));
+
+    uint32_t single_ok = 0u, combined_ok = 0u;
+    for (uint32_t trial = 0u; trial < 50u; ++trial) {
+        int16_t llr_tx1[ON_POLAR_N], llr_tx2[ON_POLAR_N];
+        for (uint32_t i = 0u; i < ON_POLAR_N; ++i) {
+            double s = coded[i] ? -1.0 : +1.0;
+            /* Box-Muller Gaussian noise for TX1 and TX2 */
+            rng = rng * 6364136223846793005ULL + 1ULL;
+            double u1 = ((double)((rng >> 11) & 0x1FFFFFULL) + 1.0) / 2097153.0;
+            rng = rng * 6364136223846793005ULL + 1ULL;
+            double u2 = ((double)((rng >> 11) & 0x1FFFFFULL) + 1.0) / 2097153.0;
+            double n1 = sigma * sqrt(-2.0 * log(u1)) * cos(6.28318530718 * u2);
+            double n2 = sigma * sqrt(-2.0 * log(u1)) * sin(6.28318530718 * u2);
+
+            double l1 = (2.0 / (sigma * sigma)) * (s + n1) * 16.0;
+            double l2 = (2.0 / (sigma * sigma)) * (s + n2) * 16.0;
+            llr_tx1[i] = (int16_t)(l1 > 511.0 ? 511 : (l1 < -512.0 ? -512 : (int)llround(l1)));
+            llr_tx2[i] = (int16_t)(l2 > 511.0 ? 511 : (l2 < -512.0 ? -512 : (int)llround(l2)));
+        }
+
+        uint8_t out1[ON_POLAR_MSG_BYTES], out_comb[ON_POLAR_MSG_BYTES];
+        on_polar_harq_buf_t hb;
+        on_polar_harq_init(&hb, ON_POLAR_MSG_BYTES);
+
+        if (on_polar_harq_combine_and_decode(&hb, llr_tx1, out1) == ON_OK &&
+            memcmp(out1, msg5, ON_POLAR_MSG_BYTES) == 0) {
+            single_ok++;
+            combined_ok++;
+        } else if (on_polar_harq_combine_and_decode(&hb, llr_tx2, out_comb) == ON_OK &&
+                   memcmp(out_comb, msg5, ON_POLAR_MSG_BYTES) == 0) {
+            combined_ok++;
+        }
+    }
+    printf("    -> @ Es/N0=-4.5 dB: 1st-TX Recovery=%u/50 | 2-TX Soft-Combined Recovery=%u/50\n",
+           single_ok, combined_ok);
+    EXPECT(combined_ok > single_ok && combined_ok >= 45u,
+           "Soft-Combining HARQ significantly boosts recovery at -4.5 dB (>= 90%)");
+}
+
+/* 18. Test v4.0 NearLink 2.0 ISAC 16-Channel MCPD + ToF Ranging & Anti-Relay Geofence */
+static void test_v40_isac_mcpd_tof_ranging_and_antirelay(void) {
+    printf("[TEST 18] v4.0 NearLink 2.0 ISAC 16-Channel MCPD + ToF Ranging & Anti-Relay Geofence...\n");
+
+    on_ranging_ctx_t rctx;
+    on_ranging_init(&rctx);
+
+    /* Case A: Legitimate Digital Car Key at true distance = 1.65 m (inside 2.5 m unlock geofence) */
+    const double true_d_m = 1.65;
+    for (uint8_t ch = 0u; ch < ON_AFH_NUM_CHANNELS; ++ch) {
+        double noise = ((ch & 1u) ? +0.025 : -0.025); /* +/- 0.025 rad phase measurement noise */
+        double phi = on_ranging_synth_tone_phase(ch, true_d_m, noise);
+        on_ranging_add_tone(&rctx, ch, phi);
+    }
+    double legit_rtt_ns = (2.0 * true_d_m / ON_RANGING_SPEED_OF_LIGHT_MPS) * 1e9 + 0.4; /* +0.4 ns jitter */
+    on_ranging_result_t res;
+    EXPECT(on_ranging_solve(&rctx, legit_rtt_ns, 2.50, 0.04, &res) == ON_OK, "MCPD+ToF solve OK");
+    double err_cm = fabs(res.d_mcpd_m - true_d_m) * 100.0;
+    printf("    -> True=1.650 m | MCPD=%.3f m (err=%.2f cm) | ToF=%.3f m | Geofence=%s\n",
+           res.d_mcpd_m, err_cm, res.d_tof_m, res.geofence_pass ? "UNLOCK" : "DENY");
+    EXPECT(err_cm < 3.0, "16-Channel MCPD ranging error < 3 cm");
+    EXPECT(!res.relay_attack_detected && res.geofence_pass,
+           "Legitimate car key at 1.65 m passes anti-relay check and unlocks geofence");
+
+    /* Case B: MitM Coaxial/RF Relay Attack (attacker replays phase for 1.65 m from 18 m away -> RTT=120 ns) */
+    on_ranging_result_t attack_res;
+    EXPECT(on_ranging_solve(&rctx, 120.0, 2.50, 0.04, &attack_res) == ON_OK, "Relay attack check OK");
+    printf("    -> Relay Attack (ToF=18.0 m vs Spoofed MCPD=1.65 m): RelayDetected=%s | Geofence=%s\n",
+           attack_res.relay_attack_detected ? "YES" : "NO",
+           attack_res.geofence_pass ? "UNLOCK" : "BLOCKED");
+    EXPECT(attack_res.relay_attack_detected && !attack_res.geofence_pass,
+           "Anti-relay physical causality check blocks 18m RF repeater attack 100%");
+}
+
+/* 19. Test v4.0 2-Byte Implicit-Address TDMA Header + Dynamic Super-Slot + 500us/1ms Multi-Gear */
+static void test_v40_implicit_hdr_superslot_and_multigear(void) {
+    printf("[TEST 19] v4.0 2B Implicit TDMA Header + Super-Slot Aggregation + 500us/1ms Multi-Gear...\n");
+
+    on_mac_hdr_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.version    = ON_PROTO_VERSION;
+    hdr.type       = ON_FRAME_TDMA_DATA;
+    hdr.sec_en     = true;
+    hdr.is_sub_g   = false;
+    hdr.src_id     = 0x007u;
+    hdr.dst_id     = ON_SHORT_ID_G_DEFAULT;
+    hdr.sf_seq_low = 0x0Au;
+    hdr.slot_idx   = 5u;
+
+    const uint8_t payload[6] = { 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 };
+    uint8_t wire[32];
+    size_t wire_len = 0u;
+    EXPECT(on_frame_pack_implicit(&hdr, payload, sizeof(payload), wire, sizeof(wire), &wire_len) == ON_OK,
+           "2-Byte implicit TDMA frame pack OK");
+    EXPECT(wire_len == ON_IMPLICIT_HDR_LEN + sizeof(payload) + ON_PAYLOAD_CRC_LEN,
+           "Implicit frame total wire length = 2B hdr + 6B payload + 2B CRC16 = 10B (saves 4B/pkt)");
+
+    on_mac_hdr_t dec_hdr;
+    const uint8_t *dec_pay = NULL;
+    size_t dec_plen = 0u;
+    EXPECT(on_frame_unpack_implicit(wire, wire_len, 0x007u, ON_SHORT_ID_G_DEFAULT, 5u,
+                                    &dec_hdr, &dec_pay, &dec_plen) == ON_OK &&
+           dec_plen == sizeof(payload) && memcmp(dec_pay, payload, sizeof(payload)) == 0,
+           "2-Byte implicit TDMA frame unpacks & reconstructs 6B canonical header");
+
+    /* Wrong slot or wrong implied_src_id must fail virtual Hdr_CRC8 immediately */
+    EXPECT(on_frame_unpack_implicit(wire, wire_len, 0x008u, ON_SHORT_ID_G_DEFAULT, 5u,
+                                    &dec_hdr, &dec_pay, &dec_plen) == ON_ERR_HDR_CRC,
+           "Cross-node leakage rejected by virtual Hdr_CRC8 in 2B implicit header");
+
+    /* Dynamic Super-Slot Aggregation & Multi-Gear Superframes (500 us / 1 ms / 4 ms) */
+    on_sf_cfg_t cfg;
+    EXPECT(on_sf_cfg_set_gear(&cfg, ON_SF_GEAR_FAST_500US) == ON_OK && cfg.t_sf_us == 500u,
+           "2 kHz Fast-500us superframe gear valid");
+    EXPECT(on_sf_cfg_set_gear(&cfg, ON_SF_GEAR_AUDIO_1MS) == ON_OK && cfg.t_sf_us == 1000u,
+           "1 kHz Audio-1ms superframe gear valid");
+    EXPECT(on_sf_cfg_set_gear(&cfg, ON_SF_GEAR_MESH_4MS) == ON_OK && cfg.t_sf_us == 4000u,
+           "250 Hz Mesh-4ms superframe gear valid");
+
+    /* Suppose slots 0, 1, 5 are occupied (bitmap = 0b00100011 = 0x0023); node at slot 1 has slots 2,3,4 free */
+    uint8_t merged = on_sf_max_contiguous_slots(&cfg, 0x0023u, 1u, 4u);
+    uint32_t budget_us = on_sf_superslot_air_budget_us(&cfg, merged);
+    printf("    -> ImplicitHdr=2B (-66.7%%) | Super-Slot Merged=%u slots (%u us burst) | Gears=500us/1ms/4ms\n",
+           merged, budget_us);
+    EXPECT(merged == 4u && budget_us == 620u,
+           "Super-Slot merges 4 contiguous slots (1..4) yielding 620 us single-SF burst");
+}
+
+/* 20. Test v4.0 Second-Order Alpha-Beta-Gamma Thermal Drift-Acceleration Clock Tracker */
+static void test_v40_second_order_thermal_accel_clock(void) {
+    printf("[TEST 20] v4.0 Second-Order Alpha-Beta-Gamma Thermal Drift-Acceleration Tracker...\n");
+
+    on_sync_ctx_t pi_1st, abg_2nd;
+    on_sync_init(&pi_1st);
+    on_sync_init(&abg_2nd);
+    on_sync_enable_accel_tracker(&abg_2nd, true, 0.04);
+
+    /* Simulate cold-boot PA heating: base drift = +15 ppm, ramping at +4,000 ppb/s (+4 ppm/s) */
+    const double base_ppb  = 15000.0;
+    const double accel_ppb_s = 4000.0;
+    const int64_t dt_net_ns = 4000000LL; /* 4 ms superframe */
+
+    /* 40 beacons (160 ms) of normal tracking, then 25 frames (100 ms) of total blackout */
+    for (int sf = 0; sf < 40; ++sf) {
+        int64_t t_net = (int64_t)sf * dt_net_ns;
+        double t_sec = (double)t_net * 1e-9;
+        /* Exact integral of (1 + (base_ppb + accel * t) * 1e-9) dt = t + base*t + 0.5*accel*t^2 */
+        int64_t t_loc = t_net + (int64_t)llround((base_ppb * t_sec + 0.5 * accel_ppb_s * t_sec * t_sec));
+        on_sync_on_beacon(&pi_1st, t_net, t_loc);
+        on_sync_on_beacon(&abg_2nd, t_net, t_loc);
+    }
+
+    /* Evaluate holdover error after 25 dropped superframes (100 ms blackout at SF=65) */
+    int64_t eval_net = 65LL * dt_net_ns;
+    double eval_sec = (double)eval_net * 1e-9;
+    int64_t eval_loc = eval_net + (int64_t)llround((base_ppb * eval_sec + 0.5 * accel_ppb_s * eval_sec * eval_sec));
+
+    int64_t err_1st_ns = llabs(on_sync_local_to_net(&pi_1st, eval_loc) - eval_net);
+    int64_t err_2nd_ns = llabs(on_sync_local_to_net(&abg_2nd, eval_loc) - eval_net);
+    printf("    -> Thermal Ramp (+4 ppm/s) + 25-SF (100ms) Blackout: 1st-Order PI Err=%lld ns | 2nd-Order ABG Err=%lld ns\n",
+           (long long)err_1st_ns, (long long)err_2nd_ns);
+    EXPECT(err_2nd_ns < err_1st_ns / 3 && err_2nd_ns < 15,
+           "2nd-order Alpha-Beta-Gamma tracker cuts thermal-ramp blackout drift by >3x (< 15 ns)");
+}
+
 int main(void) {
     printf("============================================================\n");
-    printf("       OpenNear v3.2 Core Protocol Automated Test Suite     \n");
+    printf("       OpenNear v4.0 Core Protocol Automated Test Suite     \n");
     printf("============================================================\n");
 
     test_6byte_header_and_frame();
@@ -828,6 +1025,10 @@ int main(void) {
     test_v31_multizone_subg_fdma_concurrency();
     test_v31_ptp_followup_and_ant_delay();
     test_v32_fpga_rtl_golden_vectors();
+    test_v40_soft_combining_harq_and_multirate_polar();
+    test_v40_isac_mcpd_tof_ranging_and_antirelay();
+    test_v40_implicit_hdr_superslot_and_multigear();
+    test_v40_second_order_thermal_accel_clock();
 
     printf("\n------------------------------------------------------------\n");
     printf("SUMMARY: %d passed, %d failed\n", g_tests_passed, g_tests_failed);
