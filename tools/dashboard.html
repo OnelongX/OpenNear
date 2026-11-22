@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>OpenNear v3.2 — 协议时隙、多跳锁相与极限破坏性压测仪表盘</title>
+<title>OpenNear v4.0 — 星闪 2.0 通感测距、软合并 HARQ 与极限破坏性压测工作台</title>
 <style>
   :root {
     --bg: #0b1220; --panel: #121c2e; --border: #24344d;
@@ -66,8 +66,8 @@
 <body>
   <div class="header">
     <div>
-      <h1>OpenNear v3.2 协议栈遥测与极限破坏性压测工作台</h1>
-      <div class="sub">6B 极简帧头 · 四段动态超帧 · 亚微秒硬件锁相 · 双区 Sub-G 多跳 · Backup_ID 0μs 接管 · X25519 + AES-128-CCM · TSCH AFH</div>
+      <h1>OpenNear v4.0 协议栈遥测、星闪 2.0 通感测距与极限破坏性压测工作台</h1>
+      <div class="sub">2B 隐式头 / 6B 短头 · 500μs/1ms/4ms 变速超帧 · 软合并 HARQ + 多码率 Polar · 16 频点 MCPD+ToF 厘米级测距防中继 · 二阶温漂加速度锁相 · FPGA RTL 编解码</div>
     </div>
     <div>
       <span class="badge" id="statusBadge">实时数据加载中...</span>
@@ -77,11 +77,12 @@
   <!-- Interactive Live Chaos Simulation Control Panel -->
   <div class="chaos-panel">
     <div class="chaos-title">
-      <h2>⚡ 极限破坏性混沌仿真控制台（实时调用底层 C11 引擎 <code>build/opennear_sim.exe</code>）</h2>
+      <h2>⚡ 极限破坏性混沌仿真控制台（实时调用底层 C11 引擎 <code>build/opennear_sim.exe</code> &amp; <code>test_opennear.exe</code>）</h2>
       <div class="presets">
         <button class="btn" id="presetBaseline" onclick="applyPreset('1.0', '35', '10', '0x0000', 'g')">场景1：标准 10 节点穿墙 + 主控断电接管</button>
         <button class="btn btn-warn" id="presetExtreme" onclick="applyPreset('2.5', '60', '20', '0x00F0', 'g')">场景2：±60ppm 极温晶振 + 20帧黑洞 + Wi-Fi CH6 压制</button>
         <button class="btn btn-purple" id="presetSubG" onclick="applyPreset('1.5', '45', '10', '0x00F0', 'subg')">场景3：穿墙中继 T2 断电 + Wi-Fi 压制 → T3 接任 + T8/T9 重连</button>
+        <button class="btn btn-run" id="btnRunTests" onclick="runAllUnitTests()">🔬 跑 20 组 131 项全量断言 (v4.0)</button>
       </div>
     </div>
     <div class="controls">
@@ -316,6 +317,20 @@ async function runChaosSim() {
       '当前为静态文件模式；通过 node tools/chaos_server.mjs 启动后即可在线调用 C11 引擎实时重跑。';
   } finally {
     btn.textContent = '🚀 立即重跑 C11 物理仿真';
+  }
+}
+
+async function runAllUnitTests() {
+  const btn = document.getElementById('btnRunTests');
+  btn.textContent = '⏳ 正在执行 20 组单测...';
+  try {
+    const res = await fetch('/api/run_tests');
+    const json = await res.json();
+    document.getElementById('simConsole').textContent = json.stdout || json.error || '';
+  } catch (e) {
+    document.getElementById('simConsole').textContent = '请通过 node tools/chaos_server.mjs 启动后运行。';
+  } finally {
+    btn.textContent = '🔬 跑 20 组 131 项全量断言 (v4.0)';
   }
 }
 
