@@ -63,6 +63,7 @@
 /* TIMER0 (0x40008000): 16 MHz / 2^0 = 16 MHz (62.5 ns hardware tick resolution!) */
 #define NRF_TIMER0_BASE             0x40008000UL
 #define TIMER0_TASKS_START          REG32(NRF_TIMER0_BASE + 0x000UL)
+#define TIMER0_TASKS_STOP           REG32(NRF_TIMER0_BASE + 0x004UL)
 #define TIMER0_TASKS_CAPTURE0       (NRF_TIMER0_BASE + 0x040UL)
 #define TIMER0_TASKS_CAPTURE3       REG32(NRF_TIMER0_BASE + 0x04CUL)
 #define TIMER0_EVENTS_COMPARE1      (NRF_TIMER0_BASE + 0x144UL)
@@ -86,24 +87,27 @@
 #define NRF_FICR_DEVICEADDR1        REG32(0x100000A8UL)
 
 /* DMA Packet Buffer: [0] = LENGTH byte, [1..N] = Native OpenNear 6B-header Frame */
-static uint8_t s_dma_pkt[1u + ON_MAX_FRAME_LEN] __attribute__((aligned(4)));
-static uint64_t s_timer_high_ticks = 0u;
-static uint32_t s_timer_last_ticks = 0u;
+static uint8_t  s_dma_pkt[1u + ON_MAX_FRAME_LEN] __attribute__((aligned(4)));
+static uint64_t s_timer_high_ticks   = 0u;
+static uint32_t s_timer_last_ticks   = 0u;
+static uint64_t s_sleep_offset_ticks = 0u; /* Accumulated 16 MHz ticks elapsed while TIMER0 was stopped */
 
-/* Convert 16 MHz TIMER0 ticks (62.5 ns/tick) -> monotonic 64-bit nanoseconds */
+/* Convert 16 MHz TIMER0 ticks (62.5 ns/tick) <-> monotonic 64-bit nanoseconds (bidirectional!) */
 static int64_t ticks16m_to_ns(uint32_t ticks32) {
     if (ticks32 < s_timer_last_ticks && (s_timer_last_ticks - ticks32) > 0x80000000UL) {
         s_timer_high_ticks += (1ULL << 32);
     }
     s_timer_last_ticks = ticks32;
-    uint64_t full = s_timer_high_ticks + (uint64_t)ticks32;
+    uint64_t full = s_timer_high_ticks + (uint64_t)ticks32 + s_sleep_offset_ticks;
     /* 1 tick = 62.5 ns = 125 / 2 ns */
     return (int64_t)((full * 125ULL) / 2ULL);
 }
 
 static uint32_t ns_to_ticks16m(int64_t local_ns) {
-    uint64_t ticks = ((uint64_t)local_ns * 2ULL) / 125ULL;
-    return (uint32_t)(ticks & 0xFFFFFFFFULL);
+    uint64_t full_ticks = ((uint64_t)local_ns * 2ULL) / 125ULL;
+    uint64_t hw_ticks   = (full_ticks >= s_sleep_offset_ticks)
+                        ? (full_ticks - s_sleep_offset_ticks) : 0ULL;
+    return (uint32_t)(hw_ticks & 0xFFFFFFFFULL);
 }
 
 static int64_t nrf52_now_ns(void *ctx) {
@@ -201,8 +205,9 @@ void on_nrf52_deep_sleep_until_ns(int64_t wakeup_local_ns) {
     RTC0_CC0 = (rtc_now + sleep_rtc_ticks) & 0x00FFFFFFUL;
     RTC0_EVENTS_COMPARE0 = 0UL;
 
-    /* 2. Power down RADIO & 64 MHz HFCLK crystal -> system enters ~1.5 uA System ON sleep */
+    /* 2. Explicitly stop RADIO + TIMER0 (releasing HFCLK request!) before stopping 64 MHz HFCLK */
     REG32(RADIO_TASKS_DISABLE) = 1UL;
+    TIMER0_TASKS_STOP     = 1UL;
     CLOCK_TASKS_HFCLKSTOP = 1UL;
 
     while (RTC0_EVENTS_COMPARE0 == 0UL) {
@@ -214,15 +219,15 @@ void on_nrf52_deep_sleep_until_ns(int64_t wakeup_local_ns) {
     }
     RTC0_EVENTS_COMPARE0 = 0UL;
 
-    /* 3. Wake 64 MHz HFCLK crystal ahead of SYNC/MAP & advance high-res tick accumulator */
+    /* 3. Wake 64 MHz HFCLK crystal ahead of SYNC/MAP, restart TIMER0 & update bidirectional sleep offset */
     CLOCK_EVENTS_HFCLKSTARTED = 0UL;
     CLOCK_TASKS_HFCLKSTART    = 1UL;
     while (CLOCK_EVENTS_HFCLKSTARTED == 0UL) { }
 
-    /* Compensate TIMER0 elapsed time during HFCLK-off period using exact 32.768 kHz delta */
     uint32_t rtc_elapsed = (RTC0_COUNTER - rtc_now) & 0x00FFFFFFUL;
     uint64_t equiv_16m_ticks = ((uint64_t)rtc_elapsed * 16000000ULL) / 32768ULL;
-    s_timer_high_ticks += equiv_16m_ticks;
+    s_sleep_offset_ticks += equiv_16m_ticks;
+    TIMER0_TASKS_START = 1UL;
 }
 
 on_err_t on_nrf52_hal_init(const on_nrf52_cfg_t *cfg, on_hal_ops_t *hal_out) {

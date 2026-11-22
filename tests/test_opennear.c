@@ -569,6 +569,84 @@ static void test_v3_fixed_polar_amc_and_sar_qos(void) {
            "300-byte OTA payload reassembled bit-exact across 5 SAR fragments");
 }
 
+/* 12. Deep Audit Regression: Sub-G Multi-Edge FIFO + Sub-Slot Lease GC + Backup_ID Dynamic Mirror + Auth Join */
+static void test_v3_deep_audit_regressions(void) {
+    printf("[TEST 12] Deep Audit Regressions: Sub-G FIFO + Sub-Slot GC + Backup_ID Mirror + Auth Join...\n");
+
+    const uint8_t net_key[16] = {
+        0xAA,0xBB,0xCC,0xDD,0xEE,0xFF,0x00,0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,0x99
+    };
+    const uint8_t wrong_key[16] = {
+        0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F,0x10
+    };
+
+    sim_world_t w;
+    sim_world_init(&w, 0xA0D172026ULL);
+    w.verbose = false;
+    /* Start with 100% dynamic C-RA join (pre_registered_fast = false) + full network security */
+    sim_world_setup_10node_demo(&w, false);
+    for (uint32_t i = 0; i < w.num_nodes; ++i) {
+        on_node_enable_security(&w.nodes[i], net_key);
+    }
+    on_node_set_session_salt(&w.nodes[0], 0x2026F00DUL);
+
+    /* Run 25 SFs so all 10 nodes (1-hop T1..T7 and 2-hop T8..T9) join dynamically under AES-128-CCM */
+    sim_world_run_us(&w, 100000, 10);
+    EXPECT(w.nodes[8].role == ON_ROLE_T && w.nodes[9].role == ON_ROLE_T,
+           "Both 2-hop edge nodes T8 & T9 joined via encrypted Sub-C-RA");
+
+    /* Verify Sub-G 4-slot FIFO relay ring queued & drained telemetry without losing T8 or T9 */
+    EXPECT(w.nodes[2].peers[0].rx_packets >= 5u && w.nodes[2].peers[1].rx_packets >= 5u,
+           "Sub-G T2 received multiple uplinks from both T8 (sub-slot 0) and T9 (sub-slot 1)");
+
+    /* Verify Backup_ID (T1_BK, node 1) passively mirrored 1-hop peers during its periodic snoop window */
+    uint32_t t1_mirrored_peers = 0u;
+    bool mirrored_subg_cap = false;
+    for (uint32_t i = 0; i < ON_MAX_NODES_TABLE; ++i) {
+        if (w.nodes[1].peers[i].active) {
+            t1_mirrored_peers++;
+            if (w.nodes[1].peers[i].capabilities & 0x02u) mirrored_subg_cap = true;
+        }
+    }
+    EXPECT(t1_mirrored_peers >= 5u, "Dynamic Backup_ID (T1_BK) passively mirrored >= 5 active 1-hop peers");
+    EXPECT(mirrored_subg_cap, "Dynamic Backup_ID mirrored T2_SG's Sub-G capability bit from TDMA flags");
+
+    /* Kill 2-hop edge node T9 -> verify Sub-G T2 reclaims T9's sub-slot via Sub-G Lease GC! */
+    w.alive[9] = false;
+    sim_world_run_us(&w, 160000, 10); /* 40 SFs > ON_PEER_LEASE_TIMEOUT_SF (30) */
+    EXPECT(w.nodes[2].lease_reclaim_count >= 1u,
+           "Sub-G T2 reclaimed dead 2-hop edge node T9's sub-slot via Sub-Slot Lease GC");
+    EXPECT((w.nodes[2].sub_tdma_bitmap & (1u << 1)) == 0u,
+           "Sub-G T2 cleared sub-slot 1 bit in sub_tdma_bitmap after T9 lease expiry");
+
+    /* Inject unauthorized JOIN_REQ encrypted with wrong_key -> G MUST reject via CCM MIC! */
+    on_node_t rogue;
+    on_hal_ops_t dummy_hal;
+    memset(&dummy_hal, 0, sizeof(dummy_hal));
+    on_node_init(&rogue, &dummy_hal, ON_ROLE_UNJOINED, 0u);
+    on_node_enable_security(&rogue, wrong_key);
+    on_node_set_session_salt(&rogue, 0x2026F00DUL);
+
+    on_join_req_t jreq = { {0xDE,0xAD,0xBE,0xEF,0x00,0x99}, 0u, 0u };
+    uint8_t jpay[ON_JOIN_REQ_WIRE_LEN], jsec[32], jwire[ON_MAX_FRAME_LEN], aad6[6], nonce[13];
+    size_t jlen = 0u, wlen = 0u;
+    on_join_req_pack(&jreq, jpay, sizeof(jpay), &jlen);
+    on_mac_hdr_t jhdr = { ON_PROTO_VERSION, ON_FRAME_JOIN_REQ, true, false,
+                          ON_SHORT_ID_UNASSIGNED, ON_SHORT_ID_G_DEFAULT,
+                          (uint8_t)(w.nodes[0].current_sf_seq & 0x0Fu), 0u };
+    on_hdr_pack(&jhdr, aad6);
+    on_sec_build_nonce_salted(&jhdr, w.nodes[0].current_sf_seq, rogue.sec.session_salt, nonce);
+    on_ccm_encrypt(rogue.sec.key, nonce, aad6, 6u, jpay, jlen, jsec, jsec + jlen);
+    on_frame_pack(&jhdr, jsec, jlen + ON_SEC_MIC_LEN, jwire, sizeof(jwire), &wlen);
+
+    uint32_t auth_before = w.nodes[0].sec.auth_failures;
+    on_node_on_rx_raw(&w.nodes[0], jwire, wlen, sim_phys_to_local_ns(&w, 0u, w.phys_now_ns));
+    EXPECT(w.nodes[0].sec.auth_failures == auth_before + 1u,
+           "Unauthorized JOIN_REQ with wrong key rejected by Primary G");
+    printf("    -> BackupMirroredPeers=%u | SubGLeaseReclaims=%u | RogueJoinRejected=YES\n",
+           t1_mirrored_peers, w.nodes[2].lease_reclaim_count);
+}
+
 int main(void) {
     printf("============================================================\n");
     printf("       OpenNear v3.0 Core Protocol Automated Test Suite     \n");
@@ -585,6 +663,7 @@ int main(void) {
     test_v3_lease_gc_and_subg_failover();
     test_v3_afh_cold_boot_scan();
     test_v3_fixed_polar_amc_and_sar_qos();
+    test_v3_deep_audit_regressions();
 
     printf("\n------------------------------------------------------------\n");
     printf("SUMMARY: %d passed, %d failed\n", g_tests_passed, g_tests_failed);

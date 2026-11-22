@@ -1,13 +1,13 @@
 window.OPENNEAR_DATA = {
-  "meta": {"total_tx": 1043, "total_rx": 2471, "tdma_collisions": 0, "cra_collisions": 0, "failover_sf": 69, "failover_new_g": "0x004", "pcap_pkts": 1043},
+  "meta": {"total_tx": 1043, "total_rx": 2526, "tdma_collisions": 0, "cra_collisions": 0, "failover_sf": 69, "failover_new_g": "0x004", "pcap_pkts": 1043},
   "nodes": [
     {"name":"G","alive":false,"role":"DEAD","short_id":"0x001","hop":0,"slot":0,"drift_ppm":0.00,"nco_ppm":0.00,"rtt_ns":0,"duty_pct":25.79,"acts":65},
-    {"name":"T1_BK","alive":true,"role":"G-MASTER","short_id":"0x004","hop":0,"slot":2,"drift_ppm":18.50,"nco_ppm":-18.21,"rtt_ns":219,"duty_pct":14.13,"acts":95},
+    {"name":"T1_BK","alive":true,"role":"G-MASTER","short_id":"0x004","hop":0,"slot":2,"drift_ppm":18.50,"nco_ppm":-18.21,"rtt_ns":219,"duty_pct":14.97,"acts":95},
     {"name":"T2_SG","alive":true,"role":"SUB-G","short_id":"0x005","hop":1,"slot":3,"drift_ppm":-15.20,"nco_ppm":15.80,"rtt_ns":242,"duty_pct":19.42,"acts":95},
     {"name":"T3","alive":true,"role":"T-NODE","short_id":"0x006","hop":1,"slot":4,"drift_ppm":24.00,"nco_ppm":-24.10,"rtt_ns":258,"duty_pct":10.30,"acts":95},
     {"name":"T4","alive":true,"role":"T-NODE","short_id":"0x007","hop":1,"slot":5,"drift_ppm":-21.50,"nco_ppm":21.76,"rtt_ns":291,"duty_pct":11.02,"acts":95},
     {"name":"T5","alive":true,"role":"T-NODE","short_id":"0x008","hop":1,"slot":6,"drift_ppm":11.80,"nco_ppm":-11.36,"rtt_ns":305,"duty_pct":9.96,"acts":95},
-    {"name":"T6","alive":true,"role":"T-NODE","short_id":"0x002","hop":1,"slot":0,"drift_ppm":-9.40,"nco_ppm":9.36,"rtt_ns":334,"duty_pct":7.48,"acts":95},
+    {"name":"T6","alive":true,"role":"T-NODE","short_id":"0x002","hop":1,"slot":0,"drift_ppm":-9.40,"nco_ppm":9.36,"rtt_ns":334,"duty_pct":7.80,"acts":95},
     {"name":"T7","alive":true,"role":"T-NODE","short_id":"0x003","hop":1,"slot":1,"drift_ppm":19.70,"nco_ppm":-19.50,"rtt_ns":346,"duty_pct":9.42,"acts":95},
     {"name":"T8_E1","alive":true,"role":"T-NODE","short_id":"0x100","hop":2,"slot":0,"drift_ppm":-23.10,"nco_ppm":23.79,"rtt_ns":517,"duty_pct":7.04,"acts":91},
     {"name":"T9_E2","alive":true,"role":"T-NODE","short_id":"0x101","hop":2,"slot":1,"drift_ppm":16.40,"nco_ppm":-16.19,"rtt_ns":543,"duty_pct":7.23,"acts":91}

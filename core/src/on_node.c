@@ -59,11 +59,29 @@ static uint16_t select_next_subg_id(const on_node_t *node) {
     return ON_SHORT_ID_UNASSIGNED;
 }
 
+static uint16_t alloc_unique_short_id(on_node_t *node) {
+    for (uint32_t tries = 0u; tries < 250u; ++tries) {
+        uint16_t cand = node->next_alloc_id++;
+        if (node->next_alloc_id > 0x0FEu || node->next_alloc_id < 0x002u) {
+            node->next_alloc_id = 0x002u;
+        }
+        if (cand < 0x002u || cand > 0x0FEu) {
+            cand = 0x002u;
+        }
+        if (cand != node->short_id && find_peer_by_id(node, cand) == NULL) {
+            return cand;
+        }
+    }
+    return 0x0FEu;
+}
+
 static bool is_secured_frame_type(uint8_t type) {
     return (type == ON_FRAME_TDMA_DATA ||
             type == ON_FRAME_CRA_ALERT ||
             type == ON_FRAME_RTT_REQ   ||
-            type == ON_FRAME_RTT_RESP);
+            type == ON_FRAME_RTT_RESP  ||
+            type == ON_FRAME_JOIN_REQ  ||
+            type == ON_FRAME_JOIN_ACK);
 }
 
 static void tune_channel(on_node_t *node, uint8_t ch_idx) {
@@ -295,7 +313,7 @@ static void handle_join_req(on_node_t *node, const on_mac_hdr_t *hdr,
                 memset(pe, 0, sizeof(*pe));
                 pe->active       = true;
                 memcpy(pe->mac48, req.mac48, 6u);
-                pe->short_id     = as_sub ? (uint16_t)(0x100u + free_slot) : node->next_alloc_id++;
+                pe->short_id     = as_sub ? (uint16_t)(0x100u + free_slot) : alloc_unique_short_id(node);
                 pe->slot_idx     = free_slot;
                 pe->is_sub_slot  = as_sub;
                 pe->capabilities = req.capabilities;
@@ -623,17 +641,29 @@ void on_node_on_rx_raw(on_node_t *node, const uint8_t *frame, size_t len, int64_
                     emit_event(node, "CRA_ALERT_RX", dp.origin_id, dp.data_len > 0 ? dp.data[0] : 0);
                 }
             } else if (node->role == ON_ROLE_SUB_G && hdr.is_sub_g && hdr.dst_id == node->short_id) {
-                /* Sub-G receives edge node telemetry inside carved Sub-G window -> queue relay to G */
+                /* Sub-G receives edge node telemetry inside carved Sub-G window -> enqueue in 4-slot FIFO */
                 node->tdma_rx_total++;
                 if (hdr.type == ON_FRAME_TDMA_DATA) {
                     node->sub_rx_slot_mask_this_sf |= (uint16_t)(1u << (hdr.slot_idx & 0x0Fu));
                 }
-                node->relay_buf = dp;
-                node->relay_buf.hop_count++;
-                node->relay_buf.flags |= 0x02u; /* mark relayed */
-                node->has_relay_payload = true;
+                on_peer_entry_t *pe = find_peer_by_id(node, hdr.src_id);
+                if (pe) {
+                    pe->last_seen_sf = node->current_sf_seq;
+                    pe->last_skew_ns = dp.skew_ns_est;
+                    pe->rx_packets++;
+                }
+                on_data_payload_t rdp = dp;
+                rdp.hop_count++;
+                rdp.flags |= 0x02u; /* mark relayed */
+                if (node->relay_count < ON_DEFAULT_SUBG_MAX_SLOTS) {
+                    node->relay_q[node->relay_tail] = rdp;
+                    node->relay_tail = (uint8_t)((node->relay_tail + 1u) % ON_DEFAULT_SUBG_MAX_SLOTS);
+                    node->relay_count++;
+                }
             } else if (node->short_id == node->backup_id && !hdr.is_sub_g) {
-                /* Hot-standby Backup_ID passively mirrors active 1-hop peer table */
+                /* Hot-standby Backup_ID passively mirrors active 1-hop peer table & capabilities */
+                uint8_t peer_caps = (uint8_t)((dp.flags >> 6) & 0x03u);
+                if (peer_caps == 0u) peer_caps = 0x01u;
                 on_peer_entry_t *pe = find_peer_by_id(node, hdr.src_id);
                 if (!pe) {
                     for (uint32_t i = 0; i < ON_MAX_NODES_TABLE; ++i) {
@@ -642,12 +672,13 @@ void on_node_on_rx_raw(on_node_t *node, const uint8_t *frame, size_t len, int64_
                             node->peers[i].short_id     = hdr.src_id;
                             node->peers[i].slot_idx     = hdr.slot_idx;
                             node->peers[i].is_sub_slot  = false;
-                            node->peers[i].capabilities = 0x01u;
+                            node->peers[i].capabilities = peer_caps;
                             node->peers[i].last_seen_sf = node->current_sf_seq;
                             break;
                         }
                     }
                 } else {
+                    pe->capabilities = peer_caps;
                     pe->last_seen_sf = node->current_sf_seq;
                 }
             }
@@ -869,9 +900,11 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
                 node->last_tx_data = dp;
                 node->harq_retry_pending = false;
                 node->harq_retx_total++;
-            } else if (node->role == ON_ROLE_SUB_G && node->has_relay_payload) {
-                dp = node->relay_buf;
-                node->has_relay_payload = false;
+            } else if (node->role == ON_ROLE_SUB_G && node->relay_count > 0u) {
+                dp = node->relay_q[node->relay_head];
+                node->relay_head = (uint8_t)((node->relay_head + 1u) % ON_DEFAULT_SUBG_MAX_SLOTS);
+                node->relay_count--;
+                dp.flags = (uint8_t)((dp.flags & 0x3Fu) | ((node->capabilities & 0x03u) << 6));
                 node->last_tx_data = dp;
             } else {
                 memset(&dp, 0, sizeof(dp));
@@ -880,6 +913,7 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
                 dp.skew_ns_est = (int16_t)(node->sync.last_err_ns > 32000 ? 32000 :
                                           (node->sync.last_err_ns < -32000 ? -32000 : node->sync.last_err_ns));
                 dp.hop_count   = 1u;
+                dp.flags       = (uint8_t)((node->capabilities & 0x03u) << 6);
                 dp.data[0]     = (uint8_t)(node->current_sf_seq & 0xFFu);
                 dp.data_len    = 1u;
                 node->last_tx_data = dp;
@@ -904,13 +938,25 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
         }
     }
 
-    /* Phase 2b: Sub-G Staggered Sub-Superframe (carved 2000..3120 us window) */
+    /* Phase 2b: Sub-G Staggered Sub-Superframe (carved 2040..3160 us window) */
     if (node->role == ON_ROLE_SUB_G && !node->sub_sync_tx_done_this_sf) {
         int64_t sub_start_ns = (int64_t)on_sf_subg_sync_start_us(&node->sf_cfg) * 1000LL;
         if (elapsed_ns >= sub_start_ns && elapsed_ns < sub_start_ns + 80000LL) {
             node->sub_sync_tx_done_this_sf = true;
             node->last_sub_ack_bitmap      = node->sub_rx_slot_mask_this_sf;
             node->sub_rx_slot_mask_this_sf = 0u;
+
+            /* Sub-G Lease Expiry GC for 2-hop child edge slots */
+            for (uint32_t i = 0u; i < ON_MAX_NODES_TABLE; ++i) {
+                if (node->peers[i].active && node->peers[i].is_sub_slot &&
+                    node->current_sf_seq > node->peers[i].last_seen_sf + ON_PEER_LEASE_TIMEOUT_SF) {
+                    uint8_t dead_slot = node->peers[i].slot_idx;
+                    node->sub_tdma_bitmap &= (uint16_t)(~(1u << dead_slot));
+                    node->peers[i].active = false;
+                    node->lease_reclaim_count++;
+                    emit_event(node, "SUB_PEER_LEASE_EXPIRED", node->peers[i].short_id, dead_slot);
+                }
+            }
             send_sync_map(node, true);
         }
     }
@@ -1146,6 +1192,14 @@ bool on_node_is_rx_open(const on_node_t *node, int64_t now_local_ns) {
 
     /* 1-hop T node & Sub-G wake RX during primary SYNC/MAP (0..270 us) */
     if (off_us < 270u || off_us >= (uint32_t)(node->sf_cfg.t_sf_us - 40u)) {
+        return true;
+    }
+
+    /* Hot-standby Backup_ID periodically snoops 1-hop D-TDMA window (every 8th SF) to mirror peer table */
+    if (node->short_id != ON_SHORT_ID_UNASSIGNED &&
+        node->short_id == node->backup_id &&
+        (node->current_sf_seq & 0x07u) == 0u &&
+        off_us < node->sf_cfg.sub_g_start_us) {
         return true;
     }
 

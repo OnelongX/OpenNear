@@ -64,6 +64,12 @@ static int64_t unwrap_rx_timestamp_ns(uint32_t rx_ts32_us) {
     }
     full_rx_us = s_ts_high_us + (uint64_t)rx_ts32_us;
     int64_t aligned_us = (int64_t)full_rx_us + s_rx_to_esp_offset_us;
+    /* Guard against baseband TSF counter jump on Wi-Fi channel hop (> 2 ms divergence from esp_timer) */
+    int64_t drift_us = now_esp_us - aligned_us;
+    if (drift_us > 2000LL || drift_us < -2000LL) {
+        s_rx_to_esp_offset_us = now_esp_us - (int64_t)full_rx_us;
+        aligned_us = now_esp_us;
+    }
     portEXIT_CRITICAL_ISR(&s_ts_mux);
 
     return aligned_us * 1000LL;

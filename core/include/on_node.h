@@ -85,9 +85,11 @@ typedef struct {
     bool           pending_alert;
     uint8_t        alert_code;
 
-    /* Sub-G relay uplink buffer (edge telemetry relayed to primary G) */
-    bool           has_relay_payload;
-    on_data_payload_t relay_buf;
+    /* Sub-G 4-slot FIFO relay ring buffer (prevents multi-edge packet overwrite starvation) */
+    on_data_payload_t relay_q[ON_DEFAULT_SUBG_MAX_SLOTS];
+    uint8_t           relay_head;
+    uint8_t           relay_tail;
+    uint8_t           relay_count;
 
     /* Peer table (used by G, mirrored by Backup_ID, and used by Sub-G for child nodes) */
     on_peer_entry_t peers[ON_MAX_NODES_TABLE];

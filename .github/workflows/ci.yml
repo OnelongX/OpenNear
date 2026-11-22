@@ -1,0 +1,54 @@
+name: OpenNear CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  verify-opennear:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install ARM Cortex-M bare-metal toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-none-eabi binutils-arm-none-eabi libnewlib-arm-none-eabi
+
+      - name: Build & Run Core 12-Suite Automated Test Bench
+        run: |
+          mkdir -p build
+          gcc -std=c11 -O2 -Wall -Wextra -Werror \
+            -Icore/include -Ihal -Isim \
+            core/src/on_frame.c core/src/on_polar.c core/src/on_sync.c \
+            core/src/on_superframe.c core/src/on_sec.c core/src/on_afh.c \
+            core/src/on_amc.c core/src/on_sar.c core/src/on_node.c \
+            sim/sim_world.c tests/test_opennear.c -lm -o build/test_opennear
+          ./build/test_opennear
+
+      - name: Build & Run 10-Node Multi-Hop Lifecycle Simulator
+        run: |
+          gcc -std=c11 -O2 -Wall -Wextra -Werror \
+            -Icore/include -Ihal -Isim \
+            core/src/on_frame.c core/src/on_polar.c core/src/on_sync.c \
+            core/src/on_superframe.c core/src/on_sec.c core/src/on_afh.c \
+            core/src/on_amc.c core/src/on_sar.c core/src/on_node.c \
+            sim/sim_world.c sim/main_sim.c -lm -o build/opennear_sim
+          (cd build && ./opennear_sim)
+
+      - name: Build & Run Route B L1 PHY Benchmark
+        run: |
+          gcc -std=c11 -O2 -Wall -Wextra -Werror \
+            -Icore/include \
+            core/src/on_frame.c core/src/on_polar.c core/src/on_amc.c \
+            ports/sdr_fpga_ref/l1_phy_bench.c -lm -o build/l1_phy_bench
+          ./build/l1_phy_bench
+
+      - name: Cross-Compile Route A Nordic nRF52840 Bare-Metal Firmware (.elf & .hex)
+        run: |
+          make -C ports/nrf52840_bare MASTER=0
+          make -C ports/nrf52840_bare clean
+          make -C ports/nrf52840_bare MASTER=1
