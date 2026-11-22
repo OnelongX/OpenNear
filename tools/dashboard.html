@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OpenNear v3.0 — 协议时隙、多跳锁相与自愈可视化仪表盘</title>
+<style>
+  :root {
+    --bg: #0b1220; --panel: #121c2e; --border: #24344d;
+    --text: #e2e8f0; --muted: #94a3b8;
+    --cyan: #38bdf8; --green: #34d399; --amber: #fbbf24; --red: #f87171; --purple: #a78bfa;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; padding: 24px; }
+  .header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 20px; border-bottom: 1px solid var(--border); padding-bottom: 14px; }
+  .header h1 { font-size: 22px; color: #fff; letter-spacing: 0.5px; }
+  .header .sub { color: var(--muted); font-size: 13px; margin-top: 4px; }
+  .badge { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; background: rgba(56,189,248,0.14); color: var(--cyan); border: 1px solid rgba(56,189,248,0.35); }
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; margin-bottom: 20px; }
+  .kpi { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .kpi .label { font-size: 12px; color: var(--muted); }
+  .kpi .val { font-size: 24px; font-weight: 700; margin-top: 6px; color: var(--cyan); }
+  .kpi.green .val { color: var(--green); }
+  .kpi.amber .val { color: var(--amber); }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-bottom: 18px; }
+  @media (max-width: 960px) { .grid { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px; }
+  .card h2 { font-size: 15px; margin-bottom: 12px; color: #f8fafc; display: flex; justify-content: space-between; }
+  .card h2 span { font-size: 12px; color: var(--muted); font-weight: 400; }
+  canvas { width: 100%; height: 240px; display: block; background: #0d1626; border-radius: 8px; border: 1px solid #1d2b44; }
+  .gantt { display: flex; height: 54px; border-radius: 8px; overflow: hidden; border: 1px solid var(--border); margin: 12px 0 8px; }
+  .seg { display: flex; flex-direction: column; justify-content: center; align-items: center; font-size: 11px; font-weight: 600; color: #09111e; overflow: hidden; white-space: nowrap; }
+  .seg small { font-weight: 400; opacity: 0.85; font-size: 10px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 12px; color: var(--muted); margin-top: 8px; }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: middle; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 6px; }
+  th, td { padding: 8px 10px; border-bottom: 1px solid #1e2d45; text-align: left; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  .tag { padding: 2px 7px; border-radius: 5px; font-size: 11px; font-weight: 600; }
+  .tag-g { background: rgba(251,191,36,0.18); color: var(--amber); }
+  .tag-sg { background: rgba(52,211,153,0.18); color: var(--green); }
+  .tag-t { background: rgba(56,189,248,0.15); color: var(--cyan); }
+  .tag-dead { background: rgba(248,113,113,0.18); color: var(--red); }
+  .footer { text-align: center; color: var(--muted); font-size: 12px; margin-top: 18px; }
+</style>
+</head>
+<body>
+  <div class="header">
+    <div>
+      <h1>OpenNear v3.0 协议栈遥测与多跳同步可视化面板</h1>
+      <div class="sub">6B 极简帧头 · 四段动态超帧 · 亚微秒硬件锁相 · Sub-G 错峰多跳 · Backup_ID 热备 · AES-128-CCM · TSCH AFH</div>
+    </div>
+    <div>
+      <span class="badge" id="statusBadge">实时数据加载中...</span>
+    </div>
+  </div>
+
+  <div class="kpis" id="kpis"></div>
+
+  <div class="card" style="margin-bottom: 18px;">
+    <h2>L2 四段式动态超帧时间轴（T_SF = 4,000 μs / 250 Hz）<span>0 碰撞数学隔离</span></h2>
+    <div class="gantt">
+      <div class="seg" style="width:6%; background:#fbbf24;">SYNC<small>0~240μs</small></div>
+      <div class="seg" style="width:44%; background:#38bdf8;">D-TDMA 11 私有槽 (1-Hop)<small>240 ~ 2,000 μs</small></div>
+      <div class="seg" style="width:1%; background:#334155;"></div>
+      <div class="seg" style="width:28%; background:#34d399;">Sub-G 错峰子超帧 (墙后 2-Hop)<small>2,040 ~ 3,160 μs</small></div>
+      <div class="seg" style="width:1%; background:#334155;"></div>
+      <div class="seg" style="width:10%; background:#a78bfa;">C-RA<small>3.2~3.6ms</small></div>
+      <div class="seg" style="width:10%; background:#f87171;">ACT/QUIET<small>3.6~4.0ms</small></div>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:#fbbf24"></i>SYNC/MAP（含 4B CBC-MAC 防伪造 + Group-ACK + AFH 位图）</span>
+      <span><i class="dot" style="background:#38bdf8"></i>1-Hop 私有微时隙（其余 >90% 时间深睡）</span>
+      <span><i class="dot" style="background:#34d399"></i>Sub-G 独立子窗（Sub-SYNC + 4 子槽 + Sub-CRA）</span>
+      <span><i class="dot" style="background:#a78bfa"></i>C-RA 新节点入网 / RTT / 紧急告警</span>
+      <span><i class="dot" style="background:#f87171"></i>全网静默区，3,700 μs 齐刷刷触发 GPIO</span>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>全网 10 节点物理同步偏差曲线（ns）<span>稳态 / 10帧黑洞滑行 / 主控断电热备</span></h2>
+      <canvas id="skewCanvas" width="600" height="240"></canvas>
+    </div>
+    <div class="card">
+      <h2>10 节点多跳拓扑与同步遥测总表<span>含 2 跳墙后边缘节点 T8/T9</span></h2>
+      <div style="overflow-x:auto;">
+        <table>
+          <thead><tr><th>节点</th><th>角色</th><th>ShortID</th><th>跳数</th><th>晶振漂移</th><th>NCO 锁相</th><th>RTT</th><th>占空比</th></tr></thead>
+          <tbody id="nodeTable"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="footer">
+    由 <code>build_and_test.ps1</code> 自动导出实时仿真数据 <code>tools/opennear_dashboard_data.js</code>；配套 Wireshark 插件：<code>tools/opennear_dissector.lua</code> + <code>build/opennear_capture.pcap</code>
+  </div>
+
+<script src="./opennear_dashboard_data.js"></script>
+<script>
+(function() {
+  const data = window.OPENNEAR_DATA;
+  if (!data) {
+    document.getElementById('statusBadge').textContent = '请先运行 build_and_test.ps1 生成数据';
+    return;
+  }
+  const tl = data.timeline || [];
+  const steady = tl.filter(x => x.sf >= 25 && x.sf <= 34).map(x => x.skew_ns);
+  const holdover = tl.filter(x => x.sf >= 35 && x.sf <= 44).map(x => x.skew_ns);
+  const postFail = tl.filter(x => x.sf >= 72 && x.sf <= 90).map(x => x.skew_ns);
+  const maxOf = arr => arr.length ? Math.max(...arr) : 0;
+
+  document.getElementById('statusBadge').textContent =
+    `实测快照已载入 · ${data.nodes.length} 节点 · ${data.meta.pcap_pkts} PCAP 帧`;
+
+  const kpiItems = [
+    { label: '稳态全网最大偏差 (10节点)', val: `${maxOf(steady)} ns`, cls: 'green' },
+    { label: '10帧黑洞滑行最大偏差', val: `${maxOf(holdover)} ns`, cls: 'green' },
+    { label: '主控断电热备后偏差', val: `${maxOf(postFail)} ns`, cls: 'green' },
+    { label: 'D-TDMA / Sub-G 射频碰撞', val: `${data.meta.tdma_collisions}`, cls: '' },
+    { label: 'Backup_ID 零投票接管', val: `SF #${data.meta.failover_sf} (${data.meta.failover_new_g})`, cls: 'amber' },
+    { label: '总空口收发帧数', val: `${data.meta.total_tx} TX / ${data.meta.total_rx} RX`, cls: '' }
+  ];
+  document.getElementById('kpis').innerHTML = kpiItems.map(k =>
+    `<div class="kpi ${k.cls}"><div class="label">${k.label}</div><div class="val">${k.val}</div></div>`
+  ).join('');
+
+  // Render Node Telemetry Table
+  const roleCls = r => r === 'G-MASTER' ? 'tag-g' : r === 'SUB-G' ? 'tag-sg' : r === 'DEAD' ? 'tag-dead' : 'tag-t';
+  document.getElementById('nodeTable').innerHTML = data.nodes.map(n => `
+    <tr>
+      <td><b>${n.name}</b></td>
+      <td><span class="tag ${roleCls(n.role)}">${n.role}</span></td>
+      <td><code>${n.short_id}</code></td>
+      <td>${n.hop} 跳</td>
+      <td>${n.drift_ppm >= 0 ? '+' : ''}${n.drift_ppm.toFixed(1)} ppm</td>
+      <td>${n.nco_ppm >= 0 ? '+' : ''}${n.nco_ppm.toFixed(2)} ppm</td>
+      <td>${n.rtt_ns} ns</td>
+      <td>${n.duty_pct.toFixed(2)}%</td>
+    </tr>
+  `).join('');
+
+  // Draw Skew Timeline Chart on Canvas
+  const c = document.getElementById('skewCanvas');
+  const ctx = c.getContext('2d');
+  const W = c.width, H = c.height, padL = 48, padR = 16, padT = 22, padB = 28;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const pts = tl.filter(x => x.sf >= 15);
+  const maxSf = pts.length ? pts[pts.length - 1].sf : 95;
+  const minSf = pts.length ? pts[0].sf : 15;
+  const maxY = Math.max(200, ...pts.map(p => p.skew_ns)) * 1.15;
+
+  const xOf = sf => padL + ((sf - minSf) / Math.max(1, maxSf - minSf)) * plotW;
+  const yOf = ns => padT + plotH - (ns / maxY) * plotH;
+
+  // Highlight Holdover (SF 35..44) and Failover (SF 65..69) zones
+  ctx.fillStyle = 'rgba(251, 191, 36, 0.12)';
+  ctx.fillRect(xOf(35), padT, xOf(44) - xOf(35), plotH);
+  ctx.fillStyle = 'rgba(248, 113, 113, 0.14)';
+  ctx.fillRect(xOf(65), padT, xOf(69) - xOf(65), plotH);
+
+  // Grid & Y labels
+  ctx.strokeStyle = '#1e2d45'; ctx.lineWidth = 1;
+  ctx.fillStyle = '#94a3b8'; ctx.font = '11px sans-serif';
+  for (let g = 0; g <= 4; g++) {
+    const val = Math.round((maxY * g) / 4);
+    const y = yOf(val);
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke();
+    ctx.fillText(val + 'ns', 4, y + 4);
+  }
+
+  // Labels for highlighted phases
+  ctx.fillStyle = '#fbbf24'; ctx.fillText('10帧黑洞滑行', xOf(35) + 4, padT + 14);
+  ctx.fillStyle = '#f87171'; ctx.fillText('G断电→热备', xOf(65) - 6, padT + 14);
+
+  // Polyline
+  ctx.strokeStyle = '#38bdf8'; ctx.lineWidth = 2;
+  ctx.beginPath();
+  pts.forEach((p, idx) => {
+    const x = xOf(p.sf), y = yOf(p.skew_ns);
+    if (idx === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+
+  // X Axis
+  ctx.fillStyle = '#94a3b8';
+  for (let sf = 20; sf <= maxSf; sf += 15) {
+    ctx.fillText('SF ' + sf, xOf(sf) - 12, H - 8);
+  }
+})();
+</script>
+</body>
+</html>

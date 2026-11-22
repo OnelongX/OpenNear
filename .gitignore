@@ -1,0 +1,19 @@
+# Build outputs & binaries
+build/
+*.o
+*.a
+*.exe
+*.elf
+*.hex
+*.bin
+*.map
+*.pcap
+*.csv
+
+# PlatformIO & IDE files
+.pio/
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
