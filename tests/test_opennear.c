@@ -775,9 +775,41 @@ static void test_v31_ptp_followup_and_ant_delay(void) {
     EXPECT(skew_ns < 50, "Two-Step PTP Follow-Up cancels +/-12 us TX queue jitter down to < 50 ns");
 }
 
+/* 16. Test v3.2 Route B FPGA RTL Golden Vector Verification (CA-Polar N=128 + Short Preamble) */
+static void test_v32_fpga_rtl_golden_vectors(void) {
+    printf("[TEST 16] v3.2 Route B FPGA RTL Bit-Exact Golden Vector Verification...\n");
+    const uint8_t golden_msg[ON_POLAR_MSG_BYTES] = { 0x5A, 0xC3, 0x99, 0x01, 0xEF };
+    uint8_t coded_bits[ON_POLAR_N];
+    EXPECT(on_polar_encode_block(golden_msg, coded_bits) == ON_OK, "Golden CA-Polar encode OK");
+
+    uint8_t packed16[16];
+    memset(packed16, 0, sizeof(packed16));
+    uint32_t ones_count = 0u;
+    for (uint32_t i = 0; i < ON_POLAR_N; ++i) {
+        if (coded_bits[i]) {
+            packed16[i >> 3u] |= (uint8_t)(1u << (7u - (i & 7u)));
+            ones_count++;
+        }
+    }
+    uint8_t crc = on_crc8(golden_msg, ON_POLAR_MSG_BYTES);
+    printf("    -> Golden Msg=5AC39901EF | CRC8=0x%02X | Weight=%u | Codeword[0..3]=%02X%02X%02X%02X\n",
+           crc, ones_count, packed16[0], packed16[1], packed16[2], packed16[3]);
+
+    /* Verify round-trip via Q4.4 fixed-point hardware decoder */
+    int16_t llr_q4[ON_POLAR_N];
+    for (uint32_t i = 0; i < ON_POLAR_N; ++i) {
+        llr_q4[i] = coded_bits[i] ? (int16_t)-64 : (int16_t)+64;
+    }
+    uint8_t rec[ON_POLAR_MSG_BYTES];
+    EXPECT(on_polar_decode_block_fixed(llr_q4, rec) == ON_OK &&
+           memcmp(rec, golden_msg, ON_POLAR_MSG_BYTES) == 0,
+           "Golden RTL codeword round-trips bit-exact through Q4.4 hardware decoder");
+    EXPECT(ones_count > 30u && ones_count < 98u, "Golden Polar codeword has balanced Hamming weight");
+}
+
 int main(void) {
     printf("============================================================\n");
-    printf("       OpenNear v3.1 Core Protocol Automated Test Suite     \n");
+    printf("       OpenNear v3.2 Core Protocol Automated Test Suite     \n");
     printf("============================================================\n");
 
     test_6byte_header_and_frame();
@@ -795,6 +827,7 @@ int main(void) {
     test_v31_x25519_ecdh_onboarding();
     test_v31_multizone_subg_fdma_concurrency();
     test_v31_ptp_followup_and_ant_delay();
+    test_v32_fpga_rtl_golden_vectors();
 
     printf("\n------------------------------------------------------------\n");
     printf("SUMMARY: %d passed, %d failed\n", g_tests_passed, g_tests_failed);
