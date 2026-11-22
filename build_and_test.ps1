@@ -22,6 +22,7 @@ $core = @(
     "$Root\core\src\on_sync.c",
     "$Root\core\src\on_superframe.c",
     "$Root\core\src\on_sec.c",
+    "$Root\core\src\on_ecdh.c",
     "$Root\core\src\on_afh.c",
     "$Root\core\src\on_amc.c",
     "$Root\core\src\on_sar.c",
@@ -124,6 +125,7 @@ if ((Test-Path $xbin) -and (Test-Path $sdk)) {
         "$Root\core\src\on_sync.c",
         "$Root\core\src\on_superframe.c",
         "$Root\core\src\on_sec.c",
+        "$Root\core\src\on_ecdh.c",
         "$Root\core\src\on_afh.c",
         "$Root\core\src\on_amc.c",
         "$Root\core\src\on_sar.c",
@@ -138,7 +140,7 @@ if ((Test-Path $xbin) -and (Test-Path $sdk)) {
     & xtensa-esp32-elf-g++ -std=gnu++11 -Os -Wall -Wextra -mlongcalls -fno-rtti -fno-exceptions `
         -c "$Root\ports\esp32_wroom32\src\main.cpp" @espInc -o "$BuildDir\esp32_obj\main.o"
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    Write-Host "  OK: Route C ESP32-WROOM-32 Xtensa cross-compilation passed (10/10 object files)." -ForegroundColor Green
+    Write-Host "  OK: Route C ESP32-WROOM-32 Xtensa cross-compilation passed (11/11 object files)." -ForegroundColor Green
 } else {
     Write-Host "  SKIP: ESP32 Xtensa toolchain not found in default PlatformIO path." -ForegroundColor Yellow
 }

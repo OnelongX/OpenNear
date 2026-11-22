@@ -180,11 +180,16 @@ on_err_t on_sync_payload_pack(const on_sync_payload_t *p, uint8_t *out, size_t c
     if (!p || !out || !len) return ON_ERR_INVALID_ARG;
     if (cap < ON_SYNC_PAYLOAD_WIRE_LEN) return ON_ERR_NO_MEM;
 
+    uint16_t sg2 = p->sub_g_id_2 & ON_SHORT_ID_MASK;
+    uint16_t bk_packed  = (uint16_t)((p->backup_id & ON_SHORT_ID_MASK) | ((sg2 & 0x00Fu) << 12));
+    uint16_t sg1_packed = (uint16_t)((p->sub_g_id  & ON_SHORT_ID_MASK) | (((sg2 >> 4) & 0x00Fu) << 12));
+    uint8_t  hop_packed = (uint8_t)((p->hop_depth & 0x0Fu) | (((sg2 >> 8) & 0x00Fu) << 4));
+
     put_u32_le(out + 0,  p->sf_seq);
     put_i64_le(out + 4,  p->t_tx_net_ns);
     put_u16_le(out + 12, p->t_sf_us);
-    put_u16_le(out + 14, p->backup_id & ON_SHORT_ID_MASK);
-    put_u16_le(out + 16, p->sub_g_id & ON_SHORT_ID_MASK);
+    put_u16_le(out + 14, bk_packed);
+    put_u16_le(out + 16, sg1_packed);
     put_u16_le(out + 18, p->sub_g_win_start_us);
     put_u16_le(out + 20, p->sub_g_win_len_us);
     put_u16_le(out + 22, p->tdma_bitmap);
@@ -194,10 +199,9 @@ on_err_t on_sync_payload_pack(const on_sync_payload_t *p, uint8_t *out, size_t c
     put_u32_le(out + 30, p->session_salt);
     out[34] = p->key_epoch;
     out[35] = p->act_cmd;
-    out[36] = p->hop_depth;
+    out[36] = hop_packed;
     out[37] = p->flags;
-    out[38] = 0u;
-    out[39] = 0u;
+    put_u16_le(out + 38, (uint16_t)p->prev_tx_err_ns);
     memcpy(out + 40, p->beacon_mac, 4u);
     *len = ON_SYNC_PAYLOAD_WIRE_LEN;
     return ON_OK;
@@ -207,11 +211,18 @@ on_err_t on_sync_payload_unpack(const uint8_t *in, size_t len, on_sync_payload_t
     if (!in || !p) return ON_ERR_INVALID_ARG;
     if (len < ON_SYNC_PAYLOAD_WIRE_LEN) return ON_ERR_TOO_SHORT;
 
+    uint16_t bk_raw  = get_u16_le(in + 14);
+    uint16_t sg1_raw = get_u16_le(in + 16);
+    uint8_t  hop_raw = in[36];
+
     p->sf_seq             = get_u32_le(in + 0);
     p->t_tx_net_ns        = get_i64_le(in + 4);
     p->t_sf_us            = get_u16_le(in + 12);
-    p->backup_id          = get_u16_le(in + 14) & ON_SHORT_ID_MASK;
-    p->sub_g_id           = get_u16_le(in + 16) & ON_SHORT_ID_MASK;
+    p->backup_id          = bk_raw  & ON_SHORT_ID_MASK;
+    p->sub_g_id           = sg1_raw & ON_SHORT_ID_MASK;
+    p->sub_g_id_2         = (uint16_t)(((bk_raw >> 12) & 0x00Fu) |
+                                       (((sg1_raw >> 12) & 0x00Fu) << 4) |
+                                       (((uint16_t)(hop_raw >> 4) & 0x00Fu) << 8));
     p->sub_g_win_start_us = get_u16_le(in + 18);
     p->sub_g_win_len_us   = get_u16_le(in + 20);
     p->tdma_bitmap        = get_u16_le(in + 22);
@@ -221,8 +232,9 @@ on_err_t on_sync_payload_unpack(const uint8_t *in, size_t len, on_sync_payload_t
     p->session_salt       = get_u32_le(in + 30);
     p->key_epoch          = in[34];
     p->act_cmd            = in[35];
-    p->hop_depth          = in[36];
+    p->hop_depth          = hop_raw & 0x0Fu;
     p->flags              = in[37];
+    p->prev_tx_err_ns     = (int16_t)get_u16_le(in + 38);
     memcpy(p->beacon_mac, in + 40, 4u);
     return ON_OK;
 }

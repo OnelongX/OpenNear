@@ -13,6 +13,7 @@ SRCS := \
     ../../core/src/on_sync.c \
     ../../core/src/on_superframe.c \
     ../../core/src/on_sec.c \
+    ../../core/src/on_ecdh.c \
     ../../core/src/on_afh.c \
     ../../core/src/on_amc.c \
     ../../core/src/on_sar.c \

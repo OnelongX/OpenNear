@@ -16,8 +16,10 @@ void on_sync_init(on_sync_ctx_t *ctx) {
     ctx->has_prev         = false;
     ctx->prev_rx_local_ns = 0;
     ctx->prev_tx_net_ns   = 0;
+    ctx->last_dt_loc_ns   = 0;
     ctx->rtt_calibrated   = false;
     ctx->link_delay_ns    = 0;
+    ctx->ant_delay_ns     = 0;
     ctx->kp               = 0.65;
     ctx->ki               = 0.05;
     ctx->max_rate_ppb     = 200000.0; /* +/- 200 ppm crystal bound */
@@ -53,7 +55,7 @@ int64_t on_sync_net_to_local(const on_sync_ctx_t *ctx, int64_t target_net_ns) {
 int64_t on_sync_on_beacon(on_sync_ctx_t *ctx, int64_t t_tx_net_ns, int64_t t_rx_local_ns) {
     if (!ctx) return 0;
 
-    int64_t t_expected_net_ns = t_tx_net_ns + ctx->link_delay_ns;
+    int64_t t_expected_net_ns = t_tx_net_ns + ctx->link_delay_ns + ctx->ant_delay_ns;
     ctx->holdover_frames = 0u;
 
     /* Acquisition step 1: First beacon -> snap phase immediately */
@@ -76,6 +78,7 @@ int64_t on_sync_on_beacon(on_sync_ctx_t *ctx, int64_t t_tx_net_ns, int64_t t_rx_
     if (ctx->lock_count == 1u && ctx->has_prev) {
         int64_t dt_loc = t_rx_local_ns - ctx->prev_rx_local_ns;
         int64_t dt_net = t_expected_net_ns - ctx->prev_tx_net_ns;
+        ctx->last_dt_loc_ns = dt_loc;
         if (dt_loc > 100000) { /* > 100 us sanity check */
             double est_ppb = ((double)(dt_net - dt_loc) / (double)dt_loc) * 1e9;
             if (est_ppb >  ctx->max_rate_ppb) est_ppb =  ctx->max_rate_ppb;
@@ -97,6 +100,7 @@ int64_t on_sync_on_beacon(on_sync_ctx_t *ctx, int64_t t_tx_net_ns, int64_t t_rx_
         ctx->ref_net_ns       = t_expected_net_ns;
         ctx->prev_rx_local_ns = t_rx_local_ns;
         ctx->prev_tx_net_ns   = t_expected_net_ns;
+        ctx->last_dt_loc_ns   = 0;
         ctx->lock_count++;
         ctx->last_err_ns = err_ns;
         return err_ns;
@@ -104,6 +108,7 @@ int64_t on_sync_on_beacon(on_sync_ctx_t *ctx, int64_t t_tx_net_ns, int64_t t_rx_
 
     /* Steady-state digital NCO TC-PLL PI tracking */
     int64_t dt_loc = t_rx_local_ns - ctx->prev_rx_local_ns;
+    ctx->last_dt_loc_ns = dt_loc;
     if (dt_loc > 100000) {
         /* Re-base reference point to prevent double precision drift over long runs */
         ctx->ref_net_ns   = t_pred_net_ns + (int64_t)llround(ctx->kp * (double)err_ns);
@@ -172,4 +177,35 @@ on_err_t on_sync_on_rtt(on_sync_ctx_t *ctx,
 void on_sync_on_missed_beacon(on_sync_ctx_t *ctx) {
     if (!ctx) return;
     ctx->holdover_frames++;
+}
+
+void on_sync_apply_followup(on_sync_ctx_t *ctx, int16_t prev_tx_err_ns) {
+    if (!ctx || !ctx->locked || prev_tx_err_ns == 0) return;
+    /* Exact algebraic correction for the previous beacon's true antenna departure (+prev_tx_err_ns) */
+    double e = (double)prev_tx_err_ns;
+    ctx->prev_tx_net_ns += (int64_t)prev_tx_err_ns;
+
+    if (ctx->lock_count <= 1u || ctx->last_dt_loc_ns <= 100000) {
+        ctx->ref_net_ns += (int64_t)prev_tx_err_ns;
+    } else if (ctx->lock_count == 2u) {
+        ctx->ref_net_ns += (int64_t)prev_tx_err_ns;
+        ctx->rate_ppb   += (e / (double)ctx->last_dt_loc_ns) * 1e9;
+    } else {
+        /* Undo false PI proportional & integral kick caused by uncompensated TX queue delay */
+        ctx->ref_net_ns += (int64_t)llround(ctx->kp * e);
+        double dt_sec = (double)ctx->last_dt_loc_ns * 1e-9;
+        ctx->rate_ppb += ctx->ki * (e / dt_sec);
+    }
+    if (ctx->rate_ppb >  ctx->max_rate_ppb) ctx->rate_ppb =  ctx->max_rate_ppb;
+    if (ctx->rate_ppb < -ctx->max_rate_ppb) ctx->rate_ppb = -ctx->max_rate_ppb;
+}
+
+void on_sync_set_ant_delay_ns(on_sync_ctx_t *ctx, int64_t ant_delay_ns) {
+    if (!ctx) return;
+    int64_t delta = ant_delay_ns - ctx->ant_delay_ns;
+    ctx->ant_delay_ns = ant_delay_ns;
+    if (ctx->locked && delta != 0) {
+        ctx->ref_net_ns     += delta;
+        ctx->prev_tx_net_ns += delta;
+    }
 }

@@ -14,11 +14,12 @@ opennear/
 │   │   ├── on_polar.h               # L1 控制面短码 CA-Polar (N=128, K=48, CA-SCL L=8)
 │   │   ├── on_sync.h                # L3 亚微秒同步三步链：硬捕获 + 4时间戳 RTT + NCO TC-PLL
 │   │   ├── on_superframe.h          # L2 四段式超帧排班（SYNC/MAP -> D-TDMA/Sub-G -> C-RA -> ACT/QUIET）
-│   │   ├── on_sec.h                 # v3.0 安全层：AES-128-CCM + Beacon CBC-MAC 防伪造 + Session Salt + 密钥轮换
-│   │   ├── on_afh.h                 # v3.0 TSCH 自适应跳频 + Wi-Fi 干扰黑名单 + 原子倒计时 + 冷启动扫频
-│   │   ├── on_amc.h                 # v3.0 L1 双波形速率自适应调制编码（2M MSK <-> 4M QPSK <-> 20M OFDM）
-│   │   ├── on_sar.h                 # v3.0 轻量分片重组（最高 1 KB OTA/流）+ 3 级抢占式 QoS 队列
-│   │   └── on_node.h                # 完整节点引擎（G / T / Sub-G 自愈 / Lease GC / Backup_ID / Fast HARQ）
+│   │   ├── on_sec.h                 # v3.1 安全层：AES-128-CCM + Beacon CBC-MAC 防伪造 + Session Salt + 密钥轮换
+│   │   ├── on_ecdh.h                # v3.1 零预置密钥配网：恒定时间 X25519 (RFC 7748) + OOB PIN 密钥派生
+│   │   ├── on_afh.h                 # v3.1 TSCH 自适应跳频 + Wi-Fi 干扰黑名单 + 原子倒计时 + 冷启动扫频
+│   │   ├── on_amc.h                 # v3.1 L1 双波形速率自适应调制编码（2M MSK <-> 4M QPSK <-> 20M OFDM）
+│   │   ├── on_sar.h                 # v3.1 轻量分片重组（最高 1 KB OTA/流）+ 3 级抢占式 QoS 队列
+│   │   └── on_node.h                # 完整节点引擎（G / T / 双区 FDMA Sub-G / Lease GC / Backup_ID / Fast HARQ）
 │   └── src/
 ├── hal/
 │   └── on_hal.h                     # 跨平台射频 / 高精定时器 / GPIO 硬件抽象层
@@ -26,7 +27,7 @@ opennear/
 │   ├── sim_world.h / sim_world.c
 │   └── main_sim.c
 ├── tests/
-│   └── test_opennear.c              # 11 组全链路自动化单测与集成断言套件（84 项断言）
+│   └── test_opennear.c              # 15 组全链路自动化单测与集成断言套件（105 项断言）
 ├── tools/
 │   ├── dashboard.html               # 交互式 HTML 协议可视化面板（直接双击打开，零服务器依赖）
 │   └── opennear_dissector.lua       # Wireshark Lua 抓包解析插件（DLT_USER0 = 147）

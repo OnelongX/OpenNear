@@ -32,6 +32,7 @@ static int              s_act_gpio = ON_ESP32_ACT_LED_GPIO;
 static esp_timer_handle_t s_act_timer = NULL;
 static volatile uint8_t s_pending_act_level = 0u;
 static volatile int64_t s_last_tx_queue_us  = 0;
+static volatile int16_t s_pending_followup_err_ns = 0;
 
 static void IRAM_ATTR act_timer_cb(void *arg) {
     (void)arg;
@@ -134,8 +135,16 @@ static on_err_t esp32_tx_raw(void *ctx, const uint8_t *frame, size_t len, int64_
     int64_t t_pre = esp_timer_get_time();
     esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, raw80211,
                                       (int)(ON_CARRIER_HDR_LEN + len), false);
-    /* Record Wi-Fi TX queue submission latency for PTP-style follow-up calibration */
-    s_last_tx_queue_us = esp_timer_get_time() - t_pre;
+    int64_t t_post = esp_timer_get_time();
+    /* Record Wi-Fi TX queue submission latency for IEEE 1588 PTP Two-Step Follow-Up calibration */
+    s_last_tx_queue_us = t_post - t_pre;
+    uint8_t ftype = (uint8_t)((frame[0] >> 2) & 0x0Fu);
+    if ((ftype == ON_FRAME_SYNC_MAP || ftype == ON_FRAME_SUB_SYNC) && tx_at_local_ns > 0) {
+        int64_t err_ns = (t_post * 1000LL) - tx_at_local_ns;
+        if (err_ns >  32000LL) err_ns =  32000LL;
+        if (err_ns < -32000LL) err_ns = -32000LL;
+        s_pending_followup_err_ns = (int16_t)err_ns;
+    }
     return (err == ESP_OK) ? ON_OK : ON_ERR_NOT_READY;
 }
 
@@ -224,6 +233,10 @@ on_err_t on_esp32_hal_init(const on_esp32_cfg_t *cfg, on_hal_ops_t *hal_out) {
 }
 
 void on_esp32_hal_poll_rx(on_node_t *node) {
+    if (s_pending_followup_err_ns != 0) {
+        on_node_record_sync_tx_err_ns(node, s_pending_followup_err_ns);
+        s_pending_followup_err_ns = 0;
+    }
     while (s_rx_tail != s_rx_head) {
         const esp32_rx_slot_t *slot = &s_rx_ring[s_rx_tail];
         on_node_on_rx_raw(node, slot->data, slot->len, slot->rx_local_ns);

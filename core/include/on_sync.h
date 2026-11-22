@@ -23,14 +23,16 @@ typedef struct {
     int64_t  ref_net_ns;
     double   rate_ppb;        /* Fractional frequency correction in parts-per-billion (1 ppm = 1000 ppb) */
 
-    /* Previous sample for 2-point fast frequency acquisition */
+    /* Previous sample for 2-point fast frequency acquisition & PTP follow-up exact inverse */
     bool     has_prev;
     int64_t  prev_rx_local_ns;
     int64_t  prev_tx_net_ns;
+    int64_t  last_dt_loc_ns;
 
-    /* Step 2: Calibrated one-way propagation + analog frontend group delay */
+    /* Step 2: Calibrated one-way propagation + analog frontend / antenna group delay */
     bool     rtt_calibrated;
     int64_t  link_delay_ns;
+    int64_t  ant_delay_ns;    /* v3.1: Calibrated board-level RF balun/antenna group delay */
 
     /* PI Controller tuning */
     double   kp;              /* Proportional phase gain (0..1) */
@@ -73,6 +75,14 @@ int64_t on_sync_net_to_local(const on_sync_ctx_t *ctx, int64_t target_net_ns);
 
 /* Notify sync engine of a missed SYNC frame (increments coasting/holdover counter) */
 void    on_sync_on_missed_beacon(on_sync_ctx_t *ctx);
+
+/*
+ * v3.1 IEEE 1588 PTP Two-Step Follow-Up & Board Antenna Delay Calibration:
+ * Retroactively corrects the previous SYNC beacon's actual TX antenna departure offset
+ * (prev_tx_err_ns) before locking to the current beacon, eliminating software TX queue jitter!
+ */
+void    on_sync_apply_followup(on_sync_ctx_t *ctx, int16_t prev_tx_err_ns);
+void    on_sync_set_ant_delay_ns(on_sync_ctx_t *ctx, int64_t ant_delay_ns);
 
 #ifdef __cplusplus
 }

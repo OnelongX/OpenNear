@@ -146,6 +146,7 @@ static void send_sync_map(on_node_t *node, bool is_sub_sync) {
     sp.t_sf_us            = node->sf_cfg.t_sf_us;
     sp.backup_id          = is_sub_sync ? ON_SHORT_ID_UNASSIGNED : node->backup_id;
     sp.sub_g_id           = node->sub_g_id;
+    sp.sub_g_id_2         = node->sub_g_id_2;
     sp.sub_g_win_start_us = node->sf_cfg.sub_g_start_us;
     sp.sub_g_win_len_us   = node->sf_cfg.sub_g_len_us;
     sp.tdma_bitmap        = is_sub_sync ? node->sub_tdma_bitmap : node->tdma_bitmap;
@@ -153,6 +154,8 @@ static void send_sync_map(on_node_t *node, bool is_sub_sync) {
     sp.channel_map        = node->has_pending_ch_map ? node->pending_channel_map : node->afh.channel_map;
     sp.ack_bitmap         = is_sub_sync ? node->last_sub_ack_bitmap : node->last_ack_bitmap;
     sp.session_salt       = node->sec.session_salt;
+    sp.prev_tx_err_ns     = node->last_sync_tx_err_ns;
+    node->last_sync_tx_err_ns = 0; /* Consume once in follow-up */
     sp.key_epoch          = node->sec.key_epoch;
     sp.act_cmd            = node->act_cmd;
     sp.hop_depth          = is_sub_sync ? 1u : 0u;
@@ -253,6 +256,17 @@ void on_node_set_backup_and_subg(on_node_t *node, uint16_t backup_id, uint16_t s
     node->sub_g_id  = sub_g_id & ON_SHORT_ID_MASK;
 }
 
+void on_node_set_multi_subg(on_node_t *node, uint16_t sub_g_zone0_id, uint16_t sub_g_zone1_id) {
+    if (!node) return;
+    node->sub_g_id   = sub_g_zone0_id & ON_SHORT_ID_MASK;
+    node->sub_g_id_2 = sub_g_zone1_id & ON_SHORT_ID_MASK;
+}
+
+void on_node_record_sync_tx_err_ns(on_node_t *node, int16_t tx_err_ns) {
+    if (!node) return;
+    node->last_sync_tx_err_ns = tx_err_ns;
+}
+
 void on_node_enable_security(on_node_t *node, const uint8_t key16[ON_SEC_KEY_LEN]) {
     if (!node || !key16) return;
     on_sec_set_key(&node->sec, key16);
@@ -313,7 +327,8 @@ static void handle_join_req(on_node_t *node, const on_mac_hdr_t *hdr,
                 memset(pe, 0, sizeof(*pe));
                 pe->active       = true;
                 memcpy(pe->mac48, req.mac48, 6u);
-                pe->short_id     = as_sub ? (uint16_t)(0x100u + free_slot) : alloc_unique_short_id(node);
+                pe->short_id     = as_sub ? (uint16_t)((node->sub_g_zone ? 0x200u : 0x100u) + free_slot)
+                                          : alloc_unique_short_id(node);
                 pe->slot_idx     = free_slot;
                 pe->is_sub_slot  = as_sub;
                 pe->capabilities = req.capabilities;
@@ -470,6 +485,11 @@ void on_node_on_rx_raw(on_node_t *node, const uint8_t *frame, size_t len, int64_
                 on_sec_set_session(&node->sec, sp.session_salt, sp.key_epoch);
             }
 
+            /* v3.1 IEEE 1588 PTP Two-Step Follow-Up: apply previous beacon's TX departure error */
+            if (sp.prev_tx_err_ns != 0) {
+                on_sync_apply_followup(&node->sync, sp.prev_tx_err_ns);
+            }
+
             /* Step 1 + Step 3: Hardware RX capture feeds TC-PLL / NCO lock */
             on_sync_on_beacon(&node->sync, sp.t_tx_net_ns, rx_local_ns);
             node->sync_rx_total++;
@@ -495,15 +515,17 @@ void on_node_on_rx_raw(on_node_t *node, const uint8_t *frame, size_t len, int64_
                 node->tdma_bitmap = sp.tdma_bitmap;
                 node->backup_id   = sp.backup_id;
                 node->sub_g_id    = sp.sub_g_id;
+                node->sub_g_id_2  = sp.sub_g_id_2;
                 if (node->role == ON_ROLE_UNJOINED) {
                     node->is_sub_node = false;
                 }
-                /* Promote to Sub-G proxy if designated by primary G */
+                /* Promote to Zone-0 or Zone-1 Sub-G proxy if designated by primary G */
                 if (node->role == ON_ROLE_T &&
                     node->short_id != ON_SHORT_ID_UNASSIGNED &&
-                    node->short_id == sp.sub_g_id) {
-                    node->role = ON_ROLE_SUB_G;
-                    emit_event(node, "PROMOTED_SUB_G", node->short_id, (int64_t)sp.sf_seq);
+                    (node->short_id == sp.sub_g_id || node->short_id == sp.sub_g_id_2)) {
+                    node->role       = ON_ROLE_SUB_G;
+                    node->sub_g_zone = (node->short_id == sp.sub_g_id_2) ? 1u : 0u;
+                    emit_event(node, "PROMOTED_SUB_G", node->short_id, (int64_t)node->sub_g_zone);
                 }
             }
 
@@ -938,13 +960,23 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
         }
     }
 
-    /* Phase 2b: Sub-G Staggered Sub-Superframe (carved 2040..3160 us window) */
-    if (node->role == ON_ROLE_SUB_G && !node->sub_sync_tx_done_this_sf) {
+    /* Phase 2b: Sub-G Staggered Sub-Superframe (Zone 0 + Zone 1 orthogonal FDMA concurrency!) */
+    if (node->role == ON_ROLE_SUB_G) {
         int64_t sub_start_ns = (int64_t)on_sf_subg_sync_start_us(&node->sf_cfg) * 1000LL;
-        if (elapsed_ns >= sub_start_ns && elapsed_ns < sub_start_ns + 80000LL) {
+        int64_t sub_end_ns   = sub_start_ns + (int64_t)node->sf_cfg.sub_g_len_us * 1000LL;
+
+        if (!node->sub_sync_tx_done_this_sf && elapsed_ns >= sub_start_ns && elapsed_ns < sub_start_ns + 80000LL) {
             node->sub_sync_tx_done_this_sf = true;
             node->last_sub_ack_bitmap      = node->sub_rx_slot_mask_this_sf;
             node->sub_rx_slot_mask_this_sf = 0u;
+
+            /* Zone-1 Sub-G hops onto orthogonal FDMA channel (+8 offset) during Sub-G window */
+            if (node->sub_g_zone == 1u && node->hal.radio_set_channel) {
+                uint8_t base_ch = on_afh_channel_for(&node->afh, node->current_sf_seq, 0u);
+                uint8_t z1_ch   = (uint8_t)((base_ch + 8u) & 0x0Fu);
+                node->hal.radio_set_channel(node->hal.user_ctx, z1_ch);
+                node->in_subg_z1_ch = true;
+            }
 
             /* Sub-G Lease Expiry GC for 2-hop child edge slots */
             for (uint32_t i = 0u; i < ON_MAX_NODES_TABLE; ++i) {
@@ -958,6 +990,11 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
                 }
             }
             send_sync_map(node, true);
+        } else if (node->in_subg_z1_ch && elapsed_ns >= sub_end_ns) {
+            /* Return Zone-1 Sub-G to primary superframe channel after Sub-G window closes */
+            uint8_t base_ch = on_afh_channel_for(&node->afh, node->current_sf_seq, 0u);
+            node->hal.radio_set_channel(node->hal.user_ctx, base_ch);
+            node->in_subg_z1_ch = false;
         }
     }
 

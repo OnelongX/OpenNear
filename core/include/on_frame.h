@@ -34,7 +34,8 @@ typedef struct {
     int64_t  t_tx_net_ns;       /* Exact network TX timestamp (ns) at preamble correlation point */
     uint16_t t_sf_us;           /* Programmable superframe duration (1000..20000 us) */
     uint16_t backup_id;         /* 12-bit Short-ID of hot-standby Backup G node */
-    uint16_t sub_g_id;          /* 12-bit Short-ID of delegated Sub-G relay proxy (0 if none) */
+    uint16_t sub_g_id;          /* 12-bit Short-ID of Zone-0 Sub-G relay proxy (0 if none) */
+    uint16_t sub_g_id_2;        /* v3.1: 12-bit Short-ID of Zone-1 FDMA Sub-G relay proxy */
     uint16_t sub_g_win_start_us;/* Start offset of carved Sub-G window inside D-TDMA (us) */
     uint16_t sub_g_win_len_us;  /* Length of carved Sub-G window (us) */
     uint16_t tdma_bitmap;       /* 16-bit allocated slot occupancy bitmap */
@@ -42,6 +43,7 @@ typedef struct {
     uint16_t channel_map;       /* 16-bit TSCH/AFH active channel mask (1=clean, 0=blacklisted) */
     uint16_t ack_bitmap;        /* 16-bit Piggyback Group-ACK mask for previous SF D-TDMA slots */
     uint32_t session_salt;      /* v3.0: Per-boot random salt preventing post-reboot Nonce reuse */
+    int16_t  prev_tx_err_ns;    /* v3.1: IEEE 1588 PTP Two-Step follow-up TX departure error (ns) */
     uint8_t  key_epoch;         /* v3.0: Active key rotation epoch (0..255) */
     uint8_t  act_cmd;           /* Synchronized action payload (e.g. LED blink pattern / epoch) */
     uint8_t  hop_depth;         /* 0 for primary G, 1 for Sub-G */

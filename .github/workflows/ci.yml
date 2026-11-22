@@ -24,7 +24,7 @@ jobs:
           gcc -std=c11 -O2 -Wall -Wextra -Werror \
             -Icore/include -Ihal -Isim \
             core/src/on_frame.c core/src/on_polar.c core/src/on_sync.c \
-            core/src/on_superframe.c core/src/on_sec.c core/src/on_afh.c \
+            core/src/on_superframe.c core/src/on_sec.c core/src/on_ecdh.c core/src/on_afh.c \
             core/src/on_amc.c core/src/on_sar.c core/src/on_node.c \
             sim/sim_world.c tests/test_opennear.c -lm -o build/test_opennear
           ./build/test_opennear
@@ -34,7 +34,7 @@ jobs:
           gcc -std=c11 -O2 -Wall -Wextra -Werror \
             -Icore/include -Ihal -Isim \
             core/src/on_frame.c core/src/on_polar.c core/src/on_sync.c \
-            core/src/on_superframe.c core/src/on_sec.c core/src/on_afh.c \
+            core/src/on_superframe.c core/src/on_sec.c core/src/on_ecdh.c core/src/on_afh.c \
             core/src/on_amc.c core/src/on_sar.c core/src/on_node.c \
             sim/sim_world.c sim/main_sim.c -lm -o build/opennear_sim
           (cd build && ./opennear_sim)

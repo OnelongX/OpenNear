@@ -4,6 +4,7 @@
 #include "on_sync.h"
 #include "on_superframe.h"
 #include "on_sec.h"
+#include "on_ecdh.h"
 #include "on_afh.h"
 #include "on_amc.h"
 #include "on_sar.h"
@@ -647,9 +648,136 @@ static void test_v3_deep_audit_regressions(void) {
            t1_mirrored_peers, w.nodes[2].lease_reclaim_count);
 }
 
+/* 13. Test v3.1 X25519 (RFC 7748 Section 6.1 Test Vector) + Zero-Touch OOB Onboarding KDF */
+static void test_v31_x25519_ecdh_onboarding(void) {
+    printf("[TEST 13] v3.1 X25519 (RFC 7748 Section 6.1 Vector) + Zero-Touch OOB Onboarding...\n");
+
+    /* Official RFC 7748 Section 6.1 Alice & Bob test vectors */
+    static const uint8_t alice_priv[32] = {
+        0x77,0x07,0x6d,0x0a,0x73,0x18,0xa5,0x7d,0x3c,0x16,0xc1,0x72,0x51,0xb2,0x66,0x45,
+        0xdf,0x4c,0x2f,0x87,0xeb,0xc0,0x99,0x2a,0xb1,0x77,0xfb,0xa5,0x1d,0xb9,0x2c,0x2a
+    };
+    static const uint8_t alice_pub_exp[32] = {
+        0x85,0x20,0xf0,0x09,0x89,0x30,0xa7,0x54,0x74,0x8b,0x7d,0xdc,0xb4,0x3e,0xf7,0x5a,
+        0x0d,0xbf,0x3a,0x0d,0x26,0x38,0x1a,0xf4,0xeb,0xa4,0xa9,0x8e,0xaa,0x9b,0x4e,0x6a
+    };
+    static const uint8_t bob_priv[32] = {
+        0x5d,0xab,0x08,0x7e,0x62,0x4a,0x8a,0x4b,0x79,0xe1,0x7f,0x8b,0x83,0x80,0x0e,0xe6,
+        0x6f,0x3b,0xb1,0x29,0x26,0x18,0xb6,0xfd,0x1c,0x2f,0x8b,0x27,0xff,0x88,0xe0,0xeb
+    };
+    static const uint8_t bob_pub_exp[32] = {
+        0xde,0x9e,0xdb,0x7d,0x7b,0x7d,0xc1,0xb4,0xd3,0x5b,0x61,0xc2,0xec,0xe4,0x35,0x37,
+        0x3f,0x83,0x43,0xc8,0x5b,0x78,0x67,0x4d,0xad,0xfc,0x7e,0x14,0x6f,0x88,0x2b,0x4f
+    };
+    static const uint8_t shared_exp[32] = {
+        0x4a,0x5d,0x9d,0x5b,0xa4,0xce,0x2d,0xe1,0x72,0x8e,0x3b,0xf4,0x80,0x35,0x0f,0x25,
+        0xe0,0x7e,0x21,0xc9,0x47,0xd1,0x9e,0x33,0x76,0xf0,0x9b,0x3c,0x1e,0x16,0x17,0x42
+    };
+
+    uint8_t alice_pub[32], bob_pub[32], shared_a[32], shared_b[32];
+    on_x25519_public_key(alice_priv, alice_pub);
+    on_x25519_public_key(bob_priv, bob_pub);
+    EXPECT(memcmp(alice_pub, alice_pub_exp, 32u) == 0, "X25519 Alice public key matches RFC 7748");
+    EXPECT(memcmp(bob_pub, bob_pub_exp, 32u) == 0, "X25519 Bob public key matches RFC 7748");
+
+    EXPECT(on_x25519_shared_secret(alice_priv, bob_pub, shared_a) == ON_OK, "Alice ECDH succeeds");
+    EXPECT(on_x25519_shared_secret(bob_priv, alice_pub, shared_b) == ON_OK, "Bob ECDH succeeds");
+    EXPECT(memcmp(shared_a, shared_exp, 32u) == 0, "X25519 shared secret matches RFC 7748 Section 6.1");
+    EXPECT(memcmp(shared_a, shared_b, 32u) == 0, "Alice and Bob derive identical 256-bit shared secret");
+
+    /* Zero-touch OOB PIN KDF verification */
+    const uint8_t mac48[6] = { 0x02, 0x4F, 0x4E, 0x00, 0x01, 0x09 };
+    uint8_t key_a[16], key_b[16], key_wrong_pin[16], tag_a[4], tag_b[4], tag_wrong[4];
+    on_ecdh_derive_onboarding_key(shared_a, 884219u, mac48, key_a, tag_a);
+    on_ecdh_derive_onboarding_key(shared_b, 884219u, mac48, key_b, tag_b);
+    on_ecdh_derive_onboarding_key(shared_b, 884218u, mac48, key_wrong_pin, tag_wrong);
+
+    EXPECT(memcmp(key_a, key_b, 16u) == 0 && memcmp(tag_a, tag_b, 4u) == 0,
+           "Matching OOB PIN derives identical 128-bit network key & confirmation tag");
+    EXPECT(memcmp(key_a, key_wrong_pin, 16u) != 0 && memcmp(tag_a, tag_wrong, 4u) != 0,
+           "1-digit OOB PIN mismatch produces completely different key & confirmation tag");
+}
+
+/* 14. Test v3.1 Multi-Zone Sub-G Orthogonal FDMA Concurrency (Zone 0 T2->T8 || Zone 1 T3->T9) */
+static void test_v31_multizone_subg_fdma_concurrency(void) {
+    printf("[TEST 14] v3.1 Multi-Zone Sub-G Orthogonal FDMA Concurrency (Zone 0 || Zone 1)...\n");
+    sim_world_t w;
+    sim_world_init(&w, 0xF0A22026ULL);
+    w.verbose = false;
+    sim_world_setup_10node_demo(&w, true);
+
+    /* Configure T2 (0x003) as East-Wall Zone-0 Sub-G and T3 (0x004) as West-Wall Zone-1 Sub-G */
+    w.nodes[3].capabilities |= 0x02u;
+    on_node_set_multi_subg(&w.nodes[0], 0x003u, 0x004u);
+
+    /* East-Wall T8 ONLY hears Zone-0 T2 (on ch 0); West-Wall T9 ONLY hears Zone-1 T3 (on orthogonal ch 8) */
+    w.can_hear[2][8] = w.can_hear[8][2] = true;
+    w.can_hear[2][9] = w.can_hear[9][2] = false;
+    w.can_hear[3][9] = w.can_hear[9][3] = true;  w.link_delay_ns[3][9] = w.link_delay_ns[9][3] = 360;
+    w.can_hear[3][8] = w.can_hear[8][3] = false;
+    w.cur_ch[9] = 8u; /* T9 listens on Zone-1 orthogonal channel 8 */
+
+    sim_world_run_us(&w, 120000, 10); /* 30 SFs */
+
+    printf("    -> T2(Zone=%u)->T8(id=0x%03X) | T3(Zone=%u)->T9(id=0x%03X) | Collisions=%u\n",
+           w.nodes[2].sub_g_zone, w.nodes[8].short_id,
+           w.nodes[3].sub_g_zone, w.nodes[9].short_id,
+           w.tdma_subg_collisions);
+
+    EXPECT(w.nodes[2].role == ON_ROLE_SUB_G && w.nodes[2].sub_g_zone == 0u,
+           "T2 promoted to Zone-0 Sub-G proxy");
+    EXPECT(w.nodes[3].role == ON_ROLE_SUB_G && w.nodes[3].sub_g_zone == 1u,
+           "T3 promoted to Zone-1 FDMA Sub-G proxy");
+    EXPECT(w.nodes[8].role == ON_ROLE_T && w.nodes[8].short_id == 0x100u,
+           "East-wall T8 joined Zone-0 Sub-G T2 (assigned 0x100)");
+    EXPECT(w.nodes[9].role == ON_ROLE_T && w.nodes[9].short_id == 0x200u,
+           "West-wall T9 joined Zone-1 Sub-G T3 concurrently on orthogonal channel (assigned 0x200)");
+    EXPECT(w.tdma_subg_collisions == 0u,
+           "Zero RF collisions despite Zone-0 and Zone-1 broadcasting SUB_SYNC at the same instant");
+}
+
+/* 15. Test v3.1 IEEE 1588 PTP Two-Step Follow-Up TX-Queue Jitter Cancellation + Antenna Delay */
+static void test_v31_ptp_followup_and_ant_delay(void) {
+    printf("[TEST 15] v3.1 IEEE 1588 PTP Two-Step Follow-Up (+/-12 us TX Queue Jitter) + Ant Delay...\n");
+    on_sync_ctx_t sync;
+    on_sync_init(&sync);
+    on_sync_set_ant_delay_ns(&sync, 85); /* 85 ns calibrated RF balun/antenna group delay */
+
+    const double true_drift_ppm = -16.5;
+    const int64_t true_air_delay_ns = 315; /* total true delay = 315 + 85 = 400 ns */
+    const int64_t boot_off_ns = 2468000;
+    sync.link_delay_ns  = true_air_delay_ns;
+    sync.rtt_calibrated = true;
+
+    int16_t prev_err_ns = 0;
+    for (int sf = 0; sf < 20; ++sf) {
+        int64_t nominal_tx_net = (int64_t)sf * 4000000LL;
+        /* Simulate severe ESP32 Wi-Fi software TX queue jitter: alternating +12 us / -12 us! */
+        int16_t actual_tx_err = (sf == 0) ? 0 : ((sf & 1) ? +12000 : -12000);
+        int64_t actual_tx_phys = nominal_tx_net + actual_tx_err;
+        int64_t rx_phys = actual_tx_phys + true_air_delay_ns + 85;
+        int64_t rx_loc  = boot_off_ns + (int64_t)llround((double)rx_phys * (1.0 + true_drift_ppm * 1e-6));
+
+        /* Two-step follow-up applies previous frame's measured TX departure error before locking */
+        on_sync_apply_followup(&sync, prev_err_ns);
+        on_sync_on_beacon(&sync, nominal_tx_net, rx_loc);
+        prev_err_ns = actual_tx_err;
+    }
+    /* Apply final follow-up for SF 19 */
+    on_sync_apply_followup(&sync, prev_err_ns);
+
+    int64_t test_phys = 20LL * 4000000LL;
+    int64_t test_loc  = boot_off_ns + (int64_t)llround((double)test_phys * (1.0 + true_drift_ppm * 1e-6));
+    int64_t est_net   = on_sync_local_to_net(&sync, test_loc);
+    int64_t skew_ns   = llabs(est_net - test_phys);
+    printf("    -> Despite +/-12,000 ns TX queue jitter, post-Follow-Up residual skew = %lld ns\n",
+           (long long)skew_ns);
+    EXPECT(skew_ns < 50, "Two-Step PTP Follow-Up cancels +/-12 us TX queue jitter down to < 50 ns");
+}
+
 int main(void) {
     printf("============================================================\n");
-    printf("       OpenNear v3.0 Core Protocol Automated Test Suite     \n");
+    printf("       OpenNear v3.1 Core Protocol Automated Test Suite     \n");
     printf("============================================================\n");
 
     test_6byte_header_and_frame();
@@ -664,6 +792,9 @@ int main(void) {
     test_v3_afh_cold_boot_scan();
     test_v3_fixed_polar_amc_and_sar_qos();
     test_v3_deep_audit_regressions();
+    test_v31_x25519_ecdh_onboarding();
+    test_v31_multizone_subg_fdma_concurrency();
+    test_v31_ptp_followup_and_ant_delay();
 
     printf("\n------------------------------------------------------------\n");
     printf("SUMMARY: %d passed, %d failed\n", g_tests_passed, g_tests_failed);

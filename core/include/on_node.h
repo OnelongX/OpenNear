@@ -51,6 +51,10 @@ typedef struct {
     uint16_t       sub_tdma_bitmap;
     uint16_t       backup_id;
     uint16_t       sub_g_id;
+    uint16_t       sub_g_id_2;         /* v3.1: Zone-1 secondary FDMA Sub-G relay proxy */
+    uint8_t        sub_g_zone;         /* 0 = Zone-0, 1 = Zone-1 (+8 orthogonal channel offset) */
+    bool           in_subg_z1_ch;      /* True while Zone-1 Sub-G is hopped onto orthogonal channel */
+    int16_t        last_sync_tx_err_ns;/* v3.1: Measured SYNC TX departure error for PTP follow-up */
     uint8_t        act_cmd;
     bool           sync_rx_this_sf;
     uint32_t       missed_sync_count;
@@ -126,8 +130,12 @@ on_err_t on_node_register_static_peer(on_node_t *node, const uint8_t mac48[6],
                                       uint16_t short_id, uint8_t slot_idx,
                                       uint8_t capabilities, bool is_sub_slot);
 
-/* Configure Primary G's designated Backup_ID and Sub-G proxy */
+/* Configure Primary G's designated Backup_ID and Sub-G proxy (single or dual-zone FDMA) */
 void     on_node_set_backup_and_subg(on_node_t *node, uint16_t backup_id, uint16_t sub_g_id);
+void     on_node_set_multi_subg(on_node_t *node, uint16_t sub_g_zone0_id, uint16_t sub_g_zone1_id);
+
+/* v3.1: Report actual hardware TX departure error (ns) of the last SYNC beacon for PTP Follow-Up */
+void     on_node_record_sync_tx_err_ns(on_node_t *node, int16_t tx_err_ns);
 
 /* v2.0: Enable AES-128-CCM AEAD encryption & monotonic anti-replay with 16-byte master key */
 void     on_node_enable_security(on_node_t *node, const uint8_t key16[ON_SEC_KEY_LEN]);
