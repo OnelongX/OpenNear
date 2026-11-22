@@ -45,8 +45,12 @@ uint8_t on_afh_channel_for(const on_afh_ctx_t *ctx, uint32_t sf_seq, uint8_t slo
     }
     if (count == 0u) return 0u;
 
-    /* Prime stride 17 (> 16) is coprime with EVERY active count 1..16, guaranteeing full-band coverage */
-    uint32_t idx = (sf_seq * 17u + (uint32_t)slot_offset * 3u) % (uint32_t)count;
+    /*
+     * Prime stride 23 (> 16) is coprime with EVERY active count 1..16 AND
+     * 23 mod 16 = 7 (+14 MHz jump per SF), ensuring consecutive superframes
+     * never land inside the same 4-channel (20 MHz) Wi-Fi band twice in a row.
+     */
+    uint32_t idx = (sf_seq * 23u + (uint32_t)slot_offset * 3u) % (uint32_t)count;
     return active[idx];
 }
 

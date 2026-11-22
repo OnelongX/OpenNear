@@ -516,9 +516,11 @@ bool sim_world_export_dashboard_js(const sim_world_t *w, const char *js_path) {
     FILE *fp = fopen(js_path, "w");
     if (!fp) return false;
     fprintf(fp, "window.OPENNEAR_DATA = {\n");
-    fprintf(fp, "  \"meta\": {\"total_tx\": %u, \"total_rx\": %u, \"tdma_collisions\": %u, \"cra_collisions\": %u, \"failover_sf\": %u, \"failover_new_g\": \"0x%03X\", \"pcap_pkts\": %u},\n",
+    uint16_t final_afh = w->alive[0] ? w->nodes[0].afh.channel_map : w->nodes[1].afh.channel_map;
+    fprintf(fp, "  \"meta\": {\"total_tx\": %u, \"total_rx\": %u, \"tdma_collisions\": %u, \"cra_collisions\": %u, \"failover_sf\": %u, \"failover_new_g\": \"0x%03X\", \"pcap_pkts\": %u, \"jammed_drops\": %u, \"sync_drops\": %u, \"afh_map\": \"0x%04X\"},\n",
             w->total_tx_packets, w->total_rx_packets, w->tdma_subg_collisions, w->cra_collisions,
-            w->failover_sf_seq, w->failover_new_g_id, w->pcap_pkts);
+            w->failover_sf_seq, w->failover_new_g_id, w->pcap_pkts,
+            w->jammed_drops, w->sync_drops_injected, final_afh);
     fprintf(fp, "  \"nodes\": [\n");
     for (uint32_t i = 0; i < w->num_nodes; ++i) {
         const on_node_t *n = &w->nodes[i];

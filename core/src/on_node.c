@@ -833,7 +833,12 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
         /* Listening for initial SYNC/MAP or SUB_SYNC (with v3.0 AFH channel scan) */
         if (node->hal.radio_set_rx) node->hal.radio_set_rx(node->hal.user_ctx, true);
         if (node->afh.enabled) {
-            if (node->scan_last_hop_local_ns == 0) {
+            if (node->sync_rx_total > 0u) {
+                /* Re-attaching node (e.g. after Sub-G failover) already has NCO net time & AFH map */
+                int64_t est_net_ns = on_sync_local_to_net(&node->sync, now_local_ns);
+                uint32_t est_sf = (est_net_ns > 0) ? (uint32_t)(est_net_ns / t_sf_ns) : node->current_sf_seq;
+                tune_channel(node, on_afh_channel_for(&node->afh, est_sf, 0u));
+            } else if (node->scan_last_hop_local_ns == 0) {
                 node->scan_last_hop_local_ns = now_local_ns;
             } else if ((now_local_ns - node->scan_last_hop_local_ns) >= 16000000LL) {
                 /* Dwell 16 ms (4 superframes) per channel then sweep across all 16 channels */
@@ -871,6 +876,9 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
         node->sync_rx_this_sf   = true;
         node->act_fired_this_sf = false;
         node->act_cmd           = (uint8_t)((node->current_sf_seq / 10u) & 0x01u);
+        if (node->afh.enabled) {
+            tune_channel(node, on_afh_channel_for(&node->afh, node->current_sf_seq, 0u));
+        }
 
         send_sync_map(node, false);
         emit_event(node, "BACKUP_TAKEOVER", node->short_id, (int64_t)node->current_sf_seq);
@@ -892,7 +900,12 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
         node->cra_tx_done_this_sf      = false;
         node->ch_pretuned_this_sf      = false;
         if (node->afh.enabled) {
-            tune_channel(node, on_afh_channel_for(&node->afh, node->current_sf_seq, 0u));
+            if (node->missed_sync_count > 6u) {
+                node->scan_ch_idx = (uint8_t)((node->scan_ch_idx + 1u) % ON_AFH_NUM_CHANNELS);
+                tune_channel(node, node->scan_ch_idx);
+            } else {
+                tune_channel(node, on_afh_channel_for(&node->afh, node->current_sf_seq, 0u));
+            }
         }
 
         /* v3.0 2-hop edge node self-healing: if Sub-G proxy dies, detach & re-join new Sub-G */
@@ -911,7 +924,8 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
 
     /* Phase 2a: Primary D-TDMA private slot TX (with Piggyback Group-ACK Fast HARQ) */
     if ((node->role == ON_ROLE_T || node->role == ON_ROLE_SUB_G) &&
-        !node->is_sub_node && !node->tdma_tx_done_this_sf) {
+        !node->is_sub_node && !node->tdma_tx_done_this_sf &&
+        !(node->afh.enabled && node->missed_sync_count > 6u)) {
         int64_t slot_ns = (int64_t)on_sf_slot_start_us(&node->sf_cfg, node->my_slot) * 1000LL;
         if (elapsed_ns >= slot_ns && elapsed_ns < slot_ns + 80000LL) {
             node->tdma_tx_done_this_sf = true;
@@ -1157,7 +1171,12 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
                 node->afh_countdown      = 0u;
             }
         }
-        tune_channel(node, on_afh_channel_for(&node->afh, node->current_sf_seq + 1u, 0u));
+        if (node->missed_sync_count > 6u) {
+            node->scan_ch_idx = (uint8_t)((node->scan_ch_idx + 1u) % ON_AFH_NUM_CHANNELS);
+            tune_channel(node, node->scan_ch_idx);
+        } else {
+            tune_channel(node, on_afh_channel_for(&node->afh, node->current_sf_seq + 1u, 0u));
+        }
     }
 }
 
