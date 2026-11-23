@@ -44,6 +44,11 @@ size_t on_mqtt_encode_connect(const char *client_id, const char *username,
                               const char *password, uint16_t keepalive_s,
                               uint8_t *out, size_t cap);
 
+size_t on_mqtt_encode_connect_lwt(const char *client_id, const char *username,
+                                  const char *password, uint16_t keepalive_s,
+                                  const char *will_topic, const char *will_msg,
+                                  bool will_retain, uint8_t *out, size_t cap);
+
 bool   on_mqtt_decode_connack(const uint8_t *in, size_t len, uint8_t *out_return_code);
 
 size_t on_mqtt_encode_publish(const char *topic, const uint8_t *payload, size_t payload_len,
@@ -72,6 +77,12 @@ bool   on_mqtt_format_ha_discovery_mac(uint16_t short_id, const uint8_t mac48[6]
                                        uint8_t hop_depth, const char *role_name,
                                        char *topic_out, size_t topic_cap,
                                        char *json_out, size_t json_cap);
+
+bool   on_mqtt_format_ha_discovery_full(uint16_t short_id, const uint8_t mac48[6],
+                                        uint8_t hop_depth, const char *role_name,
+                                        const char *alias_name, const char *avail_topic,
+                                        char *topic_out, size_t topic_cap,
+                                        char *json_out, size_t json_cap);
 
 bool   on_mqtt_format_node_state(uint16_t short_id, uint16_t parent_id, uint8_t hop_depth,
                                  int16_t skew_ns, const uint8_t *data, uint8_t data_len,

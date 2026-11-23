@@ -357,6 +357,62 @@ on_err_t on_gw_handle_control_text(on_gw_ctx_t *gw, const char *text, size_t len
         return ON_OK;
     }
 
+    /* Format 9: NETKEY:[<32hex>] -> Set custom AES-128 cluster master key (empty clears to default) */
+    if (clean_len >= 7u && memcmp(text, "NETKEY:", 7u) == 0) {
+        const char *hex = text + 7;
+        size_t hlen = (size_t)(end - hex);
+        if (hlen == 0u) {
+            memset(gw->cfg.net_key, 0, sizeof(gw->cfg.net_key));
+            gw->cfg.net_key_custom  = false;
+            gw->cfg.net_key_updated = true;
+            return ON_OK;
+        }
+        if (hlen != 32u) return ON_ERR_INVALID_ARG;
+        uint8_t kbuf[16];
+        for (size_t i = 0u; i < 16u; ++i) {
+            int hi = -1, lo = -1;
+            char c1 = hex[i * 2u], c2 = hex[i * 2u + 1u];
+            if (c1 >= '0' && c1 <= '9') hi = c1 - '0';
+            else if (c1 >= 'A' && c1 <= 'F') hi = 10 + (c1 - 'A');
+            else if (c1 >= 'a' && c1 <= 'f') hi = 10 + (c1 - 'a');
+            if (c2 >= '0' && c2 <= '9') lo = c2 - '0';
+            else if (c2 >= 'A' && c2 <= 'F') lo = 10 + (c2 - 'A');
+            else if (c2 >= 'a' && c2 <= 'f') lo = 10 + (c2 - 'a');
+            if (hi < 0 || lo < 0) return ON_ERR_INVALID_ARG;
+            kbuf[i] = (uint8_t)((hi << 4) | lo);
+        }
+        memcpy(gw->cfg.net_key, kbuf, 16u);
+        gw->cfg.net_key_custom  = true;
+        gw->cfg.net_key_updated = true;
+        return ON_OK;
+    }
+
+    /* Format 10: ALIAS:<MAC_HEX_OR_COLON>|<friendly_name> -> Assign/clear MAC-anchored node alias */
+    if (clean_len > 6u && memcmp(text, "ALIAS:", 6u) == 0) {
+        const char *p1 = text + 6;
+        const char *bar1 = find_sep(p1, end, '|');
+        if (!bar1 || bar1 == p1) return ON_ERR_INVALID_ARG;
+        uint8_t mac[6];
+        size_t nibs = 0u;
+        uint8_t cur = 0u;
+        for (const char *q = p1; q < bar1; ++q) {
+            if (*q == ':' || *q == '-') continue;
+            int v = -1;
+            if (*q >= '0' && *q <= '9') v = *q - '0';
+            else if (*q >= 'A' && *q <= 'F') v = 10 + (*q - 'A');
+            else if (*q >= 'a' && *q <= 'f') v = 10 + (*q - 'a');
+            if (v < 0 || nibs >= 12u) return ON_ERR_INVALID_ARG;
+            if ((nibs & 1u) == 0u) cur = (uint8_t)(v << 4);
+            else mac[nibs >> 1] = (uint8_t)(cur | (uint8_t)v);
+            nibs++;
+        }
+        if (nibs != 12u) return ON_ERR_INVALID_ARG;
+        memcpy(gw->cfg.alias_mac, mac, 6u);
+        copy_cstr(gw->cfg.alias_name, sizeof(gw->cfg.alias_name), bar1 + 1, (size_t)(end - (bar1 + 1)));
+        gw->cfg.alias_updated = true;
+        return ON_OK;
+    }
+
     return ON_ERR_INVALID_ARG;
 }
 

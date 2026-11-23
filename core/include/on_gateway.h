@@ -82,6 +82,12 @@ typedef struct {
     bool     topo_include_data;
     bool     wifi_reset_requested;
     bool     reboot_requested;
+    uint8_t  net_key[16];      /* v6.7 Optional custom AES-128 cluster master key (NETKEY:<32hex>) */
+    bool     net_key_custom;
+    bool     net_key_updated;
+    uint8_t  alias_mac[6];     /* v6.7 MAC-anchored node alias update (ALIAS:<MAC>|<name>) */
+    char     alias_name[24];
+    bool     alias_updated;
 } on_gw_config_t;
 
 /* Lock-free SPSC ring buffer for cross-core/cross-task decoupling (ON_GW_RING_DEPTH must be power of 2) */

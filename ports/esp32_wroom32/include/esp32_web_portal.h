@@ -58,7 +58,7 @@ th{color:var(--mut);font-weight:600;font-size:12px}
     <div class="brand">
       <h1>OpenNear</h1>
       <span class="badge" id="b-role">加载中...</span>
-      <span class="badge" id="b-fw">v6.6</span>
+      <span class="badge" id="b-fw">v6.7</span>
     </div>
     <div class="row">
       <input id="g-token" type="password" placeholder="Admin Token (如已设置)" style="width:185px" onchange="saveLocalToken()">
@@ -83,7 +83,7 @@ th{color:var(--mut);font-weight:600;font-size:12px}
       </div>
       <div class="tbl-wrap">
         <table>
-          <thead><tr><th>Short-ID</th><th>MAC 地址 (Wi-Fi)</th><th>角色</th><th>跳数</th><th>父节点</th><th>时隙</th><th>同步偏差</th><th>收包</th><th>OTA</th><th>实时载荷 (Hex / ASCII)</th><th>操作</th></tr></thead>
+          <thead><tr><th>Short-ID</th><th>节点名称 / MAC 地址</th><th>角色</th><th>跳数</th><th>父节点</th><th>时隙</th><th>同步偏差</th><th>收包</th><th>OTA</th><th>实时载荷 (Hex / ASCII)</th><th>操作</th></tr></thead>
           <tbody id="node-rows"><tr><td colspan="11" class="muted">正在拉取集群快照...</td></tr></tbody>
         </table>
       </div>
@@ -137,10 +137,9 @@ th{color:var(--mut);font-weight:600;font-size:12px}
         </div>
       </div>
       <div class="muted mono" style="margin-top:12px;line-height:1.7">
-        HA 自动发现: homeassistant/sensor/opennear_&lt;MACHEX&gt;/config（按硬件 MAC 永久锚定）<br>
-        节点状态上报: opennear/node/0x&lt;ID&gt;/state<br>
-        云端下行控制: opennear/cmd/0x&lt;ID&gt;<br>
-        集群 OTA 触发: opennear/ota/trigger
+        HA 自动发现: homeassistant/sensor/opennear_&lt;MACHEX&gt;/config（按 MAC 永久锚定 + 别名 + LWT）<br>
+        网关在线遗嘱: <span id="mqtt-avty-hint">opennear/gw/&lt;MAC&gt;/status</span>（online / offline）<br>
+        节点状态上报: opennear/node/0x&lt;ID&gt;/state | 下行控制: opennear/cmd/0x&lt;ID&gt;
       </div>
     </div>
   </section>
@@ -172,16 +171,18 @@ th{color:var(--mut);font-weight:600;font-size:12px}
     </div>
 
     <div class="card">
-      <h2>网关管理安全令牌（Admin Token）与维护</h2>
+      <h2>网关管理安全令牌（Admin Token）、集群空口密钥与维护</h2>
       <div class="grid">
         <div><label>新 Admin Token（留空表示清除鉴权）</label><input id="t-new" type="password" placeholder="例如 OpenNear2026"></div>
+        <div><label>集群 AES-128 空口密钥（32位 Hex，留空恢复默认）</label><input id="k-net" class="mono" placeholder="例如 00112233445566778899AABBCCDDEEFF"></div>
       </div>
       <div class="row" style="margin-top:10px">
         <button class="btn sec" onclick="updateAdminToken()">保存 / 轮换 Token</button>
+        <button class="btn sec" onclick="updateNetKey()">保存空口密钥</button>
         <button class="btn sec" onclick="resetWifi()">清除 Wi-Fi 并重开热点</button>
         <button class="btn danger" onclick="rebootGw()">重启网关</button>
       </div>
-      <div class="muted" style="margin-top:8px">设置 Token 后所有写接口需在顶部输入 Token 或携带 X-OpenNear-Token 请求头</div>
+      <div class="muted" style="margin-top:8px">集群内所有节点需配置相同 NETKEY 方可解密通信；修改后自动写入 NVS 并即时生效</div>
     </div>
   </section>
 </div>
@@ -259,8 +260,10 @@ async function fetchStatus(){
       pills.push('<span class="badge mono '+(s.rx_drops>0?'warn':'')+'">TX '+s.tx_ok+'/'+(s.tx_fail||0)+' · RX丢 '+((s.rx_drops)||0)+'</span>');
     }
     pills.push(s.token_set?'<span class="badge ok">Token 保护已启用</span>':'<span class="badge warn">未设 Token</span>');
+    pills.push(s.netkey_custom?'<span class="badge ok">独立集群密钥</span>':'<span class="badge">默认演示密钥</span>');
     pills.push('<span class="badge">运行 '+s.uptime_s+'s</span>');
     $('status-pills').innerHTML=pills.join('');
+    if(s.mqtt_avty&&$('mqtt-avty-hint'))$('mqtt-avty-hint').textContent=s.mqtt_avty;
     const tb=$('tls-state-badge');
     if(tb){
       tb.className='badge '+(s.tls_compiled?'ok':'warn');
@@ -274,6 +277,21 @@ async function fetchStatus(){
       if(s.mqtt_port)$('m-port').value=String(s.mqtt_port);
     }
   }catch(e){}
+}
+let gAliases={};
+async function fetchAliases(){
+  try{const r=await fetch('/api/aliases');gAliases=await r.json()||{};}catch(e){}
+}
+async function renameNode(mac){
+  if(!mac||mac==='--'||mac==='00:00:00:00:00:00'){toast('该节点暂未上报硬件 MAC',true);return;}
+  const cur=gAliases[mac]||'';
+  const name=prompt('为设备 '+mac+' 设置别名（留空清除）：',cur);
+  if(name===null)return;
+  if(await postCmd('ALIAS:'+mac+'|'+name.trim())){
+    toast(name.trim()?'已保存别名并同步 Home Assistant':'已清除别名');
+    await fetchAliases();
+    fetchData();
+  }
 }
 async function fetchData(){
   try{
@@ -289,9 +307,10 @@ async function fetchData(){
     tb.innerHTML=d.nodes.map(n=>{
       const asc=hexToAscii(n.data);
       const rCls=n.role==='G'?'ok':(n.role==='SUB_G'?'warn':'');
+      const al=n.mac&&gAliases[n.mac]?('<b>'+esc(gAliases[n.mac])+'</b><br>'):'';
       return '<tr>'
         +'<td class="mono"><b>'+esc(n.id)+'</b></td>'
-        +'<td class="mono muted">'+esc(n.mac||'--')+'</td>'
+        +'<td class="mono">'+al+'<span class="muted">'+esc(n.mac||'--')+'</span> <button class="btn sec sm" style="padding:1px 6px" onclick="renameNode(\''+esc(n.mac||'')+'\')">改名</button></td>'
         +'<td><span class="badge '+rCls+'">'+esc(n.role)+'</span></td>'
         +'<td>Hop '+n.hop+'</td>'
         +'<td class="mono">'+esc(n.parent)+'</td>'
@@ -308,11 +327,17 @@ async function fetchData(){
 let gScanAps=[];
 async function scanWifi(){
   const btn=$('btn-scan');
-  btn.disabled=true;btn.textContent='扫描中...';
+  btn.disabled=true;btn.textContent='异步扫描中...';
   try{
-    const r=await fetch('/api/scan');
-    const list=await r.json();
-    gScanAps=Array.isArray(list)?list:[];
+    let list=[];
+    for(let tries=0;tries<20;++tries){
+      const r=await fetch('/api/scan');
+      const d=await r.json();
+      if(Array.isArray(d)){list=d;break;}
+      if(!d.scanning){list=d.aps||[];break;}
+      await new Promise(res=>setTimeout(res,400));
+    }
+    gScanAps=list;
     const box=$('ap-list');
     box.classList.remove('hide');
     if(!gScanAps.length){
@@ -406,6 +431,15 @@ async function updateAdminToken(){
     fetchStatus();
   }
 }
+async function updateNetKey(){
+  const k=$('k-net').value.trim();
+  if(k&&!/^[0-9a-fA-F]{32}$/.test(k)){toast('空口密钥需为 32 位十六进制字符（或留空恢复默认）',true);return;}
+  if(await postCmd('NETKEY:'+k)){
+    $('k-net').value='';
+    toast(k?'独立集群密钥已保存并生效':'已恢复默认演示密钥');
+    fetchStatus();
+  }
+}
 async function resetWifi(){
   if(!confirm('确认清除已保存的 Wi-Fi 凭据并重新开启 OpenNear-Setup 配网热点？'))return;
   if(await postCmd('RESET_WIFI')){
@@ -419,7 +453,7 @@ async function rebootGw(){
     toast('网关正在重启，约 3 秒后自动恢复...');
   }
 }
-function refreshAll(){fetchStatus();fetchData();}
+function refreshAll(){fetchStatus();fetchAliases().then(fetchData);}
 loadLocalToken();
 refreshAll();
 setInterval(refreshAll,3000);

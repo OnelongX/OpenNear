@@ -38,6 +38,9 @@ void on_esp32_net_gw_poll(on_node_t *node, on_gw_ctx_t *gw);
 void on_esp32_node_lock(void);
 void on_esp32_node_unlock(void);
 
+/* v6.7: Load custom 16-byte AES-128 cluster key from NVS (returns true if custom key is set) */
+bool on_esp32_net_gw_load_netkey(uint8_t out_key[16]);
+
 #ifdef __cplusplus
 }
 #endif

@@ -5,9 +5,9 @@
 **零历史包袱、从零设计的开源类星闪（NearLink-Class）确定性无线协议栈与万物互联混合 Mesh 平台**
 
 [![OpenNear CI](https://github.com/OnelongX/OpenNear/actions/workflows/ci.yml/badge.svg)](https://github.com/OnelongX/OpenNear/actions/workflows/ci.yml)
-![Version](https://img.shields.io/badge/version-v6.6-0ea5e9?style=flat)
+![Version](https://img.shields.io/badge/version-v6.7-0ea5e9?style=flat)
 ![Core](https://img.shields.io/badge/core-Pure%20C11%20%7C%20Zero%20Deps-10b981?style=flat)
-![Tests](https://img.shields.io/badge/tests-36%20Suites%20%7C%20374%20Assertions-22c55e?style=flat)
+![Tests](https://img.shields.io/badge/tests-37%20Suites%20%7C%20382%20Assertions-22c55e?style=flat)
 ![Platforms](https://img.shields.io/badge/hardware-ESP32%20%7C%20nRF52840%20%7C%20FPGA%20RTL-8b5cf6?style=flat)
 ![License](https://img.shields.io/badge/license-MIT-f59e0b?style=flat)
 
@@ -23,7 +23,7 @@
 
 **OpenNear** 借鉴星闪（NearLink / SparkLink）核心思想，采用**纯 C11 零外部依赖协议核**从零构建，在同一套极简协议上打通 **L1 抗干扰物理层 → L2 四段式确定性超帧 → L3 亚微秒同步与多跳自愈 → L4 万物互联云边协同**，让几块钱一块的 **ESP32-WROOM-32** 或 **nRF52840** 就能组成高确定性、自组网、自修复、直连 Home Assistant 与公网云平台的无线集群。
 
-| 能力维度 | OpenNear v6.6 | BLE Mesh | Wi-Fi Mesh | Zigbee / Thread |
+| 能力维度 | OpenNear v6.7 | BLE Mesh | Wi-Fi Mesh | Zigbee / Thread |
 |---|---|---|---|---|
 | **同步精度（硬件定时 / 仿真）** | **亚微秒级（实测 90 ns 稳态）** | 10 ~ 100 ms | 1 ~ 20 ms | 1 ~ 10 ms |
 | **MAC 帧头开销** | **6 字节**（含 `Hdr_CRC8`，隐式模式 2 字节） | 29+ 字节 | 24~36 字节 | 15~25 字节 |
@@ -133,7 +133,7 @@ sequenceDiagram
   - **内置零配置 Web 配网管理台（v6.3）**：存放于 Flash `PROGMEM`（0 字节静态 RAM），无 Wi-Fi 凭据或 20 秒连不上路由器时自动开启 `OpenNear-Setup-XXXX` 热点（`http://192.168.4.1`），支持扫描 Wi-Fi、配置 MQTT/MQTTS、实时监控全网节点、远程控节点、下发 OTA、管理 Admin Token。
   - **可选 MQTTS / HTTPS TLS 加密上云模块（v6.4）**：通过 `-DOPENNEAR_ENABLE_TLS=1` 按需编译，默认零内存开销；开启后支持 MQTTS 8883、HTTPS Webhook/OTA 及 NVS Root CA PEM 证书验签，无缝对接 Home Assistant、EMQX Cloud、AWS IoT、阿里云 IoT。
   - **全网永久硬件 MAC48 透传与实体锚定（v6.5 ~ v6.6）**：自动读取 ESP32 出厂 eFuse Wi-Fi STA MAC（及网关 BLE MAC `ESP_MAC_BT`）/ nRF52840 FICR 地址，经 0~6 跳全链路（Sub-G 私有 D-TDMA `MAC_REPORT` + 3~6 跳 `ON_MESH_TOPO_REPORT` + 3-bit 跳深无截断 `TOPO_RESP`）透传至拓扑表、HTTP/串口/BLE、Web 页与 Home Assistant（`uniq_id: opennear_<MACHEX>`、`cns: [["mac", "..."]]`），配套 2~6 跳幽灵节点自动超时老化清理。
-  - **真机工程化增强（v6.6）**：SoftAP 自动弹出配网页（Captive Portal DNS）+ 局域网 `http://opennear.local`（mDNS）；Web 页实时展示剩余/最低 Heap、802.11 TX/RX 丢包与一键清除 Wi-Fi/重启；USB 串口直通 `WIFI:/MQTT:/MQTTS:/CMD:/OTA:/RESET_WIFI/REBOOT`；Wi-Fi/BLE 共存稳定模式 + 经典蓝牙 DRAM 释放；MQTT 指数退避重连 + 常量时间 Token 鉴权。
+  - **真机工程化与多网关生产级特性（v6.6 ~ v6.7）**：SoftAP 自动弹出配网页（Captive Portal DNS）+ 按 MAC 唯一 mDNS（`opennear-XXXX.local`）与唯一 MQTT ClientID（多网关同 Broker 零互踢）；MQTT 非阻塞 `CONNACK` 鉴权校验 + LWT 遗嘱在线状态（`opennear/gw/<MAC>/status` → Home Assistant `availability`）；按 MAC 永久节点别名（NVS + Web 改名 + HA 同步）；集群独立空口密钥 `NETKEY:<32hex>`（NVS 持久化）；非阻塞异步 Wi-Fi 扫描与 Wi-Fi/BLE 共存稳定模式。
 
 ---
 
@@ -143,7 +143,7 @@ sequenceDiagram
 
 | 验证项 | 实测指标 | 结论 |
 |---|---|---|
-| **核心协议单测与集成套件**（`tests/test_opennear.c`） | **36 套测试 / 374 项断言全部通过**（`0 failed`，`-Wall -Wextra -Wshadow -Wformat=2 -Wundef` 0 告警） | PASS |
+| **核心协议单测与集成套件**（`tests/test_opennear.c`） | **37 套测试 / 382 项断言全部通过**（`0 failed`，`-Wall -Wextra -Wshadow -Wformat=2 -Wundef` 0 告警） | PASS |
 | **10 节点多跳全生命周期仿真**（含 2 堵墙 2-Hop） | 稳态最大偏差 **90 ns** · 10 帧断联保持 **100 ns** · 主节点宕机热切后 **84 ns** · **0 碰撞** | PASS |
 | **ESP32 队列毛刺抗抖动验证**（`[TEST 25]`） | 1800 us Wi-Fi TX 排队毛刺下时钟相位误差 **323 ns**（Lookahead ACT 误差 **343 ns**） | PASS |
 | **L1 8 us 短前导捕获**（+40 ppm CFO + 2-Tap 瑞利多径） | `-3 dB` 命中 **88.0%** · `0 dB` 命中 **99.0%**（定时误差 **33.8 ns**）· `+6 dB` **100.0%（0 ns）** | PASS |
@@ -170,7 +170,7 @@ sequenceDiagram
 
 ```text
 opennear/
-├── build_and_test.ps1                 # 一键构建：36 组单测 + 10 节点仿真 + L1 基准 + ESP32(明文/BLE/TLS)/nRF52 交叉编译
+├── build_and_test.ps1                 # 一键构建：37 组单测 + 10 节点仿真 + L1 基准 + ESP32(明文/BLE/TLS)/nRF52 交叉编译
 ├── core/                              # 零外部依赖的纯 C11 可移植协议核（Host / ESP32 / nRF52 共用）
 │   ├── include/
 │   │   ├── on_types.h                 # 12-bit Short-ID、四段式超帧时隙常量与角色定义
@@ -194,7 +194,7 @@ opennear/
 │   └── on_hal.h                       # 跨平台射频 / 高精定时器 / GPIO 硬件抽象层
 ├── sim/                               # 10 节点多跳物理仿真器（CLI 混沌参数注入 + CSV + PCAP + 仪表盘数据）
 ├── tests/
-│   ├── test_opennear.c                # 36 组全链路自动化单测与集成断言套件（374 项断言）
+│   ├── test_opennear.c                # 37 组全链路自动化单测与集成断言套件（382 项断言）
 │   ├── test_esp32_failover_hw.py      # ESP32 双板主备 RTS 复位长稳回归测试脚本
 │   ├── measure_esp32_gpio_sync.py     # ESP32 MCPWM 双板 GPIO 同步误差测量脚本
 │   ├── capture_esp32_act_trace.py     # ESP32 双板 ACT 全链路追踪抓取脚本

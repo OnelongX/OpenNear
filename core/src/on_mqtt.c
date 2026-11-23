@@ -36,19 +36,27 @@ static size_t put_utf8(uint8_t *dst, const char *s, size_t slen) {
     return 2u + slen;
 }
 
-size_t on_mqtt_encode_connect(const char *client_id, const char *username,
-                              const char *password, uint16_t keepalive_s,
-                              uint8_t *out, size_t cap) {
+size_t on_mqtt_encode_connect_lwt(const char *client_id, const char *username,
+                                  const char *password, uint16_t keepalive_s,
+                                  const char *will_topic, const char *will_msg,
+                                  bool will_retain, uint8_t *out, size_t cap) {
     if (!client_id || !out) return 0u;
     size_t cid_len  = strlen(client_id);
+    size_t wt_len   = (will_topic && will_topic[0]) ? strlen(will_topic) : 0u;
+    size_t wm_len   = (wt_len > 0u && will_msg) ? strlen(will_msg) : 0u;
     size_t user_len = (username && username[0]) ? strlen(username) : 0u;
     size_t pass_len = (password && password[0] && user_len > 0u) ? strlen(password) : 0u;
 
     uint8_t flags = 0x02u; /* Clean Session */
+    if (wt_len > 0u) {
+        flags |= 0x04u; /* Will Flag (QoS 0) */
+        if (will_retain) flags |= 0x20u;
+    }
     if (user_len > 0u) flags |= 0x80u;
     if (pass_len > 0u) flags |= 0x40u;
 
     size_t rem_len = 10u + (2u + cid_len) +
+                     (wt_len > 0u ? (2u + wt_len + 2u + wm_len) : 0u) +
                      (user_len > 0u ? (2u + user_len) : 0u) +
                      (pass_len > 0u ? (2u + pass_len) : 0u);
     uint8_t rbuf[4];
@@ -67,10 +75,22 @@ size_t on_mqtt_encode_connect(const char *client_id, const char *username,
     out[pos++] = (uint8_t)((keepalive_s >> 8) & 0xFFu);
     out[pos++] = (uint8_t)(keepalive_s & 0xFFu);
 
+    /* Payload order strictly per OASIS MQTT 3.1.1 §3.1.3: ClientID, WillTopic, WillMsg, User, Pass */
     pos += put_utf8(out + pos, client_id, cid_len);
+    if (wt_len > 0u) {
+        pos += put_utf8(out + pos, will_topic, wt_len);
+        pos += put_utf8(out + pos, will_msg ? will_msg : "", wm_len);
+    }
     if (user_len > 0u) pos += put_utf8(out + pos, username, user_len);
     if (pass_len > 0u) pos += put_utf8(out + pos, password, pass_len);
     return pos;
+}
+
+size_t on_mqtt_encode_connect(const char *client_id, const char *username,
+                              const char *password, uint16_t keepalive_s,
+                              uint8_t *out, size_t cap) {
+    return on_mqtt_encode_connect_lwt(client_id, username, password, keepalive_s,
+                                      NULL, NULL, false, out, cap);
 }
 
 bool on_mqtt_decode_connack(const uint8_t *in, size_t len, uint8_t *out_return_code) {
@@ -197,13 +217,50 @@ static bool mac_valid(const uint8_t *mac48) {
     return mac48 != NULL && ((mac48[0] | mac48[1] | mac48[2] | mac48[3] | mac48[4] | mac48[5]) != 0u);
 }
 
-bool on_mqtt_format_ha_discovery_mac(uint16_t short_id, const uint8_t mac48[6],
-                                     uint8_t hop_depth, const char *role_name,
-                                     char *topic_out, size_t topic_cap,
-                                     char *json_out, size_t json_cap) {
+static void sanitize_json_label(const char *src, char *dst, size_t cap) {
+    if (!dst || cap == 0u) return;
+    size_t j = 0u;
+    if (src) {
+        for (size_t i = 0u; src[i] != '\0' && j + 1u < cap; ++i) {
+            unsigned char c = (unsigned char)src[i];
+            if (c >= 0x20u && c != '"' && c != '\\') {
+                dst[j++] = (char)c;
+            }
+        }
+    }
+    dst[j] = '\0';
+}
+
+bool on_mqtt_format_ha_discovery_full(uint16_t short_id, const uint8_t mac48[6],
+                                      uint8_t hop_depth, const char *role_name,
+                                      const char *alias_name, const char *avail_topic,
+                                      char *topic_out, size_t topic_cap,
+                                      char *json_out, size_t json_cap) {
     if (!topic_out || !json_out || topic_cap < 48u || json_cap < 256u) return false;
     const char *r = (role_name && role_name[0]) ? role_name : "NODE";
     unsigned sid = (unsigned)(short_id & ON_SHORT_ID_MASK);
+
+    char safe_alias[32];
+    sanitize_json_label(alias_name, safe_alias, sizeof(safe_alias));
+    char safe_avty[64];
+    sanitize_json_label(avail_topic, safe_avty, sizeof(safe_avty));
+
+    char avty_seg[128];
+    if (safe_avty[0] != '\0') {
+        snprintf(avty_seg, sizeof(avty_seg),
+                 ",\"avty_t\":\"%s\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\"",
+                 safe_avty);
+    } else {
+        avty_seg[0] = '\0';
+    }
+
+    char entity_name[64];
+    if (safe_alias[0] != '\0') {
+        snprintf(entity_name, sizeof(entity_name), "%s", safe_alias);
+    } else {
+        snprintf(entity_name, sizeof(entity_name), "OpenNear %s 0x%03X (Hop %u)",
+                 r, sid, (unsigned)hop_depth);
+    }
 
     if (mac_valid(mac48)) {
         char mhex[13], mcol[18];
@@ -217,18 +274,24 @@ bool on_mqtt_format_ha_discovery_mac(uint16_t short_id, const uint8_t mac48[6],
                           "homeassistant/sensor/opennear_%s/config", mhex);
         if (tn <= 0 || (size_t)tn >= topic_cap) return false;
 
+        char dev_name[48];
+        if (safe_alias[0] != '\0') {
+            snprintf(dev_name, sizeof(dev_name), "%s", safe_alias);
+        } else {
+            snprintf(dev_name, sizeof(dev_name), "OpenNear %s", mcol);
+        }
+
         int jn = snprintf(json_out, json_cap,
-                          "{\"name\":\"OpenNear %s 0x%03X (Hop %u)\","
+                          "{\"name\":\"%s\","
                           "\"uniq_id\":\"opennear_%s\","
                           "\"stat_t\":\"opennear/node/0x%03X/state\","
                           "\"cmd_t\":\"opennear/cmd/0x%03X\","
                           "\"val_tpl\":\"{{ value_json.data }}\","
-                          "\"json_attr_t\":\"opennear/node/0x%03X/state\","
+                          "\"json_attr_t\":\"opennear/node/0x%03X/state\"%s,"
                           "\"dev\":{\"ids\":[\"opennear_%s\"],\"cns\":[[\"mac\",\"%s\"]],"
-                          "\"name\":\"OpenNear %s\",\"mf\":\"OpenNear\",\"mdl\":\"v6.5 Hybrid Mesh (%s)\"}}",
-                          r, sid, (unsigned)hop_depth,
-                          mhex, sid, sid, sid,
-                          mhex, mcol, mcol, r);
+                          "\"name\":\"%s\",\"mf\":\"OpenNear\",\"mdl\":\"v6.7 Hybrid Mesh (%s)\"}}",
+                          entity_name, mhex, sid, sid, sid, avty_seg,
+                          mhex, mcol, dev_name, r);
         return (jn > 0 && (size_t)jn < json_cap);
     }
 
@@ -237,17 +300,24 @@ bool on_mqtt_format_ha_discovery_mac(uint16_t short_id, const uint8_t mac48[6],
     if (tn <= 0 || (size_t)tn >= topic_cap) return false;
 
     int jn = snprintf(json_out, json_cap,
-                      "{\"name\":\"OpenNear %s 0x%03X (Hop %u)\","
+                      "{\"name\":\"%s\","
                       "\"uniq_id\":\"opennear_%03X\","
                       "\"stat_t\":\"opennear/node/0x%03X/state\","
                       "\"cmd_t\":\"opennear/cmd/0x%03X\","
                       "\"val_tpl\":\"{{ value_json.data }}\","
-                      "\"json_attr_t\":\"opennear/node/0x%03X/state\","
+                      "\"json_attr_t\":\"opennear/node/0x%03X/state\"%s,"
                       "\"dev\":{\"ids\":[\"opennear_%03X\"],\"name\":\"OpenNear 0x%03X\","
-                      "\"mf\":\"OpenNear\",\"mdl\":\"v6.5 Hybrid Mesh (%s)\"}}",
-                      r, sid, (unsigned)hop_depth,
-                      sid, sid, sid, sid, sid, sid, r);
+                      "\"mf\":\"OpenNear\",\"mdl\":\"v6.7 Hybrid Mesh (%s)\"}}",
+                      entity_name, sid, sid, sid, sid, avty_seg, sid, sid, r);
     return (jn > 0 && (size_t)jn < json_cap);
+}
+
+bool on_mqtt_format_ha_discovery_mac(uint16_t short_id, const uint8_t mac48[6],
+                                     uint8_t hop_depth, const char *role_name,
+                                     char *topic_out, size_t topic_cap,
+                                     char *json_out, size_t json_cap) {
+    return on_mqtt_format_ha_discovery_full(short_id, mac48, hop_depth, role_name,
+                                            NULL, NULL, topic_out, topic_cap, json_out, json_cap);
 }
 
 bool on_mqtt_format_ha_discovery(uint16_t short_id, uint8_t hop_depth, const char *role_name,

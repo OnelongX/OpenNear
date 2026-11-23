@@ -2394,9 +2394,61 @@ static void test_v66_multihop_gc_6hop_mac_and_system_cmds(void) {
     printf("    -> 5-hop MAC48 + 3-bit hop roundtrip OK | Ghost-node GC purged 0x305 | Auth RESET_WIFI/REBOOT OK\n");
 }
 
+/* ========================================================================== */
+/* Test 37: v6.7 Multi-GW MQTT LWT + Alias HA Discovery + NETKEY/ALIAS Parser */
+/* ========================================================================== */
+static void test_v67_mqtt_lwt_alias_and_netkey(void) {
+    printf("[TEST 37] v6.7 MQTT LWT CONNECT + Alias/Availability HA Discovery + NETKEY/ALIAS Commands...\n");
+
+    /* 1. Verify OASIS MQTT 3.1.1 CONNECT with LWT Will Flag (0x04) + Will Retain (0x20) + User/Pass */
+    uint8_t cbuf[256];
+    size_t clen = on_mqtt_encode_connect_lwt("opennear_gw_112233", "u1", "p1", 30u,
+                                             "opennear/gw/112233/status", "offline", true,
+                                             cbuf, sizeof(cbuf));
+    EXPECT(clen > 40u && cbuf[0] == ON_MQTT_PKT_CONNECT, "MQTT LWT CONNECT packet encoded");
+    /* Connect Flags byte is at offset 1 (type) + 1 (rem_len <128) + 6 ("MQTT") + 1 (level=4) = 9 */
+    EXPECT((cbuf[9] & (0x80u | 0x40u | 0x20u | 0x04u | 0x02u)) == (0x80u | 0x40u | 0x20u | 0x04u | 0x02u),
+           "MQTT CONNECT flags set CleanSession + Will + WillRetain + User + Pass");
+
+    /* 2. Verify HA Discovery embeds custom alias, permanent MAC, and LWT availability topic */
+    const uint8_t mac[6] = { 0xA4u, 0xCFu, 0x12u, 0xAAu, 0xBBu, 0xCCu };
+    char topic[96], json[600];
+    EXPECT(on_mqtt_format_ha_discovery_full(0x004u, mac, 1u, "T",
+                                            "LivingRoom_Temp", "opennear/gw/112233/status",
+                                            topic, sizeof(topic), json, sizeof(json)) &&
+           strstr(json, "\"name\":\"LivingRoom_Temp\"") != NULL &&
+           strstr(json, "\"uniq_id\":\"opennear_A4CF12AABBCC\"") != NULL &&
+           strstr(json, "\"avty_t\":\"opennear/gw/112233/status\"") != NULL &&
+           strstr(json, "\"pl_not_avail\":\"offline\"") != NULL,
+           "HA Discovery integrates MAC uniq_id + friendly alias + LWT availability topic");
+
+    /* 3. Verify NETKEY:<32hex> validation, clearing & ALIAS:<MAC>|<name> parsing with Admin Token */
+    on_gw_ctx_t gw;
+    on_gw_init(&gw, ON_GW_MODE_WIFI_AND_BLE, NULL);
+    on_gw_set_admin_token(&gw, "Sec67!");
+
+    EXPECT(on_gw_handle_control_text(&gw, "NETKEY:00112233445566778899AABBCCDDEEFF", 39u, false) == ON_ERR_DECODE_FAIL,
+           "Unauthenticated NETKEY rejected when Admin Token active");
+    EXPECT(on_gw_handle_control_text(&gw, "AUTH:Sec67!|NETKEY:BADHEX", 25u, false) == ON_ERR_INVALID_ARG,
+           "Malformed NETKEY (<32 hex chars) rejected");
+    EXPECT(on_gw_handle_control_text(&gw, "AUTH:Sec67!|NETKEY:00112233445566778899AABBCCDDEEFF", 51u, false) == ON_OK &&
+           gw.cfg.net_key_custom && gw.cfg.net_key_updated &&
+           gw.cfg.net_key[0] == 0x00u && gw.cfg.net_key[15] == 0xFFu,
+           "Authenticated 32-hex NETKEY parsed into 16-byte AES-128 cluster key");
+    EXPECT(on_gw_handle_control_text(&gw, "AUTH:Sec67!|NETKEY:", 19u, false) == ON_OK &&
+           !gw.cfg.net_key_custom && gw.cfg.net_key_updated,
+           "Empty NETKEY: resets cluster key to default");
+
+    EXPECT(on_gw_handle_control_text(&gw, "AUTH:Sec67!|ALIAS:A4:CF:12:AA:BB:CC|Kitchen_Relay", 49u, false) == ON_OK &&
+           gw.cfg.alias_updated && memcmp(gw.cfg.alias_mac, mac, 6u) == 0 &&
+           strcmp(gw.cfg.alias_name, "Kitchen_Relay") == 0,
+           "Authenticated ALIAS:<MAC>|<name> parses colon-formatted MAC48 and friendly name");
+    printf("    -> MQTT LWT CONNECT=%uB | HA Alias+Avty OK | NETKEY(16B) & ALIAS parser OK\n", (unsigned)clen);
+}
+
 int main(void) {
     printf("============================================================\n");
-    printf("       OpenNear v6.6 Core Protocol Automated Test Suite     \n");
+    printf("       OpenNear v6.7 Core Protocol Automated Test Suite     \n");
     printf("============================================================\n");
 
     test_6byte_header_and_frame();
@@ -2436,6 +2488,7 @@ int main(void) {
     test_v64_optional_mqtts_tls_config();
     test_v65_cluster_mac48_and_ha_identity();
     test_v66_multihop_gc_6hop_mac_and_system_cmds();
+    test_v67_mqtt_lwt_alias_and_netkey();
 
     printf("\n------------------------------------------------------------\n");
     printf("SUMMARY: %d passed, %d failed\n", g_tests_passed, g_tests_failed);

@@ -5,13 +5,16 @@
 #include <Arduino.h>
 #include <string.h>
 
+#if defined(OPENNEAR_ENABLE_WIFI_GW) || defined(OPENNEAR_ENABLE_BLE_GW)
+#include <Preferences.h>
+#endif
+
 #ifdef OPENNEAR_ENABLE_WIFI_GW
 #include <WiFi.h>
 #include <DNSServer.h>
 #include <ESPmDNS.h>
 #include <HTTPClient.h>
 #include <WebServer.h>
-#include <Preferences.h>
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
 #include "esp_system.h"
@@ -48,8 +51,32 @@ void on_esp32_node_unlock(void) {
     if (s_node_mutex) xSemaphoreGiveRecursive(s_node_mutex);
 }
 
-#ifdef OPENNEAR_ENABLE_WIFI_GW
+#if defined(OPENNEAR_ENABLE_WIFI_GW) || defined(OPENNEAR_ENABLE_BLE_GW)
 static Preferences s_prefs;
+static bool        s_netkey_custom = false;
+
+bool on_esp32_net_gw_load_netkey(uint8_t out_key[16]) {
+    if (!out_key) return false;
+    if (s_prefs.begin("opennear_gw", true)) {
+        size_t n = s_prefs.getBytesLength("netkey");
+        if (n == 16u && s_prefs.getBytes("netkey", out_key, 16u) == 16u) {
+            s_prefs.end();
+            s_netkey_custom = true;
+            return true;
+        }
+        s_prefs.end();
+    }
+    s_netkey_custom = false;
+    return false;
+}
+#else
+bool on_esp32_net_gw_load_netkey(uint8_t out_key[16]) {
+    (void)out_key;
+    return false;
+}
+#endif
+
+#ifdef OPENNEAR_ENABLE_WIFI_GW
 static WebServer   s_http_srv(80);
 static DNSServer   s_dns_srv;
 static Client     *s_active_mqtt_cli    = nullptr;
@@ -58,17 +85,116 @@ static bool        s_wifi_was_connected = false;
 static bool        s_ap_active          = false;
 static bool        s_dns_active         = false;
 static bool        s_mdns_active        = false;
+static bool        s_mqtt_wait_connack  = false;
+static bool        s_scan_evt_reg       = false;
+static volatile bool s_scan_running     = false;
+static volatile bool s_scan_done        = false;
+static uint32_t    s_scan_started_ms    = 0u;
 static char        s_ap_ssid[32]        = {0};
 static char        s_mdns_host[32]      = {0};
+static char        s_mqtt_client_id[32] = {0};
+static char        s_mqtt_avty_topic[48]= {0};
 static uint32_t    s_ap_off_at_ms       = 0u;
 static uint32_t    s_sta_start_ms       = 0u;
 static uint32_t    s_last_wifi_retry_ms = 0u;
 static uint32_t    s_last_mqtt_retry_ms = 0u;
+static uint32_t    s_mqtt_conn_start_ms = 0u;
 static uint32_t    s_mqtt_backoff_ms    = 5000u;
 static uint32_t    s_last_mqtt_ping_ms  = 0u;
 static uint32_t    s_last_ha_pub_ms     = 0u;
 static uint8_t     s_mqtt_rxbuf[512];
 static size_t      s_mqtt_rxlen         = 0u;
+
+/* v6.7 MAC-anchored node alias cache (persisted in NVS namespace "opennear_alias") */
+#define ON_MAX_ALIASES 24u
+typedef struct {
+    bool    used;
+    uint8_t mac48[6];
+    char    name[24];
+} on_alias_entry_t;
+static on_alias_entry_t s_aliases[ON_MAX_ALIASES];
+
+static void format_mac_key(const uint8_t mac[6], char out[13]) {
+    snprintf(out, 13u, "%02X%02X%02X%02X%02X%02X",
+             (unsigned)mac[0], (unsigned)mac[1], (unsigned)mac[2],
+             (unsigned)mac[3], (unsigned)mac[4], (unsigned)mac[5]);
+}
+
+static const char *lookup_mac_alias(const uint8_t mac[6]) {
+    if (!mac) return nullptr;
+    if ((mac[0] | mac[1] | mac[2] | mac[3] | mac[4] | mac[5]) == 0u) return nullptr;
+    for (uint32_t i = 0u; i < ON_MAX_ALIASES; ++i) {
+        if (s_aliases[i].used && memcmp(s_aliases[i].mac48, mac, 6u) == 0) {
+            return s_aliases[i].name;
+        }
+    }
+    /* Lazy-load from NVS on first lookup for unseen MAC */
+    char key[13];
+    format_mac_key(mac, key);
+    if (s_prefs.begin("opennear_alias", true)) {
+        String val = s_prefs.getString(key, "");
+        s_prefs.end();
+        if (val.length() > 0) {
+            for (uint32_t i = 0u; i < ON_MAX_ALIASES; ++i) {
+                if (!s_aliases[i].used) {
+                    s_aliases[i].used = true;
+                    memcpy(s_aliases[i].mac48, mac, 6u);
+                    strncpy(s_aliases[i].name, val.c_str(), sizeof(s_aliases[i].name) - 1u);
+                    s_aliases[i].name[sizeof(s_aliases[i].name) - 1u] = '\0';
+                    return s_aliases[i].name;
+                }
+            }
+        }
+    }
+    return nullptr;
+}
+
+static void save_mac_alias(const uint8_t mac[6], const char *name) {
+    if (!mac) return;
+    char key[13];
+    format_mac_key(mac, key);
+    bool clearing = (!name || name[0] == '\0');
+    if (s_prefs.begin("opennear_alias", false)) {
+        if (clearing) s_prefs.remove(key);
+        else s_prefs.putString(key, name);
+        s_prefs.end();
+    }
+    int free_idx = -1;
+    for (uint32_t i = 0u; i < ON_MAX_ALIASES; ++i) {
+        if (s_aliases[i].used && memcmp(s_aliases[i].mac48, mac, 6u) == 0) {
+            if (clearing) {
+                s_aliases[i].used = false;
+                s_aliases[i].name[0] = '\0';
+            } else {
+                strncpy(s_aliases[i].name, name, sizeof(s_aliases[i].name) - 1u);
+                s_aliases[i].name[sizeof(s_aliases[i].name) - 1u] = '\0';
+            }
+            return;
+        }
+        if (!s_aliases[i].used && free_idx < 0) free_idx = (int)i;
+    }
+    if (!clearing && free_idx >= 0) {
+        s_aliases[free_idx].used = true;
+        memcpy(s_aliases[free_idx].mac48, mac, 6u);
+        strncpy(s_aliases[free_idx].name, name, sizeof(s_aliases[free_idx].name) - 1u);
+        s_aliases[free_idx].name[sizeof(s_aliases[free_idx].name) - 1u] = '\0';
+    }
+}
+
+static void ensure_gateway_mac_ids(const on_node_t *node) {
+    if (s_mqtt_client_id[0] != '\0') return;
+    uint8_t mac[6] = {0};
+    if (node && (node->mac48[0] | node->mac48[1] | node->mac48[2] |
+                 node->mac48[3] | node->mac48[4] | node->mac48[5]) != 0u) {
+        memcpy(mac, node->mac48, 6u);
+    } else {
+        WiFi.macAddress(mac);
+    }
+    snprintf(s_mqtt_client_id, sizeof(s_mqtt_client_id), "opennear_gw_%02X%02X%02X",
+             (unsigned)mac[3], (unsigned)mac[4], (unsigned)mac[5]);
+    snprintf(s_mqtt_avty_topic, sizeof(s_mqtt_avty_topic), "opennear/gw/%02X%02X%02X/status",
+             (unsigned)mac[3], (unsigned)mac[4], (unsigned)mac[5]);
+}
 
 static bool http_token_matches(const char *expected) {
     if (!expected || expected[0] == '\0') return true;
@@ -137,9 +263,10 @@ static void esp32_mqtt_poll(on_node_t *node, on_gw_ctx_t *gw) {
     if (gw->cfg.mqtt_creds_updated) {
         gw->cfg.mqtt_creds_updated = false;
         on_esp32_tls_stop_mqtt_clients();
-        s_active_mqtt_cli = nullptr;
-        s_mqtt_rxlen = 0u;
-        s_mqtt_backoff_ms = 5000u;
+        s_active_mqtt_cli   = nullptr;
+        s_mqtt_wait_connack = false;
+        s_mqtt_rxlen        = 0u;
+        s_mqtt_backoff_ms   = 5000u;
         s_last_mqtt_retry_ms = 0u;
         if (s_prefs.begin("opennear_gw", false)) {
             s_prefs.putString("mhost", gw->cfg.mqtt_host);
@@ -153,36 +280,34 @@ static void esp32_mqtt_poll(on_node_t *node, on_gw_ctx_t *gw) {
 
     Client *cli = on_esp32_tls_get_mqtt_client(gw->cfg.mqtt_use_tls);
     if (!cli) {
-        gw->mqtt_connected = false;
-        s_active_mqtt_cli  = nullptr;
+        gw->mqtt_connected  = false;
+        s_mqtt_wait_connack = false;
+        s_active_mqtt_cli   = nullptr;
         return; /* MQTTS requested, but firmware built without OPENNEAR_ENABLE_TLS=1 */
     }
     s_active_mqtt_cli = cli;
+    ensure_gateway_mac_ids(node);
 
     uint32_t now_ms = millis();
     if (!cli->connected()) {
-        gw->mqtt_connected = false;
-        s_mqtt_rxlen = 0u;
+        gw->mqtt_connected  = false;
+        s_mqtt_wait_connack = false;
+        s_mqtt_rxlen        = 0u;
         if (s_last_mqtt_retry_ms != 0u && (now_ms - s_last_mqtt_retry_ms) < s_mqtt_backoff_ms) return;
         s_last_mqtt_retry_ms = now_ms;
         uint16_t port = gw->cfg.mqtt_port ? gw->cfg.mqtt_port : (gw->cfg.mqtt_use_tls ? 8883u : 1883u);
         if (cli->connect(gw->cfg.mqtt_host, port)) {
-            uint8_t cbuf[192];
-            size_t clen = on_mqtt_encode_connect("opennear_gw", gw->cfg.mqtt_user,
-                                                 gw->cfg.mqtt_pass, 30u, cbuf, sizeof(cbuf));
+            uint8_t cbuf[256];
+            size_t clen = on_mqtt_encode_connect_lwt(s_mqtt_client_id, gw->cfg.mqtt_user,
+                                                     gw->cfg.mqtt_pass, 30u,
+                                                     s_mqtt_avty_topic, "offline", true,
+                                                     cbuf, sizeof(cbuf));
             if (clen > 0u && cli->write(cbuf, clen) == clen) {
-                uint8_t sbuf[64];
-                size_t s1 = on_mqtt_encode_subscribe(1u, "opennear/cmd/#", sbuf, sizeof(sbuf));
-                if (s1 > 0u) cli->write(sbuf, s1);
-                size_t s2 = on_mqtt_encode_subscribe(2u, "opennear/ota/trigger", sbuf, sizeof(sbuf));
-                if (s2 > 0u) cli->write(sbuf, s2);
-                gw->mqtt_connected  = true;
-                s_mqtt_backoff_ms   = 5000u;
-                s_last_mqtt_ping_ms = now_ms;
-                s_last_ha_pub_ms    = 0u;
-                Serial.printf("[OpenNear MQTT] Connected to %s://%s:%u (HA Discovery + cmd/# armed)\n",
-                              gw->cfg.mqtt_use_tls ? "mqtts" : "mqtt",
-                              gw->cfg.mqtt_host, (unsigned)port);
+                s_mqtt_wait_connack  = true;
+                s_mqtt_conn_start_ms = now_ms;
+            } else {
+                cli->stop();
+                s_mqtt_backoff_ms = (s_mqtt_backoff_ms < 15000u) ? (s_mqtt_backoff_ms * 2u) : 30000u;
             }
         } else {
             /* Exponential backoff (5s -> 10s -> 20s -> 30s) so unreachable broker never stalls Web Portal */
@@ -191,29 +316,39 @@ static void esp32_mqtt_poll(on_node_t *node, on_gw_ctx_t *gw) {
         return;
     }
 
-    /* Keepalive PINGREQ every 20 s */
-    if ((now_ms - s_last_mqtt_ping_ms) > 20000u) {
+    if (s_mqtt_wait_connack && (now_ms - s_mqtt_conn_start_ms) > 5000u) {
+        s_mqtt_wait_connack = false;
+        cli->stop();
+        s_mqtt_backoff_ms = (s_mqtt_backoff_ms < 15000u) ? (s_mqtt_backoff_ms * 2u) : 30000u;
+        Serial.println("[OpenNear MQTT] CONNACK timeout -> retrying with backoff");
+        return;
+    }
+
+    /* Keepalive PINGREQ every 20 s (only after CONNACK verified) */
+    if (gw->mqtt_connected && (now_ms - s_last_mqtt_ping_ms) > 20000u) {
         s_last_mqtt_ping_ms = now_ms;
         uint8_t ping[2];
         on_mqtt_encode_pingreq(ping);
         cli->write(ping, 2u);
     }
 
-    /* Periodically publish Home Assistant MQTT Auto-Discovery + full cluster topology every 15 s */
-    if (node && (s_last_ha_pub_ms == 0u || (now_ms - s_last_ha_pub_ms) > 15000u)) {
+    /* Periodically publish Home Assistant MQTT Auto-Discovery (MAC + Alias + LWT) every 15 s */
+    if (gw->mqtt_connected && node && (s_last_ha_pub_ms == 0u || (now_ms - s_last_ha_pub_ms) > 15000u)) {
         s_last_ha_pub_ms = now_ms;
         on_cluster_snapshot_t snap;
         on_esp32_node_lock();
         on_node_get_cluster_snapshot(node, &snap);
         on_esp32_node_unlock();
         static char topic[96];
-        static char payload[512];
+        static char payload[600];
         for (uint8_t i = 0u; i < snap.active_count; ++i) {
             const on_cluster_node_t *cn = &snap.nodes[i];
             const char *rname = (cn->role == ON_ROLE_G) ? "G" :
                                 (cn->role == ON_ROLE_SUB_G ? "SUB_G" : "T");
-            if (on_mqtt_format_ha_discovery_mac(cn->short_id, cn->mac48, cn->hop_depth, rname,
-                                                topic, sizeof(topic), payload, sizeof(payload))) {
+            const char *alias = lookup_mac_alias(cn->mac48);
+            if (on_mqtt_format_ha_discovery_full(cn->short_id, cn->mac48, cn->hop_depth, rname,
+                                                 alias, s_mqtt_avty_topic,
+                                                 topic, sizeof(topic), payload, sizeof(payload))) {
                 esp32_mqtt_publish_cb(gw, topic, payload, true);
             }
             if (on_mqtt_format_node_state_mac(cn->short_id, cn->mac48, cn->parent_id, cn->hop_depth,
@@ -246,7 +381,35 @@ static void esp32_mqtt_poll(on_node_t *node, on_gw_ctx_t *gw) {
             consumed = s_mqtt_rxlen;
             break;
         }
-        if (pkt_type == ON_MQTT_PKT_PUBLISH) {
+        if (pkt_type == ON_MQTT_PKT_CONNACK && s_mqtt_wait_connack) {
+            uint8_t rc = 0xFFu;
+            if (on_mqtt_decode_connack(s_mqtt_rxbuf + consumed, pkt_len, &rc) && rc == 0u) {
+                s_mqtt_wait_connack = false;
+                gw->mqtt_connected  = true;
+                s_mqtt_backoff_ms   = 5000u;
+                s_last_mqtt_ping_ms = now_ms;
+                s_last_ha_pub_ms    = 0u;
+                uint8_t sbuf[64];
+                size_t s1 = on_mqtt_encode_subscribe(1u, "opennear/cmd/#", sbuf, sizeof(sbuf));
+                if (s1 > 0u) cli->write(sbuf, s1);
+                size_t s2 = on_mqtt_encode_subscribe(2u, "opennear/ota/trigger", sbuf, sizeof(sbuf));
+                if (s2 > 0u) cli->write(sbuf, s2);
+                esp32_mqtt_publish_cb(gw, s_mqtt_avty_topic, "online", true);
+                uint16_t port = gw->cfg.mqtt_port ? gw->cfg.mqtt_port : (gw->cfg.mqtt_use_tls ? 8883u : 1883u);
+                Serial.printf("[OpenNear MQTT] Connected to %s://%s:%u (client=%s avty=%s)\n",
+                              gw->cfg.mqtt_use_tls ? "mqtts" : "mqtt",
+                              gw->cfg.mqtt_host, (unsigned)port,
+                              s_mqtt_client_id, s_mqtt_avty_topic);
+            } else {
+                s_mqtt_wait_connack = false;
+                gw->mqtt_connected  = false;
+                cli->stop();
+                s_mqtt_backoff_ms = (s_mqtt_backoff_ms < 15000u) ? (s_mqtt_backoff_ms * 2u) : 30000u;
+                Serial.printf("[OpenNear MQTT] Broker rejected CONNACK rc=%u (check credentials)\n", (unsigned)rc);
+                s_mqtt_rxlen = 0u;
+                return;
+            }
+        } else if (pkt_type == ON_MQTT_PKT_PUBLISH) {
             on_mqtt_pub_view_t pub;
             if (on_mqtt_decode_publish(s_mqtt_rxbuf + consumed, pkt_len, &pub)) {
                 uint16_t target_id = 0u;
@@ -347,7 +510,7 @@ static void start_local_http_api(void) {
 
         append_cstr(json, sizeof(json), &pos, "{\"role\":\"");
         append_cstr(json, sizeof(json), &pos, role_s);
-        snprintf(num, sizeof(num), "\",\"id\":\"0x%03X\",\"mac\":\"%s\",\"ble_mac\":\"%s\",\"sf\":%u,\"fw_ver\":\"v6.6\",\"uptime_s\":%u",
+        snprintf(num, sizeof(num), "\",\"id\":\"0x%03X\",\"mac\":\"%s\",\"ble_mac\":\"%s\",\"sf\":%u,\"fw_ver\":\"v6.7\",\"uptime_s\":%u",
                  (unsigned)short_id, mac_s, bmac_s, (unsigned)sf_seq, (unsigned)(millis() / 1000u));
         append_cstr(json, sizeof(json), &pos, num);
 
@@ -379,13 +542,17 @@ static void start_local_http_api(void) {
         append_cstr(json, sizeof(json), &pos, num);
         append_json_escaped(json, sizeof(json), &pos, s_gw_ref ? s_gw_ref->cfg.mqtt_host : "");
 
-        snprintf(num, sizeof(num), "\",\"ble_ok\":%s,\"token_set\":%s,\"tls_compiled\":%s,\"mqtt_tls\":%s,\"tls_ca_set\":%s}",
+        ensure_gateway_mac_ids(s_node_ref);
+        snprintf(num, sizeof(num), "\",\"ble_ok\":%s,\"token_set\":%s,\"netkey_custom\":%s,\"tls_compiled\":%s,\"mqtt_tls\":%s,\"tls_ca_set\":%s,\"mqtt_avty\":\"",
                  (s_gw_ref && s_gw_ref->ble_connected) ? "true" : "false",
                  (s_gw_ref && s_gw_ref->cfg.admin_token[0] != '\0') ? "true" : "false",
+                 s_netkey_custom ? "true" : "false",
                  on_esp32_tls_is_compiled() ? "true" : "false",
                  (s_gw_ref && s_gw_ref->cfg.mqtt_use_tls) ? "true" : "false",
                  on_esp32_tls_has_ca() ? "true" : "false");
         append_cstr(json, sizeof(json), &pos, num);
+        append_json_escaped(json, sizeof(json), &pos, s_mqtt_avty_topic);
+        append_cstr(json, sizeof(json), &pos, "\"}");
 
         s_http_srv.send(200, "application/json", json);
     });
@@ -393,48 +560,104 @@ static void start_local_http_api(void) {
     s_http_srv.on("/api/scan", HTTP_GET, []() {
         static char json[1536];
         static wifi_ap_record_t recs[20];
+        if (!s_scan_evt_reg) {
+            WiFi.onEvent([](WiFiEvent_t event) {
+                if (event == ARDUINO_EVENT_WIFI_SCAN_DONE) {
+                    s_scan_running = false;
+                    s_scan_done    = true;
+                }
+            });
+            s_scan_evt_reg = true;
+        }
+        uint32_t now_ms = millis();
+        if (s_scan_running && !s_scan_done && (now_ms - s_scan_started_ms) < 8000u) {
+            s_http_srv.send(200, "application/json", "{\"scanning\":true,\"aps\":[]}");
+            return;
+        }
+        if (!s_scan_running && !s_scan_done) {
+            /* Non-blocking async scan using ESP-IDF BLE-safe default active timing (min=0, max=0) */
+            WiFi.enableSTA(true);
+            wifi_scan_config_t scfg;
+            memset(&scfg, 0, sizeof(scfg));
+            scfg.scan_type = WIFI_SCAN_TYPE_ACTIVE;
+            if (esp_wifi_scan_start(&scfg, false) == ESP_OK) {
+                s_scan_running    = true;
+                s_scan_done       = false;
+                s_scan_started_ms = now_ms;
+                s_http_srv.send(200, "application/json", "{\"scanning\":true,\"aps\":[]}");
+                return;
+            }
+            s_http_srv.send(200, "application/json", "{\"scanning\":false,\"aps\":[]}");
+            return;
+        }
+
+        s_scan_running = false;
+        s_scan_done    = false;
         size_t pos = 0u;
         json[0] = '\0';
-        append_cstr(json, sizeof(json), &pos, "[");
-
-        /* Use ESP-IDF default active scan timing (min=0, max=0) so Wi-Fi/BLE coexistence
-         * in libnet80211 never rejects the scan when Bluetooth is active. */
-        WiFi.enableSTA(true);
-        wifi_scan_config_t scfg;
-        memset(&scfg, 0, sizeof(scfg));
-        scfg.scan_type = WIFI_SCAN_TYPE_ACTIVE;
-        if (esp_wifi_scan_start(&scfg, true) == ESP_OK) {
-            uint16_t count = static_cast<uint16_t>(sizeof(recs) / sizeof(recs[0]));
-            if (esp_wifi_scan_get_ap_records(&count, recs) == ESP_OK) {
-                int emitted = 0;
-                for (uint16_t i = 0u; i < count && emitted < 15; ++i) {
-                    char ssid_buf[33];
-                    memcpy(ssid_buf, recs[i].ssid, 32u);
-                    ssid_buf[32] = '\0';
-                    if (ssid_buf[0] == '\0') continue;
-                    /* Deduplicate repeated BSSIDs with same SSID (keep strongest RSSI first) */
-                    bool dup = false;
-                    for (uint16_t j = 0u; j < i; ++j) {
-                        if (strncmp(reinterpret_cast<const char *>(recs[j].ssid), ssid_buf, 32u) == 0) {
-                            dup = true;
-                            break;
-                        }
+        append_cstr(json, sizeof(json), &pos, "{\"scanning\":false,\"aps\":[");
+        uint16_t count = static_cast<uint16_t>(sizeof(recs) / sizeof(recs[0]));
+        if (esp_wifi_scan_get_ap_records(&count, recs) == ESP_OK) {
+            int emitted = 0;
+            for (uint16_t i = 0u; i < count && emitted < 15; ++i) {
+                char ssid_buf[33];
+                memcpy(ssid_buf, recs[i].ssid, 32u);
+                ssid_buf[32] = '\0';
+                if (ssid_buf[0] == '\0') continue;
+                bool dup = false;
+                for (uint16_t j = 0u; j < i; ++j) {
+                    if (strncmp(reinterpret_cast<const char *>(recs[j].ssid), ssid_buf, 32u) == 0) {
+                        dup = true;
+                        break;
                     }
-                    if (dup) continue;
-                    if (pos + 96u >= sizeof(json)) break;
-                    if (emitted > 0) append_cstr(json, sizeof(json), &pos, ",");
-                    append_cstr(json, sizeof(json), &pos, "{\"ssid\":\"");
-                    append_json_escaped(json, sizeof(json), &pos, ssid_buf);
-                    char tail[64];
-                    snprintf(tail, sizeof(tail), "\",\"rssi\":%d,\"ch\":%u,\"enc\":%d}",
-                             (int)recs[i].rssi, (unsigned)recs[i].primary,
-                             (recs[i].authmode == WIFI_AUTH_OPEN) ? 0 : 1);
-                    append_cstr(json, sizeof(json), &pos, tail);
-                    emitted++;
                 }
+                if (dup) continue;
+                if (pos + 96u >= sizeof(json)) break;
+                if (emitted > 0) append_cstr(json, sizeof(json), &pos, ",");
+                append_cstr(json, sizeof(json), &pos, "{\"ssid\":\"");
+                append_json_escaped(json, sizeof(json), &pos, ssid_buf);
+                char tail[64];
+                snprintf(tail, sizeof(tail), "\",\"rssi\":%d,\"ch\":%u,\"enc\":%d}",
+                         (int)recs[i].rssi, (unsigned)recs[i].primary,
+                         (recs[i].authmode == WIFI_AUTH_OPEN) ? 0 : 1);
+                append_cstr(json, sizeof(json), &pos, tail);
+                emitted++;
             }
         }
-        append_cstr(json, sizeof(json), &pos, "]");
+        append_cstr(json, sizeof(json), &pos, "]}");
+        s_http_srv.send(200, "application/json", json);
+    });
+
+    s_http_srv.on("/api/aliases", HTTP_GET, []() {
+        static char json[1024];
+        size_t pos = 0u;
+        json[0] = '\0';
+        append_cstr(json, sizeof(json), &pos, "{");
+        if (s_node_ref) {
+            on_cluster_snapshot_t snap;
+            on_esp32_node_lock();
+            on_node_get_cluster_snapshot(s_node_ref, &snap);
+            on_esp32_node_unlock();
+            for (uint8_t i = 0u; i < snap.active_count; ++i) {
+                lookup_mac_alias(snap.nodes[i].mac48);
+            }
+        }
+        bool first = true;
+        for (uint32_t i = 0u; i < ON_MAX_ALIASES; ++i) {
+            if (!s_aliases[i].used || s_aliases[i].name[0] == '\0') continue;
+            if (pos + 64u >= sizeof(json)) break;
+            if (!first) append_cstr(json, sizeof(json), &pos, ",");
+            first = false;
+            char mcol[28];
+            snprintf(mcol, sizeof(mcol), "\"%02X:%02X:%02X:%02X:%02X:%02X\":\"",
+                     (unsigned)s_aliases[i].mac48[0], (unsigned)s_aliases[i].mac48[1],
+                     (unsigned)s_aliases[i].mac48[2], (unsigned)s_aliases[i].mac48[3],
+                     (unsigned)s_aliases[i].mac48[4], (unsigned)s_aliases[i].mac48[5]);
+            append_cstr(json, sizeof(json), &pos, mcol);
+            append_json_escaped(json, sizeof(json), &pos, s_aliases[i].name);
+            append_cstr(json, sizeof(json), &pos, "\"");
+        }
+        append_cstr(json, sizeof(json), &pos, "}");
         s_http_srv.send(200, "application/json", json);
     });
 
@@ -905,9 +1128,14 @@ void on_esp32_net_gw_poll(on_node_t *node, on_gw_ctx_t *gw) {
         s_mqtt_backoff_ms    = 5000u;
         s_last_mqtt_retry_ms = 0u;
         if (!s_mdns_active) {
-            if (MDNS.begin("opennear")) {
+            uint8_t mac[6] = {0};
+            WiFi.macAddress(mac);
+            char mdns_name[24];
+            snprintf(mdns_name, sizeof(mdns_name), "opennear-%02x%02x",
+                     (unsigned)mac[4], (unsigned)mac[5]);
+            if (MDNS.begin(mdns_name)) {
                 MDNS.addService("http", "tcp", 80);
-                snprintf(s_mdns_host, sizeof(s_mdns_host), "opennear.local");
+                snprintf(s_mdns_host, sizeof(s_mdns_host), "%s.local", mdns_name);
                 s_mdns_active = true;
             }
         }
@@ -915,9 +1143,9 @@ void on_esp32_net_gw_poll(on_node_t *node, on_gw_ctx_t *gw) {
             /* Give phone browser 5 s to display the new LAN IP before closing fallback SoftAP */
             s_ap_off_at_ms = millis() + 5000u;
         }
-        Serial.printf("[OpenNear GW] Wi-Fi ONLINE http://%u.%u.%u.%u/ (%s) ch=%u rssi=%d\n",
+        Serial.printf("[OpenNear GW] Wi-Fi ONLINE http://%u.%u.%u.%u/ (http://%s/) ch=%u rssi=%d\n",
                       ip4[0], ip4[1], ip4[2], ip4[3],
-                      s_mdns_active ? "http://opennear.local/" : "mDNS off",
+                      s_mdns_active ? s_mdns_host : "mDNS-off",
                       (unsigned)ch, (int)WiFi.RSSI());
     } else if (!connected && s_wifi_was_connected) {
         s_wifi_was_connected = false;
@@ -1006,6 +1234,17 @@ void on_esp32_net_gw_poll(on_node_t *node, on_gw_ctx_t *gw) {
                       gw->cfg.admin_token[0] ? "updated & saved" : "cleared");
     }
 
+    if (gw->cfg.alias_updated) {
+        gw->cfg.alias_updated = false;
+        save_mac_alias(gw->cfg.alias_mac, gw->cfg.alias_name);
+        s_last_ha_pub_ms = 0u; /* Republish HA Discovery immediately with new friendly name */
+        Serial.printf("[OpenNear GW] Alias updated for %02X:%02X:%02X:%02X:%02X:%02X -> '%s'\n",
+                      (unsigned)gw->cfg.alias_mac[0], (unsigned)gw->cfg.alias_mac[1],
+                      (unsigned)gw->cfg.alias_mac[2], (unsigned)gw->cfg.alias_mac[3],
+                      (unsigned)gw->cfg.alias_mac[4], (unsigned)gw->cfg.alias_mac[5],
+                      gw->cfg.alias_name);
+    }
+
     if (connected && gw->cfg.ota_pull_requested) {
         gw->cfg.ota_pull_requested = false;
         esp32_pull_http_ota(node, gw);
@@ -1028,6 +1267,30 @@ void on_esp32_net_gw_poll(on_node_t *node, on_gw_ctx_t *gw) {
     }
 #else
     (void)node;
+#endif
+
+#if defined(OPENNEAR_ENABLE_WIFI_GW) || defined(OPENNEAR_ENABLE_BLE_GW)
+    if (gw->cfg.net_key_updated) {
+        gw->cfg.net_key_updated = false;
+        static const uint8_t kFallbackKey[16] = {
+            0x4F,0x50,0x45,0x4E,0x4E,0x45,0x41,0x52,
+            0x33,0x30,0x2D,0x4B,0x45,0x59,0x21,0x01
+        };
+        const uint8_t *apply_key = gw->cfg.net_key_custom ? gw->cfg.net_key : kFallbackKey;
+        if (s_prefs.begin("opennear_gw", false)) {
+            if (gw->cfg.net_key_custom) s_prefs.putBytes("netkey", gw->cfg.net_key, 16u);
+            else s_prefs.remove("netkey");
+            s_prefs.end();
+        }
+        s_netkey_custom = gw->cfg.net_key_custom;
+        if (node) {
+            on_esp32_node_lock();
+            on_node_enable_security(node, apply_key);
+            on_esp32_node_unlock();
+        }
+        Serial.printf("[OpenNear Sec] Cluster AES-128 key %s in NVS & applied live\n",
+                      s_netkey_custom ? "CUSTOM saved" : "reset to DEFAULT");
+    }
 #endif
 
     if (node && gw->cfg.topo_query_requested) {

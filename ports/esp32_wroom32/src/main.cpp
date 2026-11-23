@@ -97,7 +97,7 @@ static void opennear_rt_task(void *arg) {
             last_log_ns = now_ns;
             uint32_t tx_accepted, tx_failed;
             on_esp32_hal_tx_counts(&tx_accepted, &tx_failed);
-            Serial.printf("[OpenNear v6.6] SF=%u role=%d id=0x%03X hop=%d slot=%u nco=%.2fppm rtt=%lldns harq=%u acts=%u\n",
+            Serial.printf("[OpenNear v6.7] SF=%u role=%d id=0x%03X hop=%d slot=%u nco=%.2fppm rtt=%lldns harq=%u acts=%u\n",
                           (unsigned)log_s.sf_seq,
                           log_s.role,
                           (unsigned)log_s.short_id,
@@ -214,11 +214,19 @@ void setup() {
     g_node.backup_miss_threshold = kWifiBackupMissThreshold;
     g_node.backup_min_sync_silence_ns = (int64_t)kWifiBackupSilenceMs * 1000000LL;
 
-    /* Enable v3.0 AES-128-CCM + Beacon Anti-Spoofing with per-boot TRNG salt */
-    on_node_enable_security(&g_node, kDefaultNetMasterKey);
+    /* Enable v3.0+ AES-128-CCM + Beacon Anti-Spoofing with per-boot TRNG salt & optional NVS cluster key */
+    uint8_t active_net_key[ON_SEC_KEY_LEN];
+    memcpy(active_net_key, kDefaultNetMasterKey, ON_SEC_KEY_LEN);
+    bool custom_key = false;
+#if defined(OPENNEAR_ENABLE_WIFI_GW) || defined(OPENNEAR_ENABLE_BLE_GW)
+    custom_key = on_esp32_net_gw_load_netkey(active_net_key);
+#endif
+    on_node_enable_security(&g_node, active_net_key);
     if (is_master) {
         on_node_set_session_salt(&g_node, esp_random());
     }
+    Serial.printf("[OpenNear Sec] AES-128-CCM cluster key=%s\n",
+                  custom_key ? "CUSTOM_NVS" : "DEFAULT_DEMO");
 
     Serial.printf("[OpenNear] ESP32-WROOM-32 booted as %s on Wi-Fi ch=%u (54M 0xD0, RTT off, backup after %u missed beacons and %u ms silence)\n",
                   is_master ? "PRIMARY G (0x001)" : "AUTO-JOIN TERMINAL",
