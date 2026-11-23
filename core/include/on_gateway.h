@@ -43,7 +43,8 @@ typedef enum {
     ON_GW_MSG_WIFI_PROV      = 0x05, /* BLE Wi-Fi provisioning config */
     ON_GW_MSG_OTA_TRIGGER    = 0x06, /* Cloud/BLE trigger to pull & push OTA */
     ON_GW_MSG_TOPO_REQ       = 0x07, /* v5.1: Any-node request for cluster topology & data */
-    ON_GW_MSG_TOPO_RESP      = 0x08  /* v5.1: Paginated cluster topology & data snapshot from G */
+    ON_GW_MSG_TOPO_RESP      = 0x08, /* v5.1: Paginated cluster topology & data snapshot from G */
+    ON_GW_MSG_MAC_REPORT     = 0x09  /* v6.5: Sub-G -> G 2-hop child hardware MAC48 registration */
 } on_gw_msg_type_t;
 
 #define ON_GW_FLAG_RELAYED_2HOP  0x01u

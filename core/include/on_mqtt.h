@@ -68,10 +68,21 @@ bool   on_mqtt_format_ha_discovery(uint16_t short_id, uint8_t hop_depth, const c
                                    char *topic_out, size_t topic_cap,
                                    char *json_out, size_t json_cap);
 
+bool   on_mqtt_format_ha_discovery_mac(uint16_t short_id, const uint8_t mac48[6],
+                                       uint8_t hop_depth, const char *role_name,
+                                       char *topic_out, size_t topic_cap,
+                                       char *json_out, size_t json_cap);
+
 bool   on_mqtt_format_node_state(uint16_t short_id, uint16_t parent_id, uint8_t hop_depth,
                                  int16_t skew_ns, const uint8_t *data, uint8_t data_len,
                                  char *topic_out, size_t topic_cap,
                                  char *json_out, size_t json_cap);
+
+bool   on_mqtt_format_node_state_mac(uint16_t short_id, const uint8_t mac48[6],
+                                     uint16_t parent_id, uint8_t hop_depth,
+                                     int16_t skew_ns, const uint8_t *data, uint8_t data_len,
+                                     char *topic_out, size_t topic_cap,
+                                     char *json_out, size_t json_cap);
 
 /* Parse inbound MQTT topic ("opennear/cmd/0x100" or "opennear/ota/trigger") */
 bool   on_mqtt_parse_cmd_topic(const char *topic, size_t topic_len,

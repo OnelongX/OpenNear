@@ -223,12 +223,23 @@ static void cluster_mark_inactive(on_node_t *node, uint16_t short_id) {
     }
 }
 
+static bool mac48_nonzero(const uint8_t m[6]) {
+    return (m[0] | m[1] | m[2] | m[3] | m[4] | m[5]) != 0u;
+}
+
+static void format_mac48(const uint8_t m[6], char out[18]) {
+    snprintf(out, 18u, "%02X:%02X:%02X:%02X:%02X:%02X",
+             (unsigned)m[0], (unsigned)m[1], (unsigned)m[2],
+             (unsigned)m[3], (unsigned)m[4], (unsigned)m[5]);
+}
+
 static void cluster_record_tdma(on_node_t *node, const on_mac_hdr_t *hdr,
                                 const on_data_payload_t *dp, const on_peer_entry_t *pe) {
     if (!node || !hdr || !dp) return;
     /* 1. Always refresh the direct 1-hop sender */
     on_cluster_node_t *c1 = cluster_find_or_alloc(node, hdr->src_id);
     if (c1) {
+        if (pe && mac48_nonzero(pe->mac48)) memcpy(c1->mac48, pe->mac48, 6u);
         c1->parent_id    = node->short_id;
         c1->hop_depth    = 1u;
         c1->role         = (hdr->src_id == node->sub_g_id || hdr->src_id == node->sub_g_id_2)
@@ -310,18 +321,21 @@ static void topo_queue_resp_pages(on_node_t *node, uint16_t requester_id) {
         size_t off = 6u;
         for (uint8_t k = 0u; k < cnt; ++k) {
             const on_cluster_node_t *cn = &snap.nodes[start + k];
-            topo_put_u16(b + off + 0, cn->short_id);
-            topo_put_u16(b + off + 2, cn->parent_id);
-            b[off + 4] = (uint8_t)(((cn->hop_depth & 0x03u) << 6) |
+            uint16_t sid = cn->short_id & ON_SHORT_ID_MASK;
+            uint16_t pid = cn->parent_id & ON_SHORT_ID_MASK;
+            b[off + 0] = (uint8_t)(sid >> 4);
+            b[off + 1] = (uint8_t)(((sid & 0x0Fu) << 4) | ((pid >> 8) & 0x0Fu));
+            b[off + 2] = (uint8_t)(pid & 0xFFu);
+            b[off + 3] = (uint8_t)(((cn->hop_depth & 0x03u) << 6) |
                                    ((cn->role & 0x03u) << 4) |
                                    (cn->slot_idx & 0x0Fu));
-            b[off + 5] = cn->ota_state;
-            topo_put_u16(b + off + 6, (uint16_t)cn->last_skew_ns);
-            topo_put_u16(b + off + 8, cn->last_seq);
-            uint8_t dlen = (cn->last_data_len <= 7u) ? cn->last_data_len : 7u;
-            b[off + 10] = dlen;
-            memset(b + off + 11, 0, 7u);
-            if (dlen > 0u) memcpy(b + off + 11, cn->last_data, dlen);
+            uint8_t dlen = (cn->last_data_len <= 4u) ? cn->last_data_len : 4u;
+            b[off + 4] = (uint8_t)(((cn->ota_state & 0x0Fu) << 4) | (dlen & 0x0Fu));
+            topo_put_u16(b + off + 5, (uint16_t)cn->last_skew_ns);
+            b[off + 7] = (uint8_t)(cn->last_seq & 0xFFu);
+            memset(b + off + 8, 0, 4u);
+            if (dlen > 0u) memcpy(b + off + 8, cn->last_data, dlen);
+            memcpy(b + off + 12, cn->mac48, 6u);
             off += 18u;
         }
         resp.payload_len = (uint8_t)off;
@@ -352,23 +366,26 @@ static void topo_ingest_resp_page(on_node_t *node, const on_gw_bridge_msg_t *msg
 
     size_t off = 6u;
     for (uint8_t k = 0u; k < cnt; ++k) {
-        uint16_t sid = topo_get_u16(b + off + 0) & ON_SHORT_ID_MASK;
+        uint16_t sid = (uint16_t)(((uint16_t)b[off + 0] << 4) | ((b[off + 1] >> 4) & 0x0Fu));
+        uint16_t pid = (uint16_t)(((uint16_t)(b[off + 1] & 0x0Fu) << 8) | b[off + 2]);
         on_cluster_node_t *cn = cluster_find_or_alloc(node, sid);
         if (cn) {
-            cn->parent_id     = topo_get_u16(b + off + 2) & ON_SHORT_ID_MASK;
-            uint8_t packed    = b[off + 4];
+            cn->parent_id     = pid & ON_SHORT_ID_MASK;
+            uint8_t packed    = b[off + 3];
             cn->hop_depth     = (uint8_t)((packed >> 6) & 0x03u);
             cn->role          = (uint8_t)((packed >> 4) & 0x03u);
             cn->slot_idx      = (uint8_t)(packed & 0x0Fu);
-            cn->ota_state     = b[off + 5];
-            cn->last_skew_ns  = (int16_t)topo_get_u16(b + off + 6);
-            cn->last_seq      = topo_get_u16(b + off + 8);
-            cn->last_data_len = (b[off + 10] <= 7u) ? b[off + 10] : 7u;
+            cn->ota_state     = (uint8_t)((b[off + 4] >> 4) & 0x0Fu);
+            cn->last_data_len = (uint8_t)(b[off + 4] & 0x0Fu);
+            if (cn->last_data_len > 4u) cn->last_data_len = 4u;
+            cn->last_skew_ns  = (int16_t)topo_get_u16(b + off + 5);
+            cn->last_seq      = b[off + 7];
             cn->is_backup     = (sid == node->backup_id);
             cn->last_seen_sf  = node->current_sf_seq;
             if (cn->last_data_len > 0u) {
-                memcpy(cn->last_data, b + off + 11, cn->last_data_len);
+                memcpy(cn->last_data, b + off + 8, cn->last_data_len);
             }
+            memcpy(cn->mac48, b + off + 12, 6u);
         }
         off += 18u;
     }
@@ -727,6 +744,19 @@ static void handle_join_req(on_node_t *node, const on_mac_hdr_t *hdr,
     }
 
     pe->last_seen_sf = node->current_sf_seq;
+    if (as_pri) {
+        on_cluster_node_t *cn = cluster_find_or_alloc(node, pe->short_id);
+        if (cn) {
+            memcpy(cn->mac48, pe->mac48, 6u);
+            cn->parent_id    = node->short_id;
+            cn->hop_depth    = 1u;
+            cn->slot_idx     = pe->slot_idx;
+            cn->capabilities = pe->capabilities;
+            cn->last_seen_sf = node->current_sf_seq;
+        }
+    } else if (as_sub) {
+        pe->mac_reported_to_g = false;
+    }
 
     on_join_ack_t ack;
     memcpy(ack.mac48, pe->mac48, 6u);
@@ -1271,12 +1301,25 @@ void on_node_on_rx_raw_timed(on_node_t *node, const uint8_t *frame, size_t len,
             node->gw_rx_total++;
             bool is_uplink = (msg.bridge_type == ON_GW_MSG_TELEMETRY_UP ||
                               msg.bridge_type == ON_GW_MSG_BLE_NOTIFY_UP ||
-                              msg.bridge_type == ON_GW_MSG_TOPO_REQ);
+                              msg.bridge_type == ON_GW_MSG_TOPO_REQ ||
+                              msg.bridge_type == ON_GW_MSG_MAC_REPORT);
             if (is_uplink) {
                 if (node->role == ON_ROLE_G) {
                     if (msg.bridge_type == ON_GW_MSG_TOPO_REQ) {
                         topo_queue_resp_pages(node, msg.origin_id);
                         emit_event(node, "TOPO_REQ_RX", msg.origin_id, (int64_t)node->current_sf_seq);
+                    } else if (msg.bridge_type == ON_GW_MSG_MAC_REPORT && msg.payload_len >= 6u) {
+                        node->rx_slot_mask_this_sf |= (uint16_t)(1u << (hdr.slot_idx & 0x0Fu));
+                        on_peer_entry_t *pe_sg = find_peer_by_id(node, hdr.src_id);
+                        if (pe_sg) pe_sg->last_seen_sf = node->current_sf_seq;
+                        on_cluster_node_t *cn = cluster_find_or_alloc(node, msg.origin_id);
+                        if (cn) {
+                            memcpy(cn->mac48, msg.payload, 6u);
+                            if (cn->parent_id == ON_SHORT_ID_UNASSIGNED) cn->parent_id = hdr.src_id;
+                            if (cn->hop_depth == 0u) cn->hop_depth = 2u;
+                            if (cn->role == 0u) cn->role = (uint8_t)ON_ROLE_T;
+                            cn->last_seen_sf = node->current_sf_seq;
+                        }
                     } else if (node->gw) {
                         on_gw_push_uplink(node->gw, &msg);
                         emit_event(node, "GW_UPLINK_RX", msg.origin_id, (int64_t)msg.seq);
@@ -1764,6 +1807,40 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
         int64_t slot_ns = (int64_t)on_sf_slot_start_us(&node->sf_cfg, node->my_slot) * 1000LL;
         if (elapsed_ns >= slot_ns && elapsed_ns < slot_ns + 80000LL) {
             node->tdma_tx_done_this_sf = true;
+            /* v6.5: Sub-G reports each newly-joined 2-hop child's MAC48 in its own private D-TDMA slot (guaranteed 0 collision!) */
+            if (node->role == ON_ROLE_SUB_G && !node->harq_retry_pending && node->tdma_tx_total > 0u) {
+                for (uint32_t pi = 0u; pi < ON_MAX_NODES_TABLE; ++pi) {
+                    on_peer_entry_t *pe = &node->peers[pi];
+                    if (pe->active && pe->is_sub_slot && !pe->mac_reported_to_g &&
+                        mac48_nonzero(pe->mac48)) {
+                        on_gw_bridge_msg_t mrep;
+                        memset(&mrep, 0, sizeof(mrep));
+                        mrep.bridge_type = (uint8_t)ON_GW_MSG_MAC_REPORT;
+                        mrep.flags       = ON_GW_FLAG_RELAYED_2HOP;
+                        mrep.origin_id   = pe->short_id;
+                        mrep.seq         = ++node->data_tx_seq;
+                        mrep.payload_len = 6u;
+                        memcpy(mrep.payload, pe->mac48, 6u);
+                        uint8_t mbuf[ON_GW_BRIDGE_HDR_LEN + 6u];
+                        size_t mlen = 0u;
+                        if (on_gw_bridge_pack(&mrep, mbuf, sizeof(mbuf), &mlen) == ON_OK) {
+                            on_mac_hdr_t hdr;
+                            memset(&hdr, 0, sizeof(hdr));
+                            hdr.version    = ON_PROTO_VERSION;
+                            hdr.type       = (uint8_t)ON_FRAME_GW_BRIDGE;
+                            hdr.is_sub_g   = false;
+                            hdr.src_id     = node->short_id;
+                            hdr.dst_id     = node->parent_id;
+                            hdr.sf_seq_low = (uint8_t)(node->current_sf_seq & 0x0Fu);
+                            hdr.slot_idx   = node->my_slot;
+                            send_frame(node, &hdr, mbuf, mlen, now_local_ns);
+                            pe->mac_reported_to_g = true;
+                            node->gw_tx_total++;
+                            goto tdma_slot_done;
+                        }
+                    }
+                }
+            }
             on_data_payload_t dp;
             if (node->harq_retry_pending) {
                 dp = node->last_tx_data;
@@ -1812,6 +1889,7 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
 
             send_frame(node, &hdr, dbuf, dlen, now_local_ns);
             node->tdma_tx_total++;
+tdma_slot_done: ;
         }
     }
 
@@ -2414,6 +2492,7 @@ size_t on_node_get_cluster_snapshot(const on_node_t *node, on_cluster_snapshot_t
         /* Entry 0: Primary G itself */
         on_cluster_node_t *g = &out->nodes[count++];
         g->active        = true;
+        memcpy(g->mac48, node->mac48, 6u);
         g->short_id      = node->short_id;
         g->parent_id     = ON_SHORT_ID_UNASSIGNED;
         g->role          = (uint8_t)ON_ROLE_G;
@@ -2452,6 +2531,7 @@ size_t on_node_get_cluster_snapshot(const on_node_t *node, on_cluster_snapshot_t
             if (!exists) {
                 on_cluster_node_t *dst = &out->nodes[count++];
                 dst->active       = true;
+                memcpy(dst->mac48, pe->mac48, 6u);
                 dst->short_id     = pe->short_id;
                 dst->parent_id    = node->short_id;
                 dst->hop_depth    = 1u;
@@ -2481,6 +2561,7 @@ size_t on_node_get_cluster_snapshot(const on_node_t *node, on_cluster_snapshot_t
         if (node->short_id != ON_SHORT_ID_UNASSIGNED) {
             on_cluster_node_t *me = &out->nodes[count++];
             me->active        = true;
+            memcpy(me->mac48, node->mac48, 6u);
             me->short_id      = node->short_id;
             me->parent_id     = node->parent_id;
             me->role          = (uint8_t)node->role;
@@ -2501,6 +2582,7 @@ size_t on_node_get_cluster_snapshot(const on_node_t *node, on_cluster_snapshot_t
                 if (!pe->active || !pe->is_sub_slot) continue;
                 on_cluster_node_t *ch = &out->nodes[count++];
                 ch->active       = true;
+                memcpy(ch->mac48, pe->mac48, 6u);
                 ch->short_id     = pe->short_id;
                 ch->parent_id    = node->short_id;
                 ch->role         = (uint8_t)ON_ROLE_T;
@@ -2555,23 +2637,26 @@ size_t on_node_format_cluster_json(const on_node_t *node, bool include_data,
         }
         dhex[dlen * 2u] = '\0';
 
+        char mac_s[18];
+        format_mac48(c->mac48, mac_s);
+
         int n;
         if (include_data) {
             n = snprintf(out_buf + pos, out_cap - (size_t)pos,
-                         "%s{\"id\":\"0x%03X\",\"parent\":\"0x%03X\",\"hop\":%u,\"role\":\"%s\","
+                         "%s{\"id\":\"0x%03X\",\"mac\":\"%s\",\"parent\":\"0x%03X\",\"hop\":%u,\"role\":\"%s\","
                          "\"slot\":%u,\"skew_ns\":%d,\"rx\":%u,\"seq\":%u,\"ota\":%u,\"data\":\"%s\"}",
                          (i > 0u) ? "," : "",
-                         (unsigned)c->short_id, (unsigned)c->parent_id,
+                         (unsigned)c->short_id, mac_s, (unsigned)c->parent_id,
                          (unsigned)c->hop_depth, role_str(c->role),
                          (unsigned)c->slot_idx, (int)c->last_skew_ns,
                          (unsigned)c->rx_packets, (unsigned)c->last_seq,
                          (unsigned)c->ota_state, dhex);
         } else {
             n = snprintf(out_buf + pos, out_cap - (size_t)pos,
-                         "%s{\"id\":\"0x%03X\",\"parent\":\"0x%03X\",\"hop\":%u,\"role\":\"%s\","
+                         "%s{\"id\":\"0x%03X\",\"mac\":\"%s\",\"parent\":\"0x%03X\",\"hop\":%u,\"role\":\"%s\","
                          "\"slot\":%u,\"skew_ns\":%d,\"ota\":%u}",
                          (i > 0u) ? "," : "",
-                         (unsigned)c->short_id, (unsigned)c->parent_id,
+                         (unsigned)c->short_id, mac_s, (unsigned)c->parent_id,
                          (unsigned)c->hop_depth, role_str(c->role),
                          (unsigned)c->slot_idx, (int)c->last_skew_ns,
                          (unsigned)c->ota_state);

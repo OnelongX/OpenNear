@@ -335,8 +335,14 @@ bool on_sec_check_replay(on_sec_ctx_t *ctx, uint16_t src_id,
     /* Unjoined nodes (0x000) use C-RA join handshake before Short-ID assignment */
     if (src_id == ON_SHORT_ID_UNASSIGNED) return true;
 
-    /* Chronological monotonic watermark: sf_seq > frame_type (TDMA=2 < RTT=5,6 < ALERT=7) > slot */
-    uint64_t wm = ((uint64_t)sf_seq << 8)
+    /* Chronological monotonic watermark:
+     *   sf_seq > phase (0=D-TDMA slot, 1=C-RA/service) > frame_type > slot_idx
+     * Putting D-TDMA slot-local GW_BRIDGE (slot_idx < 12, e.g. v6.5 MAC_REPORT) in phase 0
+     * ensures a subsequent C-RA RTT_REQ/ALERT in the same superframe stays strictly monotonic. */
+    uint64_t phase = (frame_type == ON_FRAME_TDMA_DATA ||
+                      (frame_type == ON_FRAME_GW_BRIDGE && slot_idx < 12u)) ? 0u : 1u;
+    uint64_t wm = ((uint64_t)sf_seq << 9)
+                | (phase << 8)
                 | ((uint64_t)(frame_type & 0x0Fu) << 4)
                 | (uint64_t)(slot_idx & 0x0Fu);
 

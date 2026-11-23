@@ -2252,9 +2252,68 @@ static void test_v64_optional_mqtts_tls_config(void) {
     printf("    -> MQTT plain(1883) / auto-TLS(8883) / MQTTS shorthand / custom port TLS(443) all verified\n");
 }
 
+/* ========================================================================== */
+/* Test 35: v6.5 Cluster-Wide Permanent MAC48 Propagation & HA MAC Discovery  */
+/* ========================================================================== */
+static void test_v65_cluster_mac48_and_ha_identity(void) {
+    printf("[TEST 35] v6.5 Hardware MAC48 Propagation (0-Hop G + 1-Hop + 2-Hop Edge) & HA MAC Entity...\n");
+
+    sim_world_t w;
+    sim_world_init(&w, 0x65C12026ULL);
+    sim_world_setup_10node_demo(&w, true);
+    /* Run enough superframes for 1-hop + 2-hop join and Sub-G MAC_REPORT propagation to Primary G */
+    sim_world_run_us(&w, 240000, 10);
+
+    char g_json[3072];
+    size_t jlen = on_node_format_cluster_json(&w.nodes[0], true, g_json, sizeof(g_json));
+
+    char g_mac[18], t4_mac[18], t8_mac[18];
+    snprintf(g_mac, sizeof(g_mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+             w.nodes[0].mac48[0], w.nodes[0].mac48[1], w.nodes[0].mac48[2],
+             w.nodes[0].mac48[3], w.nodes[0].mac48[4], w.nodes[0].mac48[5]);
+    snprintf(t4_mac, sizeof(t4_mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+             w.nodes[4].mac48[0], w.nodes[4].mac48[1], w.nodes[4].mac48[2],
+             w.nodes[4].mac48[3], w.nodes[4].mac48[4], w.nodes[4].mac48[5]);
+    snprintf(t8_mac, sizeof(t8_mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+             w.nodes[8].mac48[0], w.nodes[8].mac48[1], w.nodes[8].mac48[2],
+             w.nodes[8].mac48[3], w.nodes[8].mac48[4], w.nodes[8].mac48[5]);
+
+    EXPECT(jlen > 200u && strstr(g_json, g_mac) != NULL &&
+           strstr(g_json, t4_mac) != NULL && strstr(g_json, t8_mac) != NULL,
+           "Primary G JSON includes permanent MAC48 for 0-hop G, 1-hop T4, and wall-blocked 2-hop T8");
+
+    /* Remote 1-hop node T5 fetches paginated snapshot and also receives 2-hop T8 MAC48 */
+    EXPECT(on_node_request_cluster_snapshot(&w.nodes[5]) == ON_OK,
+           "1-hop T5 requests cluster snapshot with MAC48");
+    sim_world_run_us(&w, 160000, 10);
+    char t5_json[3072];
+    on_node_format_cluster_json(&w.nodes[5], true, t5_json, sizeof(t5_json));
+    EXPECT(w.nodes[5].cluster_snapshot_valid && strstr(t5_json, t8_mac) != NULL,
+           "Remote 1-hop T5 receives 2-hop T8 permanent MAC48 via paginated air snapshot");
+    EXPECT(w.tdma_subg_collisions == 0u && w.cra_collisions == 0u,
+           "Zero RF collisions during 2-hop MAC48 reporting and snapshot pagination");
+
+    /* Verify MAC-anchored Home Assistant Discovery & State JSON */
+    const uint8_t sample_mac[6] = { 0xA4u, 0xCFu, 0x12u, 0x34u, 0x56u, 0x78u };
+    const uint8_t sample_pay[2] = { 0xABu, 0xCDu };
+    char topic[96], payload[512];
+    EXPECT(on_mqtt_format_ha_discovery_mac(0x004u, sample_mac, 2u, "T",
+                                           topic, sizeof(topic), payload, sizeof(payload)) &&
+           strcmp(topic, "homeassistant/sensor/opennear_A4CF12345678/config") == 0 &&
+           strstr(payload, "\"uniq_id\":\"opennear_A4CF12345678\"") != NULL &&
+           strstr(payload, "[\"mac\",\"A4:CF:12:34:56:78\"]") != NULL,
+           "Home Assistant discovery anchors uniq_id & device connections to permanent MAC48");
+    EXPECT(on_mqtt_format_node_state_mac(0x004u, sample_mac, 0x001u, 1u, -12,
+                                         sample_pay, 2u, topic, sizeof(topic), payload, sizeof(payload)) &&
+           strstr(payload, "\"mac\":\"A4:CF:12:34:56:78\"") != NULL,
+           "MQTT node state JSON embeds permanent MAC48 alongside dynamic Short-ID");
+    printf("    -> Cluster MACs verified: G=%s T4=%s T8(2-hop)=%s | HA uniq_id=opennear_A4CF12345678\n",
+           g_mac, t4_mac, t8_mac);
+}
+
 int main(void) {
     printf("============================================================\n");
-    printf("       OpenNear v6.4 Core Protocol Automated Test Suite     \n");
+    printf("       OpenNear v6.5 Core Protocol Automated Test Suite     \n");
     printf("============================================================\n");
 
     test_6byte_header_and_frame();
@@ -2292,6 +2351,7 @@ int main(void) {
     test_v62_deep_hardening_regressions();
     test_independent_act_clock();
     test_v64_optional_mqtts_tls_config();
+    test_v65_cluster_mac48_and_ha_identity();
 
     printf("\n------------------------------------------------------------\n");
     printf("SUMMARY: %d passed, %d failed\n", g_tests_passed, g_tests_failed);

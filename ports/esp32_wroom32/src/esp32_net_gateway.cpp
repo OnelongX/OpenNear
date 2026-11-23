@@ -12,6 +12,7 @@
 #include <Preferences.h>
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
+#include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp32_tls_transport.h"
 #include "esp32_web_portal.h"
@@ -173,13 +174,13 @@ static void esp32_mqtt_poll(on_node_t *node, on_gw_ctx_t *gw) {
             const on_cluster_node_t *cn = &snap.nodes[i];
             const char *rname = (cn->role == ON_ROLE_G) ? "G" :
                                 (cn->role == ON_ROLE_SUB_G ? "SUB_G" : "T");
-            if (on_mqtt_format_ha_discovery(cn->short_id, cn->hop_depth, rname,
-                                            topic, sizeof(topic), payload, sizeof(payload))) {
+            if (on_mqtt_format_ha_discovery_mac(cn->short_id, cn->mac48, cn->hop_depth, rname,
+                                                topic, sizeof(topic), payload, sizeof(payload))) {
                 esp32_mqtt_publish_cb(gw, topic, payload, true);
             }
-            if (on_mqtt_format_node_state(cn->short_id, cn->parent_id, cn->hop_depth,
-                                          cn->last_skew_ns, cn->last_data, cn->last_data_len,
-                                          topic, sizeof(topic), payload, sizeof(payload))) {
+            if (on_mqtt_format_node_state_mac(cn->short_id, cn->mac48, cn->parent_id, cn->hop_depth,
+                                              cn->last_skew_ns, cn->last_data, cn->last_data_len,
+                                              topic, sizeof(topic), payload, sizeof(payload))) {
                 esp32_mqtt_publish_cb(gw, topic, payload, false);
             }
         }
@@ -276,6 +277,8 @@ static void start_local_http_api(void) {
         const char *role_s = "UNJOINED";
         uint16_t short_id  = 0u;
         uint32_t sf_seq    = 0u;
+        uint8_t  sta_mac[6] = {0};
+        uint8_t  ble_mac[6] = {0};
         if (s_node_ref) {
             on_esp32_node_lock();
             switch (s_node_ref->role) {
@@ -286,19 +289,26 @@ static void start_local_http_api(void) {
             }
             short_id = s_node_ref->short_id;
             sf_seq   = s_node_ref->current_sf_seq;
+            memcpy(sta_mac, s_node_ref->mac48, 6u);
             on_esp32_node_unlock();
         }
+        esp_read_mac(ble_mac, ESP_MAC_BT);
+        char mac_s[18], bmac_s[18];
+        snprintf(mac_s, sizeof(mac_s), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 sta_mac[0], sta_mac[1], sta_mac[2], sta_mac[3], sta_mac[4], sta_mac[5]);
+        snprintf(bmac_s, sizeof(bmac_s), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 ble_mac[0], ble_mac[1], ble_mac[2], ble_mac[3], ble_mac[4], ble_mac[5]);
 
         bool wifi_ok = (WiFi.status() == WL_CONNECTED);
         IPAddress ip = wifi_ok ? WiFi.localIP() : IPAddress(0, 0, 0, 0);
         char ip_s[24];
         snprintf(ip_s, sizeof(ip_s), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
-        char num[128];
+        char num[160];
 
         append_cstr(json, sizeof(json), &pos, "{\"role\":\"");
         append_cstr(json, sizeof(json), &pos, role_s);
-        snprintf(num, sizeof(num), "\",\"id\":\"0x%03X\",\"sf\":%u,\"fw_ver\":\"v6.4\",\"uptime_s\":%u",
-                 (unsigned)short_id, (unsigned)sf_seq, (unsigned)(millis() / 1000u));
+        snprintf(num, sizeof(num), "\",\"id\":\"0x%03X\",\"mac\":\"%s\",\"ble_mac\":\"%s\",\"sf\":%u,\"fw_ver\":\"v6.5\",\"uptime_s\":%u",
+                 (unsigned)short_id, mac_s, bmac_s, (unsigned)sf_seq, (unsigned)(millis() / 1000u));
         append_cstr(json, sizeof(json), &pos, num);
 
         snprintf(num, sizeof(num), ",\"wifi_ok\":%s,\"wifi_ch\":%u,\"wifi_rssi\":%d,\"wifi_ip\":\"%s\",\"wifi_ssid\":\"",
@@ -368,7 +378,7 @@ static void start_local_http_api(void) {
     });
 
     s_http_srv.on("/api/topology", HTTP_GET, []() {
-        static char json[2048];
+        static char json[3072];
         if (!s_node_ref) { s_http_srv.send(503, "application/json", "{\"error\":\"no_node\"}"); return; }
         on_esp32_node_lock();
         size_t n = on_node_format_cluster_json(s_node_ref, false, json, sizeof(json));
@@ -376,7 +386,7 @@ static void start_local_http_api(void) {
         s_http_srv.send(200, "application/json", (n > 0u) ? json : "{}");
     });
     s_http_srv.on("/api/data", HTTP_GET, []() {
-        static char json[2048];
+        static char json[3072];
         if (!s_node_ref) { s_http_srv.send(503, "application/json", "{\"error\":\"no_node\"}"); return; }
         on_esp32_node_lock();
         size_t n = on_node_format_cluster_json(s_node_ref, true, json, sizeof(json));
@@ -881,7 +891,7 @@ void on_esp32_net_gw_poll(on_node_t *node, on_gw_ctx_t *gw) {
 
     if (node && gw->cfg.topo_query_requested) {
         gw->cfg.topo_query_requested = false;
-        static char topo_json[2048];
+        static char topo_json[3072];
         on_esp32_node_lock();
         if (node->role != ON_ROLE_G && !node->cluster_snapshot_valid) {
             on_node_request_cluster_snapshot(node);

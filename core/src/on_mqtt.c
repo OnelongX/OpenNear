@@ -193,14 +193,47 @@ size_t on_mqtt_encode_pingreq(uint8_t out[2]) {
 /* Home Assistant MQTT Auto-Discovery & OpenNear IoT Topic Formatters         */
 /* ========================================================================== */
 
-bool on_mqtt_format_ha_discovery(uint16_t short_id, uint8_t hop_depth, const char *role_name,
-                                 char *topic_out, size_t topic_cap,
-                                 char *json_out, size_t json_cap) {
+static bool mac_valid(const uint8_t *mac48) {
+    return mac48 != NULL && ((mac48[0] | mac48[1] | mac48[2] | mac48[3] | mac48[4] | mac48[5]) != 0u);
+}
+
+bool on_mqtt_format_ha_discovery_mac(uint16_t short_id, const uint8_t mac48[6],
+                                     uint8_t hop_depth, const char *role_name,
+                                     char *topic_out, size_t topic_cap,
+                                     char *json_out, size_t json_cap) {
     if (!topic_out || !json_out || topic_cap < 48u || json_cap < 256u) return false;
     const char *r = (role_name && role_name[0]) ? role_name : "NODE";
+    unsigned sid = (unsigned)(short_id & ON_SHORT_ID_MASK);
+
+    if (mac_valid(mac48)) {
+        char mhex[13], mcol[18];
+        snprintf(mhex, sizeof(mhex), "%02X%02X%02X%02X%02X%02X",
+                 (unsigned)mac48[0], (unsigned)mac48[1], (unsigned)mac48[2],
+                 (unsigned)mac48[3], (unsigned)mac48[4], (unsigned)mac48[5]);
+        snprintf(mcol, sizeof(mcol), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 (unsigned)mac48[0], (unsigned)mac48[1], (unsigned)mac48[2],
+                 (unsigned)mac48[3], (unsigned)mac48[4], (unsigned)mac48[5]);
+        int tn = snprintf(topic_out, topic_cap,
+                          "homeassistant/sensor/opennear_%s/config", mhex);
+        if (tn <= 0 || (size_t)tn >= topic_cap) return false;
+
+        int jn = snprintf(json_out, json_cap,
+                          "{\"name\":\"OpenNear %s 0x%03X (Hop %u)\","
+                          "\"uniq_id\":\"opennear_%s\","
+                          "\"stat_t\":\"opennear/node/0x%03X/state\","
+                          "\"cmd_t\":\"opennear/cmd/0x%03X\","
+                          "\"val_tpl\":\"{{ value_json.data }}\","
+                          "\"json_attr_t\":\"opennear/node/0x%03X/state\","
+                          "\"dev\":{\"ids\":[\"opennear_%s\"],\"cns\":[[\"mac\",\"%s\"]],"
+                          "\"name\":\"OpenNear %s\",\"mf\":\"OpenNear\",\"mdl\":\"v6.5 Hybrid Mesh (%s)\"}}",
+                          r, sid, (unsigned)hop_depth,
+                          mhex, sid, sid, sid,
+                          mhex, mcol, mcol, r);
+        return (jn > 0 && (size_t)jn < json_cap);
+    }
+
     int tn = snprintf(topic_out, topic_cap,
-                      "homeassistant/sensor/opennear_%03X/config",
-                      (unsigned)(short_id & ON_SHORT_ID_MASK));
+                      "homeassistant/sensor/opennear_%03X/config", sid);
     if (tn <= 0 || (size_t)tn >= topic_cap) return false;
 
     int jn = snprintf(json_out, json_cap,
@@ -211,20 +244,24 @@ bool on_mqtt_format_ha_discovery(uint16_t short_id, uint8_t hop_depth, const cha
                       "\"val_tpl\":\"{{ value_json.data }}\","
                       "\"json_attr_t\":\"opennear/node/0x%03X/state\","
                       "\"dev\":{\"ids\":[\"opennear_%03X\"],\"name\":\"OpenNear 0x%03X\","
-                      "\"mf\":\"OpenNear\",\"mdl\":\"v6.0 Hybrid Mesh (%s)\"}}",
-                      r, (unsigned)short_id, (unsigned)hop_depth,
-                      (unsigned)short_id,
-                      (unsigned)short_id,
-                      (unsigned)short_id,
-                      (unsigned)short_id,
-                      (unsigned)short_id, (unsigned)short_id, r);
+                      "\"mf\":\"OpenNear\",\"mdl\":\"v6.5 Hybrid Mesh (%s)\"}}",
+                      r, sid, (unsigned)hop_depth,
+                      sid, sid, sid, sid, sid, sid, r);
     return (jn > 0 && (size_t)jn < json_cap);
 }
 
-bool on_mqtt_format_node_state(uint16_t short_id, uint16_t parent_id, uint8_t hop_depth,
-                               int16_t skew_ns, const uint8_t *data, uint8_t data_len,
-                               char *topic_out, size_t topic_cap,
-                               char *json_out, size_t json_cap) {
+bool on_mqtt_format_ha_discovery(uint16_t short_id, uint8_t hop_depth, const char *role_name,
+                                 char *topic_out, size_t topic_cap,
+                                 char *json_out, size_t json_cap) {
+    return on_mqtt_format_ha_discovery_mac(short_id, NULL, hop_depth, role_name,
+                                           topic_out, topic_cap, json_out, json_cap);
+}
+
+bool on_mqtt_format_node_state_mac(uint16_t short_id, const uint8_t mac48[6],
+                                   uint16_t parent_id, uint8_t hop_depth,
+                                   int16_t skew_ns, const uint8_t *data, uint8_t data_len,
+                                   char *topic_out, size_t topic_cap,
+                                   char *json_out, size_t json_cap) {
     if (!topic_out || !json_out || topic_cap < 32u || json_cap < 96u) return false;
     static const char kHex[] = "0123456789ABCDEF";
     char dhex[17];
@@ -239,13 +276,36 @@ bool on_mqtt_format_node_state(uint16_t short_id, uint16_t parent_id, uint8_t ho
                       (unsigned)(short_id & ON_SHORT_ID_MASK));
     if (tn <= 0 || (size_t)tn >= topic_cap) return false;
 
-    int jn = snprintf(json_out, json_cap,
+    int jn;
+    if (mac_valid(mac48)) {
+        char mcol[18];
+        snprintf(mcol, sizeof(mcol), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 (unsigned)mac48[0], (unsigned)mac48[1], (unsigned)mac48[2],
+                 (unsigned)mac48[3], (unsigned)mac48[4], (unsigned)mac48[5]);
+        jn = snprintf(json_out, json_cap,
+                      "{\"id\":\"0x%03X\",\"mac\":\"%s\",\"parent\":\"0x%03X\",\"hop\":%u,"
+                      "\"skew_ns\":%d,\"data\":\"%s\"}",
+                      (unsigned)(short_id & ON_SHORT_ID_MASK),
+                      mcol,
+                      (unsigned)(parent_id & ON_SHORT_ID_MASK),
+                      (unsigned)hop_depth, (int)skew_ns, dhex);
+    } else {
+        jn = snprintf(json_out, json_cap,
                       "{\"id\":\"0x%03X\",\"parent\":\"0x%03X\",\"hop\":%u,"
                       "\"skew_ns\":%d,\"data\":\"%s\"}",
                       (unsigned)(short_id & ON_SHORT_ID_MASK),
                       (unsigned)(parent_id & ON_SHORT_ID_MASK),
                       (unsigned)hop_depth, (int)skew_ns, dhex);
+    }
     return (jn > 0 && (size_t)jn < json_cap);
+}
+
+bool on_mqtt_format_node_state(uint16_t short_id, uint16_t parent_id, uint8_t hop_depth,
+                               int16_t skew_ns, const uint8_t *data, uint8_t data_len,
+                               char *topic_out, size_t topic_cap,
+                               char *json_out, size_t json_cap) {
+    return on_mqtt_format_node_state_mac(short_id, NULL, parent_id, hop_depth, skew_ns,
+                                         data, data_len, topic_out, topic_cap, json_out, json_cap);
 }
 
 bool on_mqtt_parse_cmd_topic(const char *topic, size_t topic_len,

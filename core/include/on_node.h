@@ -23,18 +23,20 @@ typedef struct {
     uint16_t short_id;
     uint8_t  slot_idx;
     bool     is_sub_slot;
+    bool     mac_reported_to_g; /* v6.5: Sub-G has propagated 2-hop child MAC to Primary G */
     uint8_t  capabilities;
     uint32_t last_seen_sf;
     int16_t  last_skew_ns;
     uint32_t rx_packets;
 } on_peer_entry_t;
 
-/* v5.1 Cluster-wide multi-hop node record (0-hop G + 1-hop T/Sub-G + 2-hop edge + live data) */
+/* v5.1/v6.5 Cluster-wide multi-hop node record (0-hop G + 1-hop T/Sub-G + 2-hop edge + MAC48 + live data) */
 #define ON_MAX_CLUSTER_NODES  24u
-#define ON_TOPO_PAGE_NODES    2u  /* 6B page hdr + 2 * 18B = 42B -> 224 us air (fits inside Sub-CRA <3160 us!) */
+#define ON_TOPO_PAGE_NODES    2u  /* 6B page hdr + 2 * 18B = 42B (compact 3B IDs + 6B MAC48 + 4B data, <220us!) */
 
 typedef struct {
     bool     active;
+    uint8_t  mac48[6];        /* v6.5: Permanent hardware MAC48 (ESP32 Wi-Fi STA / nRF52 FICR) */
     uint16_t short_id;
     uint16_t parent_id;       /* 0x000 for Primary G, G_id for 1-hop, Sub-G_id for 2-hop */
     uint8_t  role;            /* on_role_t */

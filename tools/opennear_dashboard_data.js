@@ -1,16 +1,16 @@
 window.OPENNEAR_DATA = {
   "meta": {"total_tx": 1057, "total_rx": 2541, "tdma_collisions": 0, "cra_collisions": 0, "failover_sf": 69, "failover_new_g": "0x004", "pcap_pkts": 1057, "jammed_drops": 0, "sync_drops": 10, "afh_map": "0xFFFF"},
   "nodes": [
-    {"name":"G","alive":false,"role":"DEAD","short_id":"0x001","hop":0,"slot":0,"drift_ppm":0.00,"nco_ppm":0.00,"rtt_ns":0,"duty_pct":25.90,"acts":65},
+    {"name":"G","alive":false,"role":"DEAD","short_id":"0x001","hop":0,"slot":0,"drift_ppm":0.00,"nco_ppm":0.00,"rtt_ns":0,"duty_pct":25.91,"acts":65},
     {"name":"T1_BK","alive":true,"role":"G-MASTER","short_id":"0x004","hop":0,"slot":2,"drift_ppm":18.50,"nco_ppm":-18.32,"rtt_ns":218,"duty_pct":14.97,"acts":95},
-    {"name":"T2_SG","alive":true,"role":"SUB-G","short_id":"0x005","hop":1,"slot":3,"drift_ppm":-15.20,"nco_ppm":15.52,"rtt_ns":235,"duty_pct":19.75,"acts":95},
+    {"name":"T2_SG","alive":true,"role":"SUB-G","short_id":"0x005","hop":1,"slot":3,"drift_ppm":-15.20,"nco_ppm":15.52,"rtt_ns":235,"duty_pct":19.76,"acts":95},
     {"name":"T3","alive":true,"role":"T-NODE","short_id":"0x006","hop":1,"slot":4,"drift_ppm":24.00,"nco_ppm":-23.77,"rtt_ns":267,"duty_pct":10.81,"acts":95},
     {"name":"T4","alive":true,"role":"T-NODE","short_id":"0x007","hop":1,"slot":5,"drift_ppm":-21.50,"nco_ppm":22.07,"rtt_ns":275,"duty_pct":10.42,"acts":95},
-    {"name":"T5","alive":true,"role":"T-NODE","short_id":"0x008","hop":1,"slot":6,"drift_ppm":11.80,"nco_ppm":-11.37,"rtt_ns":315,"duty_pct":10.04,"acts":95},
+    {"name":"T5","alive":true,"role":"T-NODE","short_id":"0x008","hop":1,"slot":6,"drift_ppm":11.80,"nco_ppm":-11.37,"rtt_ns":315,"duty_pct":10.05,"acts":95},
     {"name":"T6","alive":true,"role":"T-NODE","short_id":"0x002","hop":1,"slot":0,"drift_ppm":-9.40,"nco_ppm":9.45,"rtt_ns":337,"duty_pct":7.80,"acts":95},
     {"name":"T7","alive":true,"role":"T-NODE","short_id":"0x003","hop":1,"slot":1,"drift_ppm":19.70,"nco_ppm":-19.47,"rtt_ns":346,"duty_pct":9.42,"acts":95},
     {"name":"T8_E1","alive":true,"role":"T-NODE","short_id":"0x100","hop":2,"slot":0,"drift_ppm":-23.10,"nco_ppm":23.35,"rtt_ns":515,"duty_pct":7.38,"acts":91},
-    {"name":"T9_E2","alive":true,"role":"T-NODE","short_id":"0x101","hop":2,"slot":1,"drift_ppm":16.40,"nco_ppm":-16.30,"rtt_ns":531,"duty_pct":7.40,"acts":91}
+    {"name":"T9_E2","alive":true,"role":"T-NODE","short_id":"0x101","hop":2,"slot":1,"drift_ppm":16.40,"nco_ppm":-16.30,"rtt_ns":531,"duty_pct":7.41,"acts":91}
   ],
   "timeline": [
     {"sf":0,"nodes":8,"skew_ns":399,"ch":0,"map":65535},

@@ -272,7 +272,7 @@ void loop() {
             if (g_node.role != ON_ROLE_G && !g_node.cluster_snapshot_valid) {
                 on_node_request_cluster_snapshot(&g_node);
             }
-            static char s_json[2048];
+            static char s_json[3072];
             size_t n = on_node_format_cluster_json(&g_node, cmd.equalsIgnoreCase("DATA?"),
                                                    s_json, sizeof(s_json));
             on_esp32_node_unlock();

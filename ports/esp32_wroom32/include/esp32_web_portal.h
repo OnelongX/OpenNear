@@ -58,7 +58,7 @@ th{color:var(--mut);font-weight:600;font-size:12px}
     <div class="brand">
       <h1>OpenNear</h1>
       <span class="badge" id="b-role">加载中...</span>
-      <span class="badge" id="b-fw">v6.4</span>
+      <span class="badge" id="b-fw">v6.5</span>
     </div>
     <div class="row">
       <input id="g-token" type="password" placeholder="Admin Token (如已设置)" style="width:185px" onchange="saveLocalToken()">
@@ -83,8 +83,8 @@ th{color:var(--mut);font-weight:600;font-size:12px}
       </div>
       <div class="tbl-wrap">
         <table>
-          <thead><tr><th>Short-ID</th><th>角色</th><th>跳数</th><th>父节点</th><th>时隙</th><th>同步偏差</th><th>收包</th><th>OTA</th><th>实时载荷 (Hex / ASCII)</th><th>操作</th></tr></thead>
-          <tbody id="node-rows"><tr><td colspan="10" class="muted">正在拉取集群快照...</td></tr></tbody>
+          <thead><tr><th>Short-ID</th><th>MAC 地址 (Wi-Fi)</th><th>角色</th><th>跳数</th><th>父节点</th><th>时隙</th><th>同步偏差</th><th>收包</th><th>OTA</th><th>实时载荷 (Hex / ASCII)</th><th>操作</th></tr></thead>
+          <tbody id="node-rows"><tr><td colspan="11" class="muted">正在拉取集群快照...</td></tr></tbody>
         </table>
       </div>
     </div>
@@ -237,6 +237,7 @@ async function fetchStatus(){
     $('b-role').textContent=(s.role||'NODE')+' '+s.id;
     $('b-fw').textContent=s.fw_ver||'v6.3';
     const pills=[];
+    if(s.mac)pills.push('<span class="badge mono">MAC: '+esc(s.mac)+(s.ble_mac?' (BLE '+esc(s.ble_mac)+')':'')+'</span>');
     pills.push(s.wifi_ok
       ?'<span class="badge ok">Wi-Fi 已连: '+esc(s.wifi_ssid)+' ('+esc(s.wifi_ip)+' CH'+s.wifi_ch+' '+s.wifi_rssi+'dBm)</span>'
       :'<span class="badge warn">Wi-Fi 未连接</span>');
@@ -272,7 +273,7 @@ async function fetchData(){
     $('topo-meta').textContent='SF='+d.sf+' | G='+d.g+' | Backup='+d.backup+' | Sub-G='+d.sub_g+' | 节点='+d.count;
     const tb=$('node-rows');
     if(!d.nodes||!d.nodes.length){
-      tb.innerHTML='<tr><td colspan="10" class="muted">暂无在线节点</td></tr>';
+      tb.innerHTML='<tr><td colspan="11" class="muted">暂无在线节点</td></tr>';
       return;
     }
     const otaNames=['IDLE','RX','VERIFY','READY','COMMIT','APPLIED','FAIL'];
@@ -281,6 +282,7 @@ async function fetchData(){
       const rCls=n.role==='G'?'ok':(n.role==='SUB_G'?'warn':'');
       return '<tr>'
         +'<td class="mono"><b>'+esc(n.id)+'</b></td>'
+        +'<td class="mono muted">'+esc(n.mac||'--')+'</td>'
         +'<td><span class="badge '+rCls+'">'+esc(n.role)+'</span></td>'
         +'<td>Hop '+n.hop+'</td>'
         +'<td class="mono">'+esc(n.parent)+'</td>'
