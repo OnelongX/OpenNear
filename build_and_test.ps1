@@ -141,9 +141,12 @@ if ((Test-Path $xbin) -and (Test-Path $sdk)) {
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     }
     & xtensa-esp32-elf-g++ -std=gnu++11 -Os -Wall -Wextra -mlongcalls -fno-rtti -fno-exceptions `
+        -c "$Root\ports\esp32_wroom32\src\act_capture.cpp" @espInc -o "$BuildDir\esp32_obj\act_capture.o"
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    & xtensa-esp32-elf-g++ -std=gnu++11 -Os -Wall -Wextra -mlongcalls -fno-rtti -fno-exceptions `
         -c "$Root\ports\esp32_wroom32\src\main.cpp" @espInc -o "$BuildDir\esp32_obj\main.o"
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    Write-Host "  OK: Route C ESP32-WROOM-32 Xtensa cross-compilation passed (13/13 object files)." -ForegroundColor Green
+    Write-Host "  OK: Route C ESP32-WROOM-32 Xtensa cross-compilation passed (14/14 object files)." -ForegroundColor Green
 } else {
     Write-Host "  SKIP: ESP32 Xtensa toolchain not found in default PlatformIO path." -ForegroundColor Yellow
 }

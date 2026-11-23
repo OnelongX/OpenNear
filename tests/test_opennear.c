@@ -1226,6 +1226,66 @@ static void test_act_lookahead(void) {
     EXPECT(t.act_cmd == 0u && t.last_act_was_scheduled, "Wrapped action is applied exactly like any other target");
 }
 
+static void test_queued_tx_min_delay_envelope(void) {
+    printf("[TEST 25] Queued-TX Asymmetric Minimum-Delay Envelope Filter (ESP32 Wi-Fi Jitter Rejection)...\n");
+
+    on_node_t t;
+    on_node_init(&t, NULL, ON_ROLE_UNJOINED, 0);
+    t.hal.tx_timing_best_effort = true;
+    t.act_lookahead_enabled     = true;
+
+    /*
+     * Simulate an ESP32 terminal with a -22 ppm crystal offset (local clock runs slower:
+     * true_local_ns(net_ns) = 10,000,000 + net_ns / (1.0 - 22e-6)) receiving 40 superframes
+     * where esp_wifi_80211_tx adds asymmetric one-sided queuing spikes up to +1,800 us!
+     * Including an initially queued boot beacon (+650 us on SF=0).
+     */
+    static const int64_t kQueueDelayUs[20] = {
+        650, 180,   0, 1450,  45,   1, 1800, 920,   0, 310,
+       1250,   0, 740, 1620,   1, 530,    0, 1100, 890,   0
+    };
+    const double true_rate_ppb = -22000.0; /* -22 ppm */
+    const int64_t boot_offset_ns = 10000000LL;
+
+    int64_t max_phase_err_after_floor_ns = 0;
+    for (uint32_t sf = 0; sf < 40u; ++sf) {
+        int64_t tx_net_ns = (int64_t)sf * 4000000LL;
+        int64_t true_floor_loc_ns = boot_offset_ns +
+            (int64_t)llround((double)tx_net_ns / (1.0 + true_rate_ppb * 1e-9));
+        int64_t q_ns = kQueueDelayUs[sf % 20u] * 1000LL;
+        int64_t rx_loc_ns = true_floor_loc_ns + q_ns;
+
+        uint8_t lead = (sf == 37u) ? 4u : 0u; /* Arm lookahead flip for SF=41 during a +1100 us queued beacon */
+        act_test_beacon(&t, 1u, sf, 77u, 0u, lead, tx_net_ns, rx_loc_ns, false);
+
+        if (sf >= 10u) {
+            int64_t pred_net_at_floor = on_sync_local_to_net(&t.sync, true_floor_loc_ns);
+            int64_t phase_err_ns = pred_net_at_floor - tx_net_ns;
+            if (phase_err_ns < 0) phase_err_ns = -phase_err_ns;
+            if (phase_err_ns > max_phase_err_after_floor_ns) {
+                max_phase_err_after_floor_ns = phase_err_ns;
+            }
+        }
+    }
+
+    int64_t target_sf41_net_ns = 41LL * 4000000LL + 3700000LL;
+    int64_t true_sf41_act_loc_ns = boot_offset_ns +
+        (int64_t)llround((double)target_sf41_net_ns / (1.0 + true_rate_ppb * 1e-9));
+    int64_t lookahead_err_ns = t.act_lookahead.deadline_local_ns - true_sf41_act_loc_ns;
+    if (lookahead_err_ns < 0) lookahead_err_ns = -lookahead_err_ns;
+
+    printf("  -> Max clock phase error under 1800 us Wi-Fi TX queue spikes: %lld ns (%.2f us), NCO=%.2f ppm, Lookahead ACT err=%lld ns\n",
+           (long long)max_phase_err_after_floor_ns,
+           (double)max_phase_err_after_floor_ns * 1e-3,
+           t.sync.rate_ppb * 1e-3,
+           (long long)lookahead_err_ns);
+
+    EXPECT(max_phase_err_after_floor_ns < 2500LL,
+           "Minimum-delay envelope filter rejects +1800 us Wi-Fi queuing spikes to < 2.5 us phase error");
+    EXPECT(t.act_lookahead.pending && t.act_lookahead.target_sf == 41u && lookahead_err_ns < 2500LL,
+           "Lookahead GPIO deadline armed from a +1100 us delayed beacon hits true target within < 2.5 us");
+}
+
 int main(void) {
     printf("============================================================\n");
     printf("       OpenNear v4.0 Core Protocol Automated Test Suite     \n");
@@ -1255,6 +1315,7 @@ int main(void) {
     test_rejoin_after_primary_reboot();
     test_rejoin_after_primary_lease_expiry();
     test_act_lookahead();
+    test_queued_tx_min_delay_envelope();
 
     printf("\n------------------------------------------------------------\n");
     printf("SUMMARY: %d passed, %d failed\n", g_tests_passed, g_tests_failed);

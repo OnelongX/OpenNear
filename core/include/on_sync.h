@@ -40,6 +40,7 @@ typedef struct {
     double   ka;                /* v4.0: Second-order thermal drift-acceleration gain (ppb/s) */
     double   drift_accel_ppb_s; /* v4.0: Tracked crystal frequency drift rate (ppb/s) */
     bool     accel_en;          /* v4.0: Enable 3-state [phase, skew, drift_accel] tracking */
+    bool     queued_tx_mode;    /* v4.0: Asymmetric minimum-delay envelope filter for queued Wi-Fi TX */
     double   max_rate_ppb;      /* Clamp for crystal tolerance (default +/- 200,000 ppb = +/- 200 ppm) */
 
     /* Telemetry */
@@ -93,6 +94,7 @@ void    on_sync_set_ant_delay_ns(on_sync_ctx_t *ctx, int64_t ant_delay_ns);
  * during rapid crystal thermal ramping (e.g. cold boot or continuous PA TX heating).
  */
 void    on_sync_enable_accel_tracker(on_sync_ctx_t *ctx, bool enable, double ka);
+void    on_sync_set_queued_tx_mode(on_sync_ctx_t *ctx, bool enable);
 
 #ifdef __cplusplus
 }

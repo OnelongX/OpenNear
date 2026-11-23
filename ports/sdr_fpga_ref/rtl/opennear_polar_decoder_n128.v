@@ -50,13 +50,14 @@ module opennear_polar_decoder_n128 (
         end
     endfunction
 
-    // Hardware min-sum f(a, b) = sign(a)*sign(b)*min(|a|, |b|)
+    // Hardware Normalized Min-Sum f(a, b) = 0.875 * sign(a)*sign(b)*min(|a|, |b|)
     function automatic signed [9:0] llr_f_q4(input signed [9:0] a, input signed [9:0] b);
         reg signed [11:0] aa, ab, m;
         begin
             aa = (a < 0) ? -a : a;
             ab = (b < 0) ? -b : b;
             m  = (aa < ab) ? aa : ab;
+            m  = m - (m >>> 3); // 7/8 scaling via single shift-subtract
             llr_f_q4 = ((a < 0) ^ (b < 0)) ? sat_q4(-m) : sat_q4(m);
         end
     endfunction

@@ -25,6 +25,7 @@ void on_sync_init(on_sync_ctx_t *ctx) {
     ctx->ka                = 0.0;
     ctx->drift_accel_ppb_s = 0.0;
     ctx->accel_en          = false;
+    ctx->queued_tx_mode    = false;
     ctx->max_rate_ppb      = 200000.0; /* +/- 200 ppm crystal bound */
     ctx->last_err_ns       = 0;
     ctx->max_abs_err_ns    = 0;
@@ -40,12 +41,17 @@ void on_sync_enable_accel_tracker(on_sync_ctx_t *ctx, bool enable, double ka) {
     }
 }
 
+void on_sync_set_queued_tx_mode(on_sync_ctx_t *ctx, bool enable) {
+    if (!ctx) return;
+    ctx->queued_tx_mode = enable;
+}
+
 void on_sync_reset(on_sync_ctx_t *ctx) {
     on_sync_init(ctx);
 }
 
 int64_t on_sync_local_to_net(const on_sync_ctx_t *ctx, int64_t local_ns) {
-    if (!ctx || !ctx->locked) {
+    if (!ctx || (!ctx->locked && ctx->lock_count == 0u)) {
         return local_ns;
     }
     double dt_loc = (double)(local_ns - ctx->ref_local_ns);
@@ -90,6 +96,87 @@ int64_t on_sync_on_beacon(on_sync_ctx_t *ctx, int64_t t_tx_net_ns, int64_t t_rx_
     int64_t t_pred_net_ns = on_sync_local_to_net(ctx, t_rx_local_ns);
     int64_t err_ns = t_expected_net_ns - t_pred_net_ns;
 
+    /*
+     * Asymmetric Minimum-Delay Envelope Filter for Queued TX Transports (v4.1):
+     * On best-effort raw 802.11 transports (ESP32 esp_wifi_80211_tx), TX queuing delay q_k >= 0
+     * is strictly one-sided: delayed arrivals produce err_ns < 0 (up to several milliseconds),
+     * whereas packets that hit the minimum queuing floor produce err_ns >= -1500 ns (or err_ns > 0
+     * when beating a previously queued reference).
+     */
+    if (ctx->queued_tx_mode) {
+        if (ctx->lock_count == 1u && ctx->has_prev) {
+            int64_t dt_loc = t_rx_local_ns - ctx->prev_rx_local_ns;
+            int64_t dt_net = t_expected_net_ns - ctx->prev_tx_net_ns;
+            if (ll_abs64(err_ns) <= 2000 && dt_loc > 100000) {
+                double est_ppb = ((double)(dt_net - dt_loc) / (double)dt_loc) * 1e9;
+                if (est_ppb >  40000.0) est_ppb =  40000.0;
+                if (est_ppb < -40000.0) est_ppb = -40000.0;
+                ctx->rate_ppb = est_ppb;
+            }
+            if (err_ns >= -1500) {
+                ctx->ref_local_ns     = t_rx_local_ns;
+                ctx->ref_net_ns       = t_expected_net_ns;
+                ctx->prev_rx_local_ns = t_rx_local_ns;
+                ctx->prev_tx_net_ns   = t_expected_net_ns;
+                ctx->last_dt_loc_ns   = dt_loc;
+            }
+            ctx->lock_count++;
+            ctx->last_err_ns = err_ns;
+            return err_ns;
+        }
+
+        /* Major epoch jump (> 25 ms) or new lower queuing floor discovered (> +2 us early) */
+        if (ll_abs64(err_ns) > 25000000LL || err_ns > 2000LL) {
+            ctx->ref_local_ns     = t_rx_local_ns;
+            ctx->ref_net_ns       = t_expected_net_ns;
+            ctx->prev_rx_local_ns = t_rx_local_ns;
+            ctx->prev_tx_net_ns   = t_expected_net_ns;
+            ctx->last_dt_loc_ns   = 0;
+            ctx->lock_count++;
+            ctx->last_err_ns = err_ns;
+            return err_ns;
+        }
+
+        int64_t dt_loc = t_rx_local_ns - ctx->prev_rx_local_ns;
+        if (err_ns >= -1500LL) {
+            /* Near-floor packet: track phase & crystal drift relative to last floor packet */
+            ctx->last_dt_loc_ns = dt_loc;
+            if (dt_loc > 100000) {
+                double dt_sec = (double)dt_loc * 1e-9;
+                double kp_eff = (err_ns >= 0) ? 0.75 : 0.45;
+                ctx->ref_net_ns   = t_pred_net_ns + (int64_t)llround(kp_eff * (double)err_ns);
+                ctx->ref_local_ns = t_rx_local_ns;
+
+                double delta_ppb = ctx->ki * ((double)err_ns / dt_sec);
+                if (delta_ppb >  1000.0) delta_ppb =  1000.0;
+                if (delta_ppb < -1000.0) delta_ppb = -1000.0;
+                ctx->rate_ppb += delta_ppb;
+                if (ctx->rate_ppb >  ctx->max_rate_ppb) ctx->rate_ppb =  ctx->max_rate_ppb;
+                if (ctx->rate_ppb < -ctx->max_rate_ppb) ctx->rate_ppb = -ctx->max_rate_ppb;
+            }
+            ctx->prev_rx_local_ns = t_rx_local_ns;
+            ctx->prev_tx_net_ns   = t_expected_net_ns;
+        } else {
+            /* Late queued outlier (err_ns < -1.5 us): reject Wi-Fi queue spike, apply tiny leaky decay */
+            if (dt_loc <= 60000000LL) {
+                ctx->ref_net_ns   = t_pred_net_ns - 30LL;
+                ctx->ref_local_ns = t_rx_local_ns;
+                ctx->rate_ppb    -= 10.0;
+                if (ctx->rate_ppb < -ctx->max_rate_ppb) ctx->rate_ppb = -ctx->max_rate_ppb;
+            } else {
+                /* > 60 ms without reaching old floor: gradually relax envelope toward new baseline */
+                int64_t step_ns = (err_ns < -5000LL) ? -1000LL : (err_ns / 5);
+                ctx->ref_net_ns       = t_pred_net_ns + step_ns;
+                ctx->ref_local_ns     = t_rx_local_ns;
+                ctx->prev_rx_local_ns = t_rx_local_ns;
+                ctx->prev_tx_net_ns   = t_expected_net_ns;
+            }
+        }
+        ctx->lock_count++;
+        ctx->last_err_ns = err_ns;
+        return err_ns;
+    }
+
     /* Acquisition step 2: Second beacon -> direct two-point NCO frequency seed */
     if (ctx->lock_count == 1u && ctx->has_prev) {
         int64_t dt_loc = t_rx_local_ns - ctx->prev_rx_local_ns;
@@ -133,12 +220,28 @@ int64_t on_sync_on_beacon(on_sync_ctx_t *ctx, int64_t t_tx_net_ns, int64_t t_rx_
             ctx->rate_ppb += ctx->drift_accel_ppb_s * dt_sec;
         }
 
+        /*
+         * Phase-Step vs. Frequency-Noise Discrimination (v4.0):
+         * Once NCO frequency is locked (lock_count >= 4), a single-frame innovation in
+         * (150 ns .. 5000 ns) is a parent RTT / failover phase step (a quartz crystal cannot
+         * shift frequency by >37 ppm in 4 ms). Snap phase quickly (0.85) while clamping the
+         * integral frequency kick to +/-80 ns so parent RTT calibration never pollutes rate_ppb!
+         */
+        bool is_phase_step = (ctx->lock_count >= 4u && !ctx->accel_en &&
+                              ll_abs64(err_ns) > 150 && ll_abs64(err_ns) < 5000);
+        double kp_eff = is_phase_step ? 0.85 : ctx->kp;
+        double err_for_ki = (double)err_ns;
+        if (is_phase_step) {
+            if (err_for_ki >  80.0) err_for_ki =  80.0;
+            if (err_for_ki < -80.0) err_for_ki = -80.0;
+        }
+
         /* Re-base reference point to prevent double precision drift over long runs */
-        ctx->ref_net_ns   = t_pred_net_ns + (int64_t)llround(ctx->kp * (double)err_ns);
+        ctx->ref_net_ns   = t_pred_net_ns + (int64_t)llround(kp_eff * (double)err_ns);
         ctx->ref_local_ns = t_rx_local_ns;
 
         /* Integral NCO fractional rate update (ppb) */
-        double delta_ppb = ctx->ki * ((double)err_ns / dt_sec);
+        double delta_ppb = ctx->ki * (err_for_ki / dt_sec);
         ctx->rate_ppb += delta_ppb;
         if (ctx->rate_ppb >  ctx->max_rate_ppb) ctx->rate_ppb =  ctx->max_rate_ppb;
         if (ctx->rate_ppb < -ctx->max_rate_ppb) ctx->rate_ppb = -ctx->max_rate_ppb;

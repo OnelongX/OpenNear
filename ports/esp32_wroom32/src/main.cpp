@@ -33,8 +33,11 @@ static void opennear_rt_task(void *arg) {
         int64_t now_ns = g_node.hal.now_ns(g_node.hal.user_ctx);
         on_node_step(&g_node, now_ns);
 
-        /* Network SF can reset on a primary reboot; local time stays monotonic. */
-        if (now_ns - last_log_ns >= 1000000000LL) {
+        /* Network SF can reset on a primary reboot; local time stays monotonic.
+         * Defer 1 Hz UART formatting if an ACT/SYNC deadline is within 600 us. */
+        const int64_t until_deadline_ns = on_node_next_wakeup_local_ns(&g_node, now_ns) - now_ns;
+        if (now_ns - last_log_ns >= 1000000000LL &&
+            (!g_node.sync.locked || until_deadline_ns > 600000LL)) {
             last_log_ns = now_ns;
             uint32_t tx_accepted, tx_failed;
             on_esp32_hal_tx_counts(&tx_accepted, &tx_failed);

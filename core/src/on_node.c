@@ -264,6 +264,7 @@ void on_node_init(on_node_t *node, const on_hal_ops_t *hal,
     node->backup_miss_threshold = ON_BACKUP_MISS_THRESHOLD;
     node->peer_lease_timeout_sf = ON_PEER_LEASE_TIMEOUT_SF;
     on_sync_init(&node->sync);
+    on_sync_set_queued_tx_mode(&node->sync, node->hal.tx_timing_best_effort);
     on_sec_init(&node->sec);
     on_afh_init(&node->afh, false);
 
@@ -610,6 +611,7 @@ void on_node_on_rx_raw(on_node_t *node, const uint8_t *frame, size_t len, int64_
             }
 
             /* Step 1 + Step 3: Hardware RX capture feeds TC-PLL / NCO lock */
+            on_sync_set_queued_tx_mode(&node->sync, node->hal.tx_timing_best_effort);
             on_sync_on_beacon(&node->sync, sp.t_tx_net_ns, rx_local_ns);
             node->sync_rx_total++;
             if (node->backup_min_sync_silence_ns > 0) {
@@ -710,6 +712,7 @@ void on_node_on_rx_raw(on_node_t *node, const uint8_t *frame, size_t len, int64_
                 node->primary_slot_leased = !node->is_sub_node;
                 node->primary_join_sf = node->current_sf_seq;
                 node->rtt_next_sf = node->current_sf_seq + 1u;
+                node->sync.rtt_calibrated = false; /* Fresh RTT lock to new parent */
                 emit_event(node, node->is_sub_node ? "JOINED_VIA_SUBG" : "JOINED_PRIMARY",
                            node->short_id, node->my_slot);
             }
@@ -722,14 +725,10 @@ void on_node_on_rx_raw(on_node_t *node, const uint8_t *frame, size_t len, int64_
             if (on_rtt_req_unpack(payload, plen, &req) != ON_OK) break;
 
             int64_t now_loc = node->hal.now_ns ? node->hal.now_ns(node->hal.user_ctx) : rx_local_ns;
-            int64_t t2_net = (node->role == ON_ROLE_G)
-                           ? rx_local_ns
-                           : on_sync_local_to_net(&node->sync, rx_local_ns);
+            int64_t t2_net  = on_sync_local_to_net(&node->sync, rx_local_ns);
             /* Schedule hardware TX strictly AFTER RX completion so T3 matches physical TX start */
             int64_t tx_local = (now_loc > rx_local_ns ? now_loc : rx_local_ns) + 25000LL;
-            int64_t t3_net = (node->role == ON_ROLE_G)
-                           ? tx_local
-                           : on_sync_local_to_net(&node->sync, tx_local);
+            int64_t t3_net   = on_sync_local_to_net(&node->sync, tx_local);
 
             on_rtt_resp_t resp;
             resp.t1_local_ns = req.t1_local_ns;
@@ -909,10 +908,14 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
                     emit_event(node, "KEY_EPOCH_ROTATED", next_ep, (int64_t)node->current_sf_seq);
                 }
 
-                /* v3.0 Lease Expiry GC & automatic Sub-G / Backup_ID re-election */
+                /* v3.0 Lease Expiry GC & fast automatic Sub-G / Backup_ID re-election */
                 for (uint32_t i = 0u; i < ON_MAX_NODES_TABLE; ++i) {
-                    if (node->peers[i].active && !node->peers[i].is_sub_slot &&
-                        node->current_sf_seq - node->peers[i].last_seen_sf > node->peer_lease_timeout_sf) {
+                    if (!node->peers[i].active || node->peers[i].is_sub_slot) continue;
+                    bool is_active_subg = (!node->hal.tx_timing_best_effort &&
+                                           (node->peers[i].short_id == node->sub_g_id ||
+                                            node->peers[i].short_id == node->sub_g_id_2));
+                    uint32_t timeout_sfs = is_active_subg ? 12u : node->peer_lease_timeout_sf;
+                    if (node->current_sf_seq - node->peers[i].last_seen_sf > timeout_sfs) {
                         uint16_t dead_id = node->peers[i].short_id;
                         uint8_t  dead_slot = node->peers[i].slot_idx;
                         node->tdma_bitmap &= (uint16_t)(~(1u << dead_slot));
@@ -995,9 +998,15 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
         node->current_sf_start_net_ns += t_sf_ns;
         node->role = ON_ROLE_G;
         node->failover_count++;
-        /* Anchor G clock smoothly to our locked NCO network time */
-        node->sync.ref_local_ns = now_local_ns;
+        /* Anchor G clock smoothly to our locked NCO network time without tick-overshoot jump */
+        node->sync.ref_local_ns = on_sync_net_to_local(&node->sync, node->current_sf_start_net_ns);
         node->sync.ref_net_ns   = node->current_sf_start_net_ns;
+        /* Refresh mirrored peer lease timestamps at takeover epoch so inherited peers get a full lease window */
+        for (uint32_t i = 0u; i < ON_MAX_NODES_TABLE; ++i) {
+            if (node->peers[i].active) {
+                node->peers[i].last_seen_sf = node->current_sf_seq;
+            }
+        }
         node->backup_id         = select_next_backup_id(node);
         node->sync_rx_this_sf   = true;
         node->act_fired_this_sf = false;
@@ -1027,7 +1036,7 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
         node->cra_tx_done_this_sf      = false;
         node->ch_pretuned_this_sf      = false;
         if (node->afh.enabled) {
-            if (node->missed_sync_count > 6u) {
+            if (node->missed_sync_count > 6u && (node->missed_sync_count & 1u) != 0u) {
                 node->scan_ch_idx = (uint8_t)((node->scan_ch_idx + 1u) % ON_AFH_NUM_CHANNELS);
                 tune_channel(node, node->scan_ch_idx);
             } else {
@@ -1037,12 +1046,13 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
 
         /* v3.0 2-hop edge node self-healing: if Sub-G proxy dies, detach & re-join new Sub-G */
         if (node->is_sub_node && node->missed_sync_count >= ON_SUB_NODE_DETACH_MISS) {
-            node->role              = ON_ROLE_UNJOINED;
-            node->short_id          = ON_SHORT_ID_UNASSIGNED;
-            node->sync.locked       = false;
-            node->missed_sync_count = 0u;
-            node->awaiting_ack      = false;
-            node->harq_retry_pending = false;
+            node->role                = ON_ROLE_UNJOINED;
+            node->short_id            = ON_SHORT_ID_UNASSIGNED;
+            node->sync.locked         = false;
+            node->sync.rtt_calibrated = false;
+            node->missed_sync_count   = 0u;
+            node->awaiting_ack        = false;
+            node->harq_retry_pending  = false;
             emit_event(node, "SUB_NODE_DETACHED", node->parent_id, (int64_t)node->current_sf_seq);
             return;
         }
@@ -1185,14 +1195,15 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
 
     /* Phase 3: C-RA Contention Micro-Slot (JOIN_REQ, RTT_REQ, or Emergency Alert) */
     if (!node->cra_tx_done_this_sf) {
-        /* Deterministic stagger by MAC byte[5] to minimize C-RA join collisions */
-        uint32_t my_turn = (node->mac48[5] % 7u);
+        /* Deterministic stagger by MAC byte[5] (mod 2 for Sub-CRA 2-hop, mod 7 for 1-hop C-RA) */
+        uint32_t turn_mod = node->is_sub_node ? 2u : 7u;
+        uint32_t my_turn  = node->is_sub_node ? ((node->mac48[5] + 1u) % 2u) : (node->mac48[5] % 7u);
         int64_t cra_ns = node->is_sub_node
             ? (int64_t)on_sf_subg_cra_start_us(&node->sf_cfg) * 1000LL
             : (int64_t)on_sf_cra_slot_start_us(&node->sf_cfg, (uint8_t)(node->mac48[5] & 1u)) * 1000LL;
 
         if (elapsed_ns >= cra_ns && elapsed_ns < cra_ns + 60000LL) {
-            if (node->role == ON_ROLE_UNJOINED && ((node->current_sf_seq % 7u) == my_turn)) {
+            if (node->role == ON_ROLE_UNJOINED && ((node->current_sf_seq % turn_mod) == my_turn)) {
                 node->cra_tx_done_this_sf = true;
                 on_join_req_t req;
                 memcpy(req.mac48, node->mac48, 6u);
@@ -1245,7 +1256,7 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
             } else if ((node->role == ON_ROLE_T || node->role == ON_ROLE_SUB_G) &&
                        !node->hal.tx_timing_best_effort &&
                        node->current_sf_seq >= node->rtt_next_sf &&
-                       ((node->current_sf_seq % 7u) == my_turn)) {
+                       ((node->current_sf_seq % turn_mod) == my_turn)) {
                 /* Periodic 4-timestamp RTT calibration */
                 node->cra_tx_done_this_sf = true;
                 node->rtt_in_flight   = true;
@@ -1300,8 +1311,7 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
                 node->afh_countdown      = 0u;
             }
         }
-        if (node->missed_sync_count > 6u) {
-            node->scan_ch_idx = (uint8_t)((node->scan_ch_idx + 1u) % ON_AFH_NUM_CHANNELS);
+        if (node->missed_sync_count > 6u && (node->missed_sync_count & 1u) != 0u) {
             tune_channel(node, node->scan_ch_idx);
         } else {
             tune_channel(node, on_afh_channel_for(&node->afh, node->current_sf_seq + 1u, 0u));
@@ -1374,9 +1384,10 @@ bool on_node_is_rx_open(const on_node_t *node, int64_t now_local_ns) {
     uint32_t off_us = (uint32_t)(elapsed_ns / 1000LL);
 
     if (node->is_sub_node) {
-        /* 2-hop edge node ONLY wakes RX during Sub-G SYNC window (2040..2310 us) */
+        /* 2-hop edge node wakes RX during Sub-G SYNC window (with 40 us pre-guard for clock jitter) */
         uint32_t sub0 = node->sf_cfg.sub_g_start_us;
-        return (off_us >= sub0 && off_us < sub0 + 270u);
+        uint32_t pre  = (sub0 >= 40u) ? (sub0 - 40u) : 0u;
+        return (off_us >= pre && off_us < sub0 + 270u);
     }
 
     /* 1-hop T node & Sub-G wake RX during primary SYNC/MAP (0..270 us) */

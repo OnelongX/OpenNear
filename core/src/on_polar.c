@@ -101,7 +101,8 @@ static float llr_f(float a, float b) {
     float sb = (b >= 0.0f) ? 1.0f : -1.0f;
     float aa = fabsf(a);
     float ab = fabsf(b);
-    return sa * sb * (aa < ab ? aa : ab);
+    /* 5G NR Normalized Min-Sum scaling factor alpha = 0.875 (7/8) */
+    return 0.875f * sa * sb * (aa < ab ? aa : ab);
 }
 
 static float llr_g(float a, float b, uint8_t u_left) {
