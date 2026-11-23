@@ -51,9 +51,11 @@ static void opennear_rt_task(void *arg) {
     uint32_t loop_iters = 0;
 
     for (;;) {
+        on_esp32_node_lock();
         on_esp32_hal_poll_rx(&g_node);
         int64_t now_ns = g_node.hal.now_ns(g_node.hal.user_ctx);
         on_node_step(&g_node, now_ns);
+        on_esp32_node_unlock();
 
         /* Network SF can reset on a primary reboot; local time stays monotonic.
          * Defer 1 Hz UART formatting if an ACT/SYNC deadline is within 600 us. */
@@ -177,6 +179,10 @@ void setup() {
                   (unsigned)cfg.channel, (unsigned)kWifiBackupMissThreshold,
                   (unsigned)kWifiBackupSilenceMs);
 
+    /* Initialize recursive mutex before spawning Core 1 real-time task */
+    on_esp32_node_lock();
+    on_esp32_node_unlock();
+
     /* Pin OpenNear real-time state machine to Core 1 (isolating Wi-Fi ISR on Core 0) */
     xTaskCreatePinnedToCore(opennear_rt_task, "opennear_rt", 8192, NULL,
                             configMAX_PRIORITIES - 2, NULL, 1);
@@ -205,12 +211,14 @@ void loop() {
         String cmd = Serial.readStringUntil('\n');
         cmd.trim();
         if (cmd.equalsIgnoreCase("TOPO?") || cmd.equalsIgnoreCase("DATA?")) {
+            on_esp32_node_lock();
             if (g_node.role != ON_ROLE_G && !g_node.cluster_snapshot_valid) {
                 on_node_request_cluster_snapshot(&g_node);
             }
             static char s_json[1024];
             size_t n = on_node_format_cluster_json(&g_node, cmd.equalsIgnoreCase("DATA?"),
                                                    s_json, sizeof(s_json));
+            on_esp32_node_unlock();
             if (n > 0u) Serial.println(s_json);
         }
     }

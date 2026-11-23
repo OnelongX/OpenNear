@@ -188,6 +188,12 @@ void     on_ota_compute_auth_tag(const uint8_t key[ON_SEC_KEY_LEN],
                                  const uint8_t *image_data,
                                  uint8_t tag8_out[ON_OTA_AUTH_TAG_LEN]);
 
+on_err_t on_ota_compute_auth_tag_reader(const uint8_t key[ON_SEC_KEY_LEN],
+                                        const on_ota_meta_t *meta,
+                                        on_err_t (*read_fn)(void *, uint32_t, uint8_t *, size_t),
+                                        void *read_ctx,
+                                        uint8_t tag8_out[ON_OTA_AUTH_TAG_LEN]);
+
 /* Wire codecs */
 on_err_t on_ota_meta_pack(const on_ota_meta_t *m, uint8_t *out, size_t cap, size_t *len);
 on_err_t on_ota_meta_unpack(const uint8_t *in, size_t len, on_ota_meta_t *m);

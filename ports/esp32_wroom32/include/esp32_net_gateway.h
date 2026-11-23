@@ -34,6 +34,10 @@ void on_esp32_net_gw_start(on_node_t *node, on_gw_ctx_t *gw, const char *ble_nam
 /* Run on Core 0 (Arduino loop): service Wi-Fi reconnect, AP channel sync, HTTP POST & Cloud OTA pull */
 void on_esp32_net_gw_poll(on_node_t *node, on_gw_ctx_t *gw);
 
+/* Cross-core spinlock helpers protecting shared on_node_t reads/writes between Core 0 and Core 1 */
+void on_esp32_node_lock(void);
+void on_esp32_node_unlock(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -222,10 +222,10 @@ static void topo_queue_resp_pages(on_node_t *node, uint16_t requester_id) {
         }
         resp.payload_len = (uint8_t)off;
 
-        if (node->topo_resp_q.count < ON_GW_RING_DEPTH) {
+        uint8_t nt = (uint8_t)((node->topo_resp_q.tail + 1u) & (ON_GW_RING_DEPTH - 1u));
+        if (nt != node->topo_resp_q.head) {
             node->topo_resp_q.items[node->topo_resp_q.tail] = resp;
-            node->topo_resp_q.tail = (uint8_t)((node->topo_resp_q.tail + 1u) % ON_GW_RING_DEPTH);
-            node->topo_resp_q.count++;
+            node->topo_resp_q.tail = nt;
         }
     }
 }
@@ -425,9 +425,9 @@ static void send_sync_map(on_node_t *node, bool is_sub_sync) {
         ? (node->sub_dl_pending && ((node->current_sf_seq & 1u) != 0u))
         : (((node->current_sf_seq & 1u) == 0u) &&
            ((node->ota && node->ota->tx.active) ||
-            (node->topo_resp_q.count > 0u) ||
+            (on_gw_ring_count(&node->topo_resp_q) > 0u) ||
             (node->mesh_tx_pending) ||
-            (node->gw && node->gw->downlink_q.count > 0u)));
+            (node->gw && on_gw_ring_count(&node->gw->downlink_q) > 0u)));
     sp.flags              = (uint8_t)(((node->afh_countdown & 0x0Fu) << 4) |
                                       (has_dl_service ? 0x08u : 0x00u) |
                                       (ON_PHY_LE_MSK_2M & 0x07u));
@@ -1427,10 +1427,9 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
                         node->ota_tx_total++;
                     }
                 }
-            } else if (node->topo_resp_q.count > 0u) {
+            } else if (on_gw_ring_count(&node->topo_resp_q) > 0u) {
                 on_gw_bridge_msg_t dl = node->topo_resp_q.items[node->topo_resp_q.head];
-                node->topo_resp_q.head = (uint8_t)((node->topo_resp_q.head + 1u) % ON_GW_RING_DEPTH);
-                node->topo_resp_q.count--;
+                node->topo_resp_q.head = (uint8_t)((node->topo_resp_q.head + 1u) & (ON_GW_RING_DEPTH - 1u));
                 node->service_tx_done_this_sf = true;
                 uint8_t pbuf[ON_MAX_PAYLOAD_LEN];
                 size_t plen = 0u;
@@ -1465,7 +1464,7 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
                     send_frame(node, &hdr, mbuf, mlen, now_local_ns);
                     node->mesh_tx_total++;
                 }
-            } else if (node->gw && node->gw->downlink_q.count > 0u) {
+            } else if (node->gw && on_gw_ring_count(&node->gw->downlink_q) > 0u) {
                 on_gw_bridge_msg_t dl;
                 if (on_gw_pop_downlink(node->gw, &dl)) {
                     node->service_tx_done_this_sf = true;
@@ -2114,8 +2113,16 @@ bool on_node_is_rx_open(const on_node_t *node, int64_t now_local_ns) {
         return false;
     }
 
-    /* 1-hop T node & Sub-G wake RX during primary SYNC/MAP (0..270 us) */
+    /* 1-hop T node & Sub-G wake RX during primary SYNC/MAP (0..270 us).
+     * Sleeping Epoch-TDMA sensors (epoch_period > 1) only wake on their scheduled epoch
+     * once NCO frequency is locked (lock_count >= 4), achieving < 0.5% radio duty cycle! */
     if (off_us < 270u || off_us >= (uint32_t)(node->sf_cfg.t_sf_us - 40u)) {
+        if (node->epoch_period > 1u && node->sync.lock_count >= 4u &&
+            node->role == ON_ROLE_T && !node->is_sub_node) {
+            uint32_t target_sf = (off_us >= (uint32_t)(node->sf_cfg.t_sf_us - 40u))
+                                 ? (node->current_sf_seq + 1u) : node->current_sf_seq;
+            return on_epoch_is_my_sf(target_sf, node->epoch_phase, node->epoch_period);
+        }
         return true;
     }
 

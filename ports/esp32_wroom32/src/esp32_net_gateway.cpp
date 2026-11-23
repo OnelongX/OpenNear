@@ -21,8 +21,24 @@
 #include <BLE2902.h>
 #endif
 
-static on_gw_ctx_t *s_gw_ref   = nullptr;
-static on_node_t   *s_node_ref = nullptr;
+static on_gw_ctx_t      *s_gw_ref     = nullptr;
+static on_node_t        *s_node_ref   = nullptr;
+static SemaphoreHandle_t s_node_mutex = nullptr;
+
+static void ensure_node_mutex(void) {
+    if (!s_node_mutex) {
+        s_node_mutex = xSemaphoreCreateRecursiveMutex();
+    }
+}
+
+void on_esp32_node_lock(void) {
+    ensure_node_mutex();
+    if (s_node_mutex) xSemaphoreTakeRecursive(s_node_mutex, portMAX_DELAY);
+}
+
+void on_esp32_node_unlock(void) {
+    if (s_node_mutex) xSemaphoreGiveRecursive(s_node_mutex);
+}
 
 #ifdef OPENNEAR_ENABLE_WIFI_GW
 static Preferences s_prefs;
@@ -139,8 +155,15 @@ static void esp32_mqtt_poll(on_node_t *node, on_gw_ctx_t *gw) {
                     } else if (node) {
                         uint8_t plen = (pub.payload_len <= ON_GW_MAX_PAYLOAD_LEN)
                                        ? static_cast<uint8_t>(pub.payload_len) : ON_GW_MAX_PAYLOAD_LEN;
-                        on_node_send_gw_downlink(node, target_id, ON_GW_MSG_CLOUD_CMD_DOWN,
-                                                 pub.payload, plen);
+                        on_esp32_node_lock();
+                        if (node->mesh &&
+                            on_mesh_lookup_next_hop(node->mesh, target_id) != ON_SHORT_ID_UNASSIGNED) {
+                            on_node_send_mesh_downlink(node, target_id, pub.payload, plen);
+                        } else {
+                            on_node_send_gw_downlink(node, target_id, ON_GW_MSG_CLOUD_CMD_DOWN,
+                                                     pub.payload, plen);
+                        }
+                        on_esp32_node_unlock();
                     }
                 }
             }
@@ -153,13 +176,17 @@ static void start_local_http_api(void) {
     s_http_srv.on("/api/topology", HTTP_GET, []() {
         static char json[2048];
         if (!s_node_ref) { s_http_srv.send(503, "application/json", "{\"error\":\"no_node\"}"); return; }
+        on_esp32_node_lock();
         size_t n = on_node_format_cluster_json(s_node_ref, false, json, sizeof(json));
+        on_esp32_node_unlock();
         s_http_srv.send(200, "application/json", (n > 0u) ? json : "{}");
     });
     s_http_srv.on("/api/data", HTTP_GET, []() {
         static char json[2048];
         if (!s_node_ref) { s_http_srv.send(503, "application/json", "{\"error\":\"no_node\"}"); return; }
+        on_esp32_node_lock();
         size_t n = on_node_format_cluster_json(s_node_ref, true, json, sizeof(json));
+        on_esp32_node_unlock();
         s_http_srv.send(200, "application/json", (n > 0u) ? json : "{}");
     });
     s_http_srv.on("/api/cmd", HTTP_POST, []() {
@@ -168,10 +195,21 @@ static void start_local_http_api(void) {
             return;
         }
         String body = s_http_srv.arg("plain");
+        /* Support X-OpenNear-Token header for HTTP /api/cmd when admin_token is configured */
+        if (s_gw_ref->cfg.admin_token[0] != '\0' && !body.startsWith("AUTH:")) {
+            if (!s_http_srv.hasHeader("X-OpenNear-Token") ||
+                s_http_srv.header("X-OpenNear-Token") != String(s_gw_ref->cfg.admin_token)) {
+                s_http_srv.send(401, "application/json", "{\"ok\":false,\"error\":\"unauthorized\"}");
+                return;
+            }
+            body = String("AUTH:") + String(s_gw_ref->cfg.admin_token) + "|" + body;
+        }
         on_err_t rc = on_gw_handle_control_text(s_gw_ref, body.c_str(), body.length(), false);
         s_http_srv.send((rc == ON_OK) ? 200 : 400, "application/json",
                         (rc == ON_OK) ? "{\"ok\":true}" : "{\"ok\":false}");
     });
+    const char *hdr_keys[1] = { "X-OpenNear-Token" };
+    s_http_srv.collectHeaders(hdr_keys, 1);
     s_http_srv.begin();
     s_http_srv_started = true;
     Serial.println("[OpenNear GW] HTTP API server started: GET /api/topology, GET /api/data, POST /api/cmd");
@@ -301,7 +339,7 @@ static void esp32_pull_http_ota(on_node_t *node, on_gw_ctx_t *gw) {
     if (node->ota && node->role == ON_ROLE_G) {
         uint8_t tag8[ON_OTA_AUTH_TAG_LEN] = {0};
         if (node->sec.enabled) {
-            /* Compute streaming CBC-MAC over staged partition via chunked readback */
+            /* Compute true streaming 64-bit AES-128-CBC-MAC over all staged flash partition bytes */
             on_ota_meta_t tmp_meta;
             memset(&tmp_meta, 0, sizeof(tmp_meta));
             tmp_meta.ota_id     = static_cast<uint16_t>((gw->cfg.ota_target_ver & 0xFFFFu) ^ 0x5A01u);
@@ -309,10 +347,10 @@ static void esp32_pull_http_ota(on_node_t *node, on_gw_ctx_t *gw) {
             tmp_meta.total_size = written;
             tmp_meta.crc32      = crc;
             tmp_meta.hw_compat  = 1u;
-            /* Note: on_ota_compute_auth_tag works on contiguous memory; for flash-staged
-             * cluster relay, nodes verify CRC32 unless tag8 is provided by manifest server. */
-            on_ota_compute_auth_tag(node->sec.master_key, &tmp_meta, nullptr, tag8);
+            on_ota_compute_auth_tag_reader(node->sec.master_key, &tmp_meta,
+                                           on_esp32_ota_read_staged, nullptr, tag8);
         }
+        on_esp32_node_lock();
         on_ota_tx_start_reader(&node->ota->tx,
                                static_cast<uint16_t>((gw->cfg.ota_target_ver & 0xFFFFu) ^ 0x5A01u),
                                gw->cfg.ota_target_ver,
@@ -326,6 +364,7 @@ static void esp32_pull_http_ota(on_node_t *node, on_gw_ctx_t *gw) {
                                on_esp32_ota_read_staged,
                                nullptr);
         node->ota->tx.meta_repeat_cnt = 2u;
+        on_esp32_node_unlock();
         Serial.printf("[OpenNear OTA] Staged %u B (CRC32=0x%08X) -> streaming to OpenNear target 0x%03X!\n",
                       (unsigned)written, (unsigned)crc, (unsigned)gw->cfg.ota_target_id);
     }
@@ -367,9 +406,21 @@ class OpenNearBleCtrlCb : public BLECharacteristicCallbacks {
 static on_err_t esp32_ble_notify_cb(void *ctx, const uint8_t *data, size_t len) {
     (void)ctx;
     if (!s_ble_tx_char || !data || len == 0u) return ON_ERR_NOT_READY;
-    size_t send_len = (len > 180u) ? 180u : len;
-    s_ble_tx_char->setValue(const_cast<uint8_t *>(data), send_len);
-    s_ble_tx_char->notify();
+    /* Auto-fragment large JSON payloads (>180B) with newline terminator so mobile apps never see truncated JSON */
+    size_t off = 0u;
+    while (off < len) {
+        size_t chunk = len - off;
+        if (chunk > 180u) chunk = 180u;
+        s_ble_tx_char->setValue(const_cast<uint8_t *>(data + off), chunk);
+        s_ble_tx_char->notify();
+        off += chunk;
+        if (off < len) vTaskDelay(pdMS_TO_TICKS(2));
+    }
+    if (data[len - 1u] != '\n') {
+        uint8_t nl = '\n';
+        s_ble_tx_char->setValue(&nl, 1u);
+        s_ble_tx_char->notify();
+    }
     return ON_OK;
 }
 #endif /* OPENNEAR_ENABLE_BLE_GW */
@@ -417,14 +468,33 @@ void on_esp32_net_gw_preinit_wifi(on_gw_ctx_t *gw, const char *default_ssid,
     String url  = default_cloud_url ? String(default_cloud_url) : String("");
 
     if (s_prefs.begin("opennear_gw", true)) {
-        String nvs_ssid = s_prefs.getString("ssid", "");
-        String nvs_pass = s_prefs.getString("pass", "");
-        String nvs_url  = s_prefs.getString("url", "");
+        String nvs_ssid  = s_prefs.getString("ssid", "");
+        String nvs_pass  = s_prefs.getString("pass", "");
+        String nvs_url   = s_prefs.getString("url", "");
+        String nvs_mhost = s_prefs.getString("mhost", "");
+        uint16_t mport   = s_prefs.getUShort("mport", 1883u);
+        String nvs_muser = s_prefs.getString("muser", "");
+        String nvs_mpass = s_prefs.getString("mpass", "");
+        String nvs_tok   = s_prefs.getString("atoken", "");
         s_prefs.end();
-        if (nvs_ssid.length() > 0) ssid = nvs_ssid;
-        if (nvs_pass.length() > 0) pass = nvs_pass;
-        if (nvs_url.length() > 0)  url  = nvs_url;
+        if (nvs_ssid.length() > 0)  ssid = nvs_ssid;
+        if (nvs_pass.length() > 0)  pass = nvs_pass;
+        if (nvs_url.length() > 0)   url  = nvs_url;
+        if (nvs_mhost.length() > 0) {
+            strncpy(gw->cfg.mqtt_host, nvs_mhost.c_str(), sizeof(gw->cfg.mqtt_host) - 1u);
+            gw->cfg.mqtt_port = mport;
+            strncpy(gw->cfg.mqtt_user, nvs_muser.c_str(), sizeof(gw->cfg.mqtt_user) - 1u);
+            strncpy(gw->cfg.mqtt_pass, nvs_mpass.c_str(), sizeof(gw->cfg.mqtt_pass) - 1u);
+        }
+        if (nvs_tok.length() > 0) {
+            on_gw_set_admin_token(gw, nvs_tok.c_str());
+        }
     }
+#ifdef OPENNEAR_ADMIN_TOKEN
+    if (gw->cfg.admin_token[0] == '\0') {
+        on_gw_set_admin_token(gw, OPENNEAR_ADMIN_TOKEN);
+    }
+#endif
 
     on_gw_set_wifi_creds(gw, ssid.c_str(), pass.c_str(), url.c_str());
     WiFi.mode(WIFI_STA);
@@ -501,6 +571,16 @@ void on_esp32_net_gw_poll(on_node_t *node, on_gw_ctx_t *gw) {
     if (connected && gw->cfg.ota_pull_requested) {
         gw->cfg.ota_pull_requested = false;
         esp32_pull_http_ota(node, gw);
+    }
+
+    /* Auto-commit staged cluster OTA once all target nodes verify & report READY */
+    if (node && node->role == ON_ROLE_G && node->ota &&
+        node->ota->tx.active && !node->ota->tx.commit_sent &&
+        on_ota_tx_all_targets_ready(&node->ota->tx, 1u)) {
+        on_esp32_node_lock();
+        on_node_ota_commit(node, 8u, ON_OTA_FLAG_AUTO_REBOOT);
+        on_esp32_node_unlock();
+        Serial.println("[OpenNear OTA] All targets READY -> scheduled synchronized cluster commit (+8 SFs)");
     }
 #else
     (void)node;

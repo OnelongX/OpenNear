@@ -18,6 +18,10 @@ SRCS := \
     ../../core/src/on_amc.c \
     ../../core/src/on_sar.c \
     ../../core/src/on_ranging.c \
+    ../../core/src/on_ota.c \
+    ../../core/src/on_gateway.c \
+    ../../core/src/on_mesh.c \
+    ../../core/src/on_mqtt.c \
     ../../core/src/on_node.c \
     src/startup_nrf52840.c \
     src/hal_nrf52_radio_ppi.c \

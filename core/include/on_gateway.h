@@ -69,6 +69,7 @@ typedef struct {
     uint16_t mqtt_port;
     char     mqtt_user[32];
     char     mqtt_pass[32];
+    char     admin_token[32];  /* Optional auth PIN/token for HTTP /api/cmd & BLE 0xFFE2 */
     uint16_t ota_target_id;
     uint32_t ota_target_ver;
     bool     wifi_creds_updated;
@@ -78,14 +79,18 @@ typedef struct {
     bool     topo_include_data;
 } on_gw_config_t;
 
-/* SPSC ring buffer for cross-core/cross-task decoupling */
+/* Lock-free SPSC ring buffer for cross-core/cross-task decoupling (ON_GW_RING_DEPTH must be power of 2) */
 typedef struct {
     on_gw_bridge_msg_t items[ON_GW_RING_DEPTH];
-    uint8_t            head;
-    uint8_t            tail;
-    uint8_t            count;
-    uint32_t           drops;
+    volatile uint8_t   head;
+    volatile uint8_t   tail;
+    volatile uint32_t  drops;
 } on_gw_ring_t;
+
+static inline uint8_t on_gw_ring_count(const on_gw_ring_t *r) {
+    if (!r) return 0u;
+    return (uint8_t)((r->tail - r->head) & (ON_GW_RING_DEPTH - 1u));
+}
 
 /* Platform transport callbacks (ESP32 Wi-Fi HTTP + BLE GATT, or host test mock) */
 typedef struct {
@@ -133,6 +138,7 @@ on_err_t on_gw_bridge_unpack(const uint8_t *in, size_t len, on_gw_bridge_msg_t *
 void     on_gw_init(on_gw_ctx_t *gw, on_gw_mode_t mode, const on_gw_transport_ops_t *ops);
 void     on_gw_set_wifi_creds(on_gw_ctx_t *gw, const char *ssid, const char *pass,
                               const char *cloud_url);
+void     on_gw_set_admin_token(on_gw_ctx_t *gw, const char *token);
 
 /* Link state & Wi-Fi AP channel coexistence hooks */
 uint8_t  on_gw_on_wifi_connected(on_gw_ctx_t *gw, uint8_t ap_channel, int8_t rssi,

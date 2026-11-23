@@ -1,4 +1,4 @@
--- OpenNear v3.0 Wireshark Lua Dissector (DLT_USER0 = 147)
+-- OpenNear v6.0 Wireshark Lua Dissector (DLT_USER0 = 147)
 -- Install: Copy to Wireshark Personal Lua Plugins folder, then Edit -> Preferences -> Protocols -> DLT_USER -> User 0 -> "opennear"
 
 local p_on = Proto("opennear", "OpenNear Clean-Slate NearLink-Class Protocol")
@@ -14,7 +14,13 @@ local f_type      = ProtoField.uint8("opennear.hdr.type", "Frame Type", base.HEX
     [0x4] = "JOIN_ACK",
     [0x5] = "RTT_REQ",
     [0x6] = "RTT_RESP",
-    [0x7] = "CRA_ALERT"
+    [0x7] = "CRA_ALERT",
+    [0x8] = "OTA_META",
+    [0x9] = "OTA_CHUNK",
+    [0xA] = "OTA_STATUS",
+    [0xB] = "OTA_COMMIT",
+    [0xC] = "GW_BRIDGE",
+    [0xD] = "MESH"
 }, 0x3C)
 local f_sec       = ProtoField.bool("opennear.hdr.sec_en", "AES-128-CCM Encrypted", 8, nil, 0x02)
 local f_subg      = ProtoField.bool("opennear.hdr.is_sub_g", "Sub-G Window Frame", 8, nil, 0x01)
@@ -74,7 +80,9 @@ function p_on.dissector(tvbuf, pinfo, tree)
     hdr:add(f_hcrc8, tvbuf(9, 1))
 
     local names = { [0]="SYNC_MAP", [1]="SUB_SYNC", [2]="TDMA_DATA", [3]="JOIN_REQ",
-                    [4]="JOIN_ACK", [5]="RTT_REQ", [6]="RTT_RESP", [7]="CRA_ALERT" }
+                    [4]="JOIN_ACK", [5]="RTT_REQ", [6]="RTT_RESP", [7]="CRA_ALERT",
+                    [8]="OTA_META", [9]="OTA_CHUNK", [10]="OTA_STATUS", [11]="OTA_COMMIT",
+                    [12]="GW_BRIDGE", [13]="MESH" }
     pinfo.cols.info = string.format("%s 0x%03X -> 0x%03X (CH=%d)",
                                     names[ftype] or "UNKNOWN", src_id, dst_id, tvbuf(0,1):uint())
 

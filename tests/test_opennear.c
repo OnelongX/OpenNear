@@ -1941,6 +1941,85 @@ static void test_v60_mqtt311_and_home_assistant_discovery(void) {
            "Gateway poller forwards 6-hop node telemetry directly to MQTT broker topic");
 }
 
+/* ========================================================================== */
+/* TEST 32: v6.1 Audit Regressions (Streaming OTA MAC, SPSC Ring, Token, RX)  */
+/* ========================================================================== */
+static on_err_t test_mem_chunk_reader(void *ctx, uint32_t offset, uint8_t *out, size_t len) {
+    const uint8_t *src = (const uint8_t *)ctx;
+    memcpy(out, src + offset, len);
+    return ON_OK;
+}
+
+static void test_v61_audit_regressions(void) {
+    printf("[TEST 32] v6.1 Audit Regressions (Streaming OTA MAC + Lock-Free SPSC + Admin Token + Epoch RX Sleep)...\n");
+
+    /* 1. Streaming flash-reader OTA auth tag must match contiguous RAM tag bit-for-bit */
+    static const uint8_t kKey[ON_SEC_KEY_LEN] = {
+        0x12,0x34,0x56,0x78,0x9A,0xBC,0xDE,0xF0,
+        0xFE,0xDC,0xBA,0x98,0x76,0x54,0x32,0x10
+    };
+    uint8_t img[333];
+    for (size_t i = 0u; i < sizeof(img); ++i) img[i] = (uint8_t)((i * 19u + 7u) & 0xFFu);
+    on_ota_meta_t meta;
+    memset(&meta, 0, sizeof(meta));
+    meta.ota_id     = 0x7777u;
+    meta.fw_version = 0x00060100u;
+    meta.total_size = sizeof(img);
+    meta.crc32      = on_ota_crc32(img, sizeof(img));
+    meta.hw_compat  = 1u;
+
+    uint8_t tag_mem[ON_OTA_AUTH_TAG_LEN], tag_stream[ON_OTA_AUTH_TAG_LEN];
+    on_ota_compute_auth_tag(kKey, &meta, img, tag_mem);
+    EXPECT(on_ota_compute_auth_tag_reader(kKey, &meta, test_mem_chunk_reader, img, tag_stream) == ON_OK &&
+           memcmp(tag_mem, tag_stream, ON_OTA_AUTH_TAG_LEN) == 0,
+           "Streaming flash-reader OTA CBC-MAC matches contiguous memory MAC bit-exact");
+
+    /* 2. Lock-free SPSC ring buffer wraparound & capacity stress (64 cycles) */
+    on_gw_ctx_t gw;
+    on_gw_init(&gw, ON_GW_MODE_WIFI_AND_BLE, NULL);
+    uint32_t popped_ok = 0u;
+    for (uint16_t round = 0u; round < 64u; ++round) {
+        on_gw_bridge_msg_t in, out;
+        memset(&in, 0, sizeof(in));
+        in.seq = round;
+        in.origin_id = 0x100u;
+        EXPECT(on_gw_push_uplink(&gw, &in), "SPSC push succeeds");
+        if (on_gw_pop_uplink(&gw, &out) && out.seq == round) popped_ok++;
+    }
+    EXPECT(popped_ok == 64u && on_gw_ring_count(&gw.uplink_q) == 0u,
+           "Lock-free SPSC ring wraps cleanly across 64 cycles with zero lost frames");
+
+    /* 3. Gateway Admin Token enforcement on BLE/HTTP control commands */
+    on_gw_set_admin_token(&gw, "PIN9876");
+    EXPECT(on_gw_handle_control_text(&gw, "CMD:100|HACK", 12u, true) == ON_ERR_DECODE_FAIL,
+           "Unauthorized control command rejected when admin_token is set");
+    EXPECT(on_gw_handle_control_text(&gw, "AUTH:WRONG|CMD:100|HACK", 23u, true) == ON_ERR_DECODE_FAIL,
+           "Wrong admin token rejected");
+    EXPECT(on_gw_handle_control_text(&gw, "AUTH:PIN9876|CMD:100|SAFE", 25u, true) == ON_OK &&
+           on_gw_ring_count(&gw.downlink_q) == 1u,
+           "Valid AUTH:<token>|CMD:... accepted and queued");
+    EXPECT(on_gw_handle_control_text(&gw, "TOPO?", 5u, true) == ON_OK,
+           "Read-only TOPO? query still permitted with admin_token active");
+
+    /* 4. Sleeping Epoch-TDMA RX gate wakes only on scheduled epoch (1 out of 16 SFs) */
+    on_node_t slp;
+    on_node_init(&slp, NULL, ON_ROLE_T, 0u);
+    slp.short_id              = 0x050u;
+    slp.sync.locked           = true;
+    slp.sync.lock_count       = 10u;
+    slp.current_sf_start_net_ns = 0;
+    on_node_set_epoch_schedule(&slp, 3u, 16u);
+    uint32_t wake_sfs = 0u;
+    for (uint32_t sf = 0u; sf < 16u; ++sf) {
+        slp.current_sf_seq = sf;
+        slp.current_sf_start_net_ns = (int64_t)sf * 4000000LL;
+        if (on_node_is_rx_open(&slp, slp.current_sf_start_net_ns + 50000LL)) wake_sfs++;
+    }
+    printf("    -> Epoch-TDMA (period=16) SYNC RX wakeups: %u/16 SFs (%.2f%% duty)\n",
+           wake_sfs, on_epoch_duty_cycle_pct(16u));
+    EXPECT(wake_sfs == 1u, "Sleeping Epoch-TDMA node opens SYNC RX only on 1/16 scheduled superframes");
+}
+
 int main(void) {
     printf("============================================================\n");
     printf("       OpenNear v6.0 Core Protocol Automated Test Suite     \n");
@@ -1977,6 +2056,7 @@ int main(void) {
     test_v60_leaderless_cold_boot_auto_election();
     test_v60_6hop_mesh_routing_and_256node_epoch_tdma();
     test_v60_mqtt311_and_home_assistant_discovery();
+    test_v61_audit_regressions();
 
     printf("\n------------------------------------------------------------\n");
     printf("SUMMARY: %d passed, %d failed\n", g_tests_passed, g_tests_failed);

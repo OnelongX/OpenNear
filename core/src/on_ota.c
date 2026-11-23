@@ -111,6 +111,28 @@ void on_ota_compute_auth_tag(const uint8_t key[ON_SEC_KEY_LEN],
     cbcmac_finish(&mac, meta->crc32, tag8_out);
 }
 
+on_err_t on_ota_compute_auth_tag_reader(const uint8_t key[ON_SEC_KEY_LEN],
+                                        const on_ota_meta_t *meta,
+                                        on_err_t (*read_fn)(void *, uint32_t, uint8_t *, size_t),
+                                        void *read_ctx,
+                                        uint8_t tag8_out[ON_OTA_AUTH_TAG_LEN]) {
+    if (!key || !meta || !read_fn || !tag8_out) return ON_ERR_INVALID_ARG;
+    ota_cbcmac_t mac;
+    cbcmac_init(&mac, key, meta);
+    uint8_t buf[128];
+    uint32_t off = 0u;
+    while (off < meta->total_size) {
+        size_t n = meta->total_size - off;
+        if (n > sizeof(buf)) n = sizeof(buf);
+        on_err_t rc = read_fn(read_ctx, off, buf, n);
+        if (rc != ON_OK) return rc;
+        cbcmac_update(&mac, buf, n);
+        off += (uint32_t)n;
+    }
+    cbcmac_finish(&mac, meta->crc32, tag8_out);
+    return ON_OK;
+}
+
 /* ========================================================================== */
 /* Wire Codecs                                                                */
 /* ========================================================================== */

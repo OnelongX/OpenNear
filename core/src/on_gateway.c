@@ -84,6 +84,15 @@ void on_gw_set_wifi_creds(on_gw_ctx_t *gw, const char *ssid, const char *pass,
     gw->cfg.wifi_creds_updated = true;
 }
 
+void on_gw_set_admin_token(on_gw_ctx_t *gw, const char *token) {
+    if (!gw) return;
+    if (token && token[0]) {
+        copy_cstr(gw->cfg.admin_token, sizeof(gw->cfg.admin_token), token, strlen(token));
+    } else {
+        gw->cfg.admin_token[0] = '\0';
+    }
+}
+
 uint8_t on_gw_on_wifi_connected(on_gw_ctx_t *gw, uint8_t ap_channel, int8_t rssi,
                                 const uint8_t ip4[4]) {
     if (!gw) return 0u;
@@ -119,21 +128,23 @@ void on_gw_on_ble_state(on_gw_ctx_t *gw, bool connected, uint16_t mtu) {
 
 static bool ring_push(on_gw_ring_t *r, const on_gw_bridge_msg_t *msg) {
     if (!r || !msg) return false;
-    if (r->count >= ON_GW_RING_DEPTH) {
+    uint8_t t = r->tail;
+    uint8_t next = (uint8_t)((t + 1u) & (ON_GW_RING_DEPTH - 1u));
+    if (next == r->head) {
         r->drops++;
         return false;
     }
-    r->items[r->tail] = *msg;
-    r->tail = (uint8_t)((r->tail + 1u) % ON_GW_RING_DEPTH);
-    r->count++;
+    r->items[t] = *msg;
+    r->tail = next;
     return true;
 }
 
 static bool ring_pop(on_gw_ring_t *r, on_gw_bridge_msg_t *out) {
-    if (!r || !out || r->count == 0u) return false;
-    *out = r->items[r->head];
-    r->head = (uint8_t)((r->head + 1u) % ON_GW_RING_DEPTH);
-    r->count--;
+    if (!r || !out) return false;
+    uint8_t h = r->head;
+    if (h == r->tail) return false;
+    *out = r->items[h];
+    r->head = (uint8_t)((h + 1u) & (ON_GW_RING_DEPTH - 1u));
     return true;
 }
 
@@ -173,6 +184,27 @@ on_err_t on_gw_handle_control_text(on_gw_ctx_t *gw, const char *text, size_t len
     }
     size_t clean_len = (size_t)(end - text);
     if (clean_len < 5u) return ON_ERR_INVALID_ARG;
+
+    /* Optional Gateway Admin Token authentication ("AUTH:<token>|<command>") */
+    if (gw->cfg.admin_token[0] != '\0') {
+        bool is_readonly = (clean_len == 5u &&
+                            (memcmp(text, "TOPO?", 5u) == 0 || memcmp(text, "DATA?", 5u) == 0));
+        if (!is_readonly) {
+            if (clean_len <= 6u || memcmp(text, "AUTH:", 5u) != 0) {
+                return ON_ERR_DECODE_FAIL;
+            }
+            const char *tok_start = text + 5;
+            const char *bar = find_sep(tok_start, end, '|');
+            size_t expect_len = strlen(gw->cfg.admin_token);
+            if (!bar || (size_t)(bar - tok_start) != expect_len ||
+                memcmp(tok_start, gw->cfg.admin_token, expect_len) != 0) {
+                return ON_ERR_DECODE_FAIL;
+            }
+            text      = bar + 1;
+            clean_len = (size_t)(end - text);
+            if (clean_len < 5u) return ON_ERR_INVALID_ARG;
+        }
+    }
 
     if (from_ble) gw->ble_cmds_parsed++;
 
