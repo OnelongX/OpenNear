@@ -1286,9 +1286,297 @@ static void test_queued_tx_min_delay_envelope(void) {
            "Lookahead GPIO deadline armed from a +1100 us delayed beacon hits true target within < 2.5 us");
 }
 
+/* ========================================================================== */
+/* TEST 26: v5.0 Authenticated Multi-Hop Node OTA (1-Hop + 2-Hop Sub-G Relay) */
+/* ========================================================================== */
+static void test_v50_multihop_authenticated_node_ota(void) {
+    printf("[TEST 26] v5.0 Authenticated Multi-Hop Node OTA (Broadcast + 2-Hop Relay + Selective NACK + Tamper Guard)...\n");
+
+    static const uint8_t kKey[ON_SEC_KEY_LEN] = {
+        0x55,0xAA,0x11,0x22,0x33,0x44,0x77,0x88,
+        0x99,0x00,0xFE,0xDC,0xBA,0x98,0x76,0x54
+    };
+
+    /* 1. Prepare synthetic 1,024-byte firmware v5.1.0 image */
+    uint8_t fw_img[1024];
+    for (size_t i = 0u; i < sizeof(fw_img); ++i) {
+        fw_img[i] = (uint8_t)((i * 37u + 0xA5u) & 0xFFu);
+    }
+
+    /* 2. Unit-test anti-downgrade, tamper rejection & selective-repeat NACK recovery under 25% loss */
+    on_ota_ctx_t ota_tx, ota_rx;
+    uint8_t rx_flash[1024];
+    on_ota_ram_storage_t ram_st;
+    on_ota_storage_ops_t st_ops;
+    on_ota_ram_storage_init(&ram_st, rx_flash, sizeof(rx_flash), &st_ops);
+    on_ota_init(&ota_tx, 0x00050000u, 1u, NULL);
+    on_ota_init(&ota_rx, 0x00050000u, 1u, &st_ops);
+
+    /* Reject firmware downgrade (v4.9.0 <= v5.0.0) without FORCE flag */
+    on_ota_meta_t old_meta;
+    memset(&old_meta, 0, sizeof(old_meta));
+    old_meta.ota_id       = 1u;
+    old_meta.fw_version   = 0x00040900u;
+    old_meta.total_size   = sizeof(fw_img);
+    old_meta.chunk_size   = 64u;
+    old_meta.total_chunks = 16u;
+    old_meta.target_id    = 0x004u;
+    EXPECT(on_ota_rx_on_meta(&ota_rx.rx, &old_meta, 0x004u) != ON_OK &&
+           ota_rx.rx.last_err == ON_OTA_ERR_DOWNGRADE,
+           "OTA anti-downgrade guard rejects older firmware version");
+
+    /* Start valid v5.1.0 authenticated OTA session */
+    EXPECT(on_ota_tx_start_mem(&ota_tx.tx, 0x0501u, 0x00050100u, 0x004u, 1u,
+                               ON_OTA_FLAG_AUTO_REBOOT, fw_img, sizeof(fw_img),
+                               64u, kKey) == ON_OK,
+           "OTA sender initializes authenticated 1024B image (16 x 64B chunks)");
+    EXPECT(on_ota_rx_on_meta(&ota_rx.rx, &ota_tx.tx.meta, 0x004u) == ON_OK,
+           "OTA receiver accepts valid v5.1.0 manifest");
+
+    /* Drop chunks 2, 5, 9, 13 on first pass -> verify selective-repeat NACK bitmap recovers all 4! */
+    uint32_t drops = 0u;
+    for (uint32_t step = 0u; step < 64u && ota_rx.rx.state != ON_OTA_STATE_READY; ++step) {
+        on_ota_chunk_t ch;
+        if (on_ota_tx_next_chunk(&ota_tx.tx, &ch)) {
+            bool drop_first = (ch.flags == 0u) &&
+                              (ch.chunk_idx == 2u || ch.chunk_idx == 5u ||
+                               ch.chunk_idx == 9u || ch.chunk_idx == 13u);
+            if (drop_first) {
+                drops++;
+            } else {
+                on_ota_rx_on_chunk(&ota_rx.rx, &ch, kKey);
+            }
+        }
+        if (ota_rx.rx.status_dirty || (step % 4u) == 3u) {
+            on_ota_status_t st;
+            on_ota_rx_build_status(&ota_rx.rx, 0x004u, &st);
+            ota_rx.rx.status_dirty = false;
+            on_ota_tx_on_status(&ota_tx.tx, &st, step);
+        }
+    }
+    EXPECT(drops == 4u && ota_rx.rx.state == ON_OTA_STATE_READY &&
+           ota_tx.tx.chunks_retx_total >= 4u &&
+           memcmp(rx_flash, fw_img, sizeof(fw_img)) == 0,
+           "Selective-repeat NACK bitmap recovers all 4 dropped chunks bit-exact");
+
+    /* Tamper test: corrupt 1 byte in flash -> verify image integrity & AES-CBC-MAC rejects it! */
+    rx_flash[500] ^= 0x01u;
+    EXPECT(on_ota_rx_verify_image(&ota_rx.rx, kKey) == ON_ERR_PAY_CRC &&
+           ota_rx.rx.last_err == ON_OTA_ERR_CRC_MISMATCH,
+           "Corrupted flash byte fails CRC-32 verification");
+    rx_flash[500] ^= 0x01u;
+    ota_rx.rx.meta.auth_tag[0] ^= 0x80u;
+    EXPECT(on_ota_rx_verify_image(&ota_rx.rx, kKey) == ON_ERR_DECODE_FAIL &&
+           ota_rx.rx.last_err == ON_OTA_ERR_AUTH_FAIL,
+           "Forged OTA auth tag fails 64-bit AES-128-CBC-MAC verification");
+
+    /* 3. End-to-End 10-Node Encrypted Multi-Hop Cluster OTA (1-Hop T4 + Sub-G T2 + 2-Hop Edge T8!) */
+    sim_world_t w;
+    sim_world_init(&w, 0x50A02026ULL);
+    sim_world_setup_10node_demo(&w, true);
+    for (uint32_t i = 0u; i < w.num_nodes; ++i) {
+        on_node_enable_security(&w.nodes[i], kKey);
+    }
+
+    static on_ota_ctx_t node_ota[10];
+    static uint8_t flash_bank[10][1024];
+    static on_ota_ram_storage_t ram_bank[10];
+    static on_ota_storage_ops_t ops_bank[10];
+    for (uint32_t i = 0u; i < w.num_nodes; ++i) {
+        on_ota_ram_storage_init(&ram_bank[i], flash_bank[i], sizeof(flash_bank[i]), &ops_bank[i]);
+        on_ota_init(&node_ota[i], 0x00050000u, 1u, &ops_bank[i]);
+        on_node_attach_ota(&w.nodes[i], &node_ota[i]);
+    }
+
+    /* Bring up 10-node cluster (including 2-hop wall-blocked T8_E1 & T9_E2 via Sub-G T2) */
+    sim_world_run_us(&w, 80000, 10);
+    EXPECT(w.nodes[8].role == ON_ROLE_T && w.nodes[8].is_sub_node,
+           "2-hop wall-blocked edge node T8 joined via Sub-G before OTA");
+
+    /* Start encrypted cluster-wide broadcast OTA (512B = 8 x 64B chunks) from Primary G */
+    EXPECT(on_node_ota_start_mem(&w.nodes[0], 0x0510u, 0x00050100u, ON_SHORT_ID_BROADCAST,
+                                 1u, ON_OTA_FLAG_AUTO_REBOOT, fw_img, 512u, 64u) == ON_OK,
+           "Primary G starts AES-128-CCM encrypted broadcast OTA across 1-hop + 2-hop cluster");
+
+    /* Stream chunks + selective-repeat NACK recovery until 1-hop T4, Sub-G T2 & 2-hop T8 are READY */
+    sim_world_run_us(&w, 240000, 10);
+    EXPECT(node_ota[4].rx.state == ON_OTA_STATE_READY &&
+           memcmp(flash_bank[4], fw_img, 512u) == 0,
+           "1-hop node T4 received & authenticated 512B OTA image over AES-128-CCM");
+    EXPECT(node_ota[2].rx.state == ON_OTA_STATE_READY &&
+           memcmp(flash_bank[2], fw_img, 512u) == 0,
+           "Sub-G proxy T2 received & authenticated 512B OTA image");
+    EXPECT(node_ota[8].rx.state == ON_OTA_STATE_READY &&
+           memcmp(flash_bank[8], fw_img, 512u) == 0,
+           "Wall-blocked 2-hop edge node T8 received & authenticated 512B OTA via Sub-G relay!");
+
+    /* Schedule synchronized SF-aligned cluster commit & activation */
+    EXPECT(on_node_ota_commit(&w.nodes[0], 6u, ON_OTA_FLAG_AUTO_REBOOT) == ON_OK,
+           "Primary G schedules synchronized OTA commit (+6 SFs)");
+    sim_world_run_us(&w, 60000, 10);
+
+    printf("    -> Cluster OTA: T4(1-hop)=v%X T2(Sub-G)=v%X T8(2-hop)=v%X | TX=%u Collisions=%u\n",
+           (unsigned)ram_bank[4].applied_fw_version,
+           (unsigned)ram_bank[2].applied_fw_version,
+           (unsigned)ram_bank[8].applied_fw_version,
+           w.nodes[0].ota_tx_total, w.tdma_subg_collisions + w.cra_collisions);
+
+    EXPECT(ram_bank[4].applied && ram_bank[4].applied_fw_version == 0x00050100u &&
+           ram_bank[2].applied && ram_bank[2].applied_fw_version == 0x00050100u &&
+           ram_bank[8].applied && ram_bank[8].applied_fw_version == 0x00050100u,
+           "1-hop T4, Sub-G T2, and 2-hop wall-blocked T8 all activated v5.1.0 synchronously");
+    EXPECT(w.tdma_subg_collisions == 0u && w.cra_collisions == 0u,
+           "Zero RF collisions during encrypted multi-hop cluster OTA");
+}
+
+/* ========================================================================== */
+/* TEST 27: v5.0 Public Wi-Fi STA + BLE GATT Gateway Bridge & Coexistence     */
+/* ========================================================================== */
+typedef struct {
+    uint32_t wifi_connect_calls;
+    uint32_t cloud_posts;
+    uint32_t ble_notifies;
+    uint8_t  aligned_ch;
+    char     last_json[384];
+    uint32_t dl_delivered;
+    char     last_dl_text[96];
+} test_gw_mock_t;
+
+static on_err_t mock_wifi_connect(void *ctx, const char *ssid, const char *pass) {
+    (void)ssid; (void)pass;
+    ((test_gw_mock_t *)ctx)->wifi_connect_calls++;
+    return ON_OK;
+}
+static on_err_t mock_cloud_post(void *ctx, const char *url, const char *json) {
+    (void)url;
+    test_gw_mock_t *m = (test_gw_mock_t *)ctx;
+    m->cloud_posts++;
+    strncpy(m->last_json, json, sizeof(m->last_json) - 1u);
+    m->last_json[sizeof(m->last_json) - 1u] = '\0';
+    return ON_OK;
+}
+static on_err_t mock_ble_notify(void *ctx, const uint8_t *data, size_t len) {
+    (void)data; (void)len;
+    ((test_gw_mock_t *)ctx)->ble_notifies++;
+    return ON_OK;
+}
+static on_err_t mock_ch_align(void *ctx, uint8_t ch) {
+    ((test_gw_mock_t *)ctx)->aligned_ch = ch;
+    return ON_OK;
+}
+static on_err_t mock_dl_delivered(void *ctx, const on_gw_bridge_msg_t *msg) {
+    test_gw_mock_t *m = (test_gw_mock_t *)ctx;
+    m->dl_delivered++;
+    size_t n = (msg->payload_len < sizeof(m->last_dl_text) - 1u) ? msg->payload_len : (sizeof(m->last_dl_text) - 1u);
+    memcpy(m->last_dl_text, msg->payload, n);
+    m->last_dl_text[n] = '\0';
+    return ON_OK;
+}
+
+static void test_v50_public_wifi_ble_gateway_bridge(void) {
+    printf("[TEST 27] v5.0 Public Wi-Fi STA + BLE GATT Gateway Bridge (BLE Prov + AP Ch-Sync + 2-Hop Cloud/BLE Tunnel)...\n");
+
+    static const uint8_t kKey[ON_SEC_KEY_LEN] = {
+        0x10,0x20,0x30,0x40,0x50,0x60,0x70,0x80,
+        0x90,0xA0,0xB0,0xC0,0xD0,0xE0,0xF0,0x01
+    };
+
+    sim_world_t w;
+    sim_world_init(&w, 0x50B12026ULL);
+    sim_world_setup_10node_demo(&w, true);
+    for (uint32_t i = 0u; i < w.num_nodes; ++i) {
+        on_node_enable_security(&w.nodes[i], kKey);
+    }
+
+    test_gw_mock_t g_mock, t8_mock;
+    memset(&g_mock, 0, sizeof(g_mock));
+    memset(&t8_mock, 0, sizeof(t8_mock));
+
+    on_gw_transport_ops_t g_ops = {
+        .user_ctx              = &g_mock,
+        .wifi_connect          = mock_wifi_connect,
+        .cloud_post_json       = mock_cloud_post,
+        .ble_notify            = mock_ble_notify,
+        .on_channel_align      = mock_ch_align,
+        .on_downlink_delivered = NULL
+    };
+    on_gw_transport_ops_t t8_ops = {
+        .user_ctx              = &t8_mock,
+        .wifi_connect          = NULL,
+        .cloud_post_json       = NULL,
+        .ble_notify            = NULL,
+        .on_channel_align      = NULL,
+        .on_downlink_delivered = mock_dl_delivered
+    };
+
+    on_gw_ctx_t g_gw, t2_gw, t8_gw;
+    on_gw_init(&g_gw, ON_GW_MODE_WIFI_AND_BLE, &g_ops);
+    on_gw_init(&t2_gw, ON_GW_MODE_OFF, NULL);
+    on_gw_init(&t8_gw, ON_GW_MODE_OFF, &t8_ops);
+    on_node_attach_gateway(&w.nodes[0], &g_gw);
+    on_node_attach_gateway(&w.nodes[2], &t2_gw);
+    on_node_attach_gateway(&w.nodes[8], &t8_gw);
+
+    /* 1. BLE phone connects and provisions public Wi-Fi router credentials + Cloud URL */
+    on_gw_on_ble_state(&g_gw, true, 185u);
+    const char *prov = "WIFI:Factory5G_24|SuperSecret99|https://iot.example.com/v1/telemetry";
+    EXPECT(on_gw_handle_control_text(&g_gw, prov, strlen(prov), true) == ON_OK &&
+           strcmp(g_gw.cfg.wifi_ssid, "Factory5G_24") == 0 &&
+           strcmp(g_gw.cfg.cloud_url, "https://iot.example.com/v1/telemetry") == 0 &&
+           g_mock.wifi_connect_calls == 1u,
+           "BLE GATT Wi-Fi provisioning parses SSID/Pass/CloudURL and triggers STA connect");
+
+    /* 2. Public Wi-Fi router connects on Channel 11 -> Gateway aligns OpenNear channel to Ch 11 */
+    const uint8_t ip4[4] = { 192u, 168u, 1u, 88u };
+    EXPECT(on_gw_on_wifi_connected(&g_gw, 11u, -48, ip4) == 11u &&
+           g_mock.aligned_ch == 11u && g_gw.wifi_connected,
+           "Wi-Fi STA AP channel alignment locks OpenNear coexistence channel to router Ch 11");
+
+    /* 3. Bring up 10-node cluster -> 2-hop edge node T8 (0x100) sends telemetry to Public Cloud & BLE */
+    sim_world_run_us(&w, 80000, 10);
+    EXPECT(w.nodes[8].role == ON_ROLE_T && w.nodes[8].short_id == 0x100u,
+           "2-hop wall-blocked edge node T8 online as 0x100");
+
+    const uint8_t sensor_pay[4] = { 0xDEu, 0xADu, 0xBEu, 0xEFu };
+    EXPECT(on_node_send_gw_uplink(&w.nodes[8], ON_GW_MSG_TELEMETRY_UP, sensor_pay, 4u) == ON_OK,
+           "2-hop edge node T8 queues public-cloud telemetry uplink");
+
+    /* 4. Phone sends BLE downlink command targeting 2-hop edge node 0x100 ("CMD:100|MOTOR_ON") */
+    const char *ble_cmd = "CMD:100|MOTOR_ON";
+    EXPECT(on_gw_handle_control_text(&g_gw, ble_cmd, strlen(ble_cmd), true) == ON_OK,
+           "BLE phone queues downlink command to 2-hop node 0x100");
+
+    /* 5. Phone also triggers Cloud HTTP OTA pull ("OTA:FFF|327936|http://ota.example.com/fw.bin") */
+    const char *ota_cmd = "OTA:FFF|327936|http://ota.example.com/fw.bin";
+    EXPECT(on_gw_handle_control_text(&g_gw, ota_cmd, strlen(ota_cmd), true) == ON_OK &&
+           g_gw.cfg.ota_pull_requested && g_gw.cfg.ota_target_id == 0xFFFu &&
+           g_gw.cfg.ota_target_ver == 327936u,
+           "BLE/Cloud OTA trigger parses target=0xFFF, version & HTTP firmware URL");
+
+    /* Run OpenNear superframes for bidirectional 2-hop <-> Sub-G <-> G relay */
+    sim_world_run_us(&w, 120000, 10);
+    uint32_t flushed = on_gw_poll_network(&g_gw);
+
+    printf("    -> Cloud POSTs=%u BLE Notifies=%u | JSON=%s\n",
+           g_mock.cloud_posts, g_mock.ble_notifies, g_mock.last_json);
+    printf("    -> 2-Hop Node T8(0x100) Downlink RX=%u Payload='%s' | Collisions=%u\n",
+           t8_mock.dl_delivered, t8_mock.last_dl_text, w.tdma_subg_collisions + w.cra_collisions);
+
+    EXPECT(flushed == 1u && g_mock.cloud_posts == 1u && g_mock.ble_notifies == 1u &&
+           strstr(g_mock.last_json, "\"node\":\"0x100\"") != NULL &&
+           strstr(g_mock.last_json, "\"hop\":2") != NULL &&
+           strstr(g_mock.last_json, "\"wifi_ch\":11") != NULL &&
+           strstr(g_mock.last_json, "DEADBEEF") != NULL,
+           "2-hop edge node T8 telemetry bridged through Sub-G + Primary G to Public Cloud JSON & BLE Notify");
+    EXPECT(t8_mock.dl_delivered == 1u && strcmp(t8_mock.last_dl_text, "MOTOR_ON") == 0,
+           "BLE/Cloud downlink command 'MOTOR_ON' delivered over AES-128-CCM to wall-blocked 2-hop T8");
+    EXPECT(w.tdma_subg_collisions == 0u && w.cra_collisions == 0u,
+           "Zero RF collisions during bidirectional Wi-Fi/BLE Gateway bridging");
+}
+
 int main(void) {
     printf("============================================================\n");
-    printf("       OpenNear v4.0 Core Protocol Automated Test Suite     \n");
+    printf("       OpenNear v5.0 Core Protocol Automated Test Suite     \n");
     printf("============================================================\n");
 
     test_6byte_header_and_frame();
@@ -1316,6 +1604,8 @@ int main(void) {
     test_rejoin_after_primary_lease_expiry();
     test_act_lookahead();
     test_queued_tx_min_delay_envelope();
+    test_v50_multihop_authenticated_node_ota();
+    test_v50_public_wifi_ble_gateway_bridge();
 
     printf("\n------------------------------------------------------------\n");
     printf("SUMMARY: %d passed, %d failed\n", g_tests_passed, g_tests_failed);

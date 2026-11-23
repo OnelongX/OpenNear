@@ -136,12 +136,17 @@ static uint16_t alloc_unique_short_id(on_node_t *node) {
 }
 
 static bool is_secured_frame_type(uint8_t type) {
-    return (type == ON_FRAME_TDMA_DATA ||
-            type == ON_FRAME_CRA_ALERT ||
-            type == ON_FRAME_RTT_REQ   ||
-            type == ON_FRAME_RTT_RESP  ||
-            type == ON_FRAME_JOIN_REQ  ||
-            type == ON_FRAME_JOIN_ACK);
+    return (type == ON_FRAME_TDMA_DATA  ||
+            type == ON_FRAME_CRA_ALERT  ||
+            type == ON_FRAME_RTT_REQ    ||
+            type == ON_FRAME_RTT_RESP   ||
+            type == ON_FRAME_JOIN_REQ   ||
+            type == ON_FRAME_JOIN_ACK   ||
+            type == ON_FRAME_OTA_META   ||
+            type == ON_FRAME_OTA_CHUNK  ||
+            type == ON_FRAME_OTA_STATUS ||
+            type == ON_FRAME_OTA_COMMIT ||
+            type == ON_FRAME_GW_BRIDGE);
 }
 
 static void tune_channel(on_node_t *node, uint8_t ch_idx) {
@@ -692,6 +697,8 @@ void on_node_on_rx_raw(on_node_t *node, const uint8_t *frame, size_t len, int64_
             node->sub_sync_tx_done_this_sf = false;
             node->cra_tx_done_this_sf      = false;
             node->ch_pretuned_this_sf      = false;
+            node->service_tx_done_this_sf  = false;
+            node->sub_dl_tx_done_this_sf   = false;
             break;
         }
 
@@ -835,6 +842,133 @@ void on_node_on_rx_raw(on_node_t *node, const uint8_t *frame, size_t len, int64_
             break;
         }
 
+        case ON_FRAME_OTA_META: {
+            on_ota_meta_t meta;
+            if (on_ota_meta_unpack(payload, plen, &meta) != ON_OK) break;
+            node->ota_rx_total++;
+            if (node->ota && node->role != ON_ROLE_G) {
+                if (on_ota_rx_on_meta(&node->ota->rx, &meta, node->short_id) == ON_OK) {
+                    emit_event(node, "OTA_META_RX", meta.ota_id, (int64_t)meta.fw_version);
+                }
+            }
+            /* Sub-G transparently relays broadcast or 2-hop-targeted OTA_META into Sub-G window */
+            if (node->role == ON_ROLE_SUB_G && !hdr.is_sub_g &&
+                (meta.target_id == ON_SHORT_ID_BROADCAST || meta.target_id >= 0x100u) &&
+                plen <= sizeof(node->sub_dl_payload)) {
+                node->sub_dl_pending = true;
+                node->sub_dl_type    = (uint8_t)ON_FRAME_OTA_META;
+                node->sub_dl_dst_id  = meta.target_id;
+                node->sub_dl_len     = (uint8_t)plen;
+                memcpy(node->sub_dl_payload, payload, plen);
+            }
+            break;
+        }
+
+        case ON_FRAME_OTA_CHUNK: {
+            on_ota_chunk_t chunk;
+            if (on_ota_chunk_unpack(payload, plen, &chunk) != ON_OK) break;
+            node->ota_rx_total++;
+            if (node->ota && node->role != ON_ROLE_G) {
+                const uint8_t *auth_key = node->sec.enabled ? node->sec.master_key : NULL;
+                on_ota_rx_on_chunk(&node->ota->rx, &chunk, auth_key);
+                if (node->ota->rx.state == ON_OTA_STATE_READY) {
+                    emit_event(node, "OTA_IMAGE_READY", chunk.ota_id, (int64_t)node->ota->rx.meta.fw_version);
+                } else if (node->ota->rx.state == ON_OTA_STATE_FAILED) {
+                    emit_event(node, "OTA_VERIFY_FAIL", chunk.ota_id, (int64_t)node->ota->rx.last_err);
+                }
+            }
+            /* Sub-G relays broadcast or 2-hop OTA_CHUNK into Sub-G window */
+            if (node->role == ON_ROLE_SUB_G && !hdr.is_sub_g &&
+                (hdr.dst_id == ON_SHORT_ID_BROADCAST || hdr.dst_id == node->short_id || hdr.dst_id >= 0x100u) &&
+                plen <= sizeof(node->sub_dl_payload)) {
+                node->sub_dl_pending = true;
+                node->sub_dl_type    = (uint8_t)ON_FRAME_OTA_CHUNK;
+                node->sub_dl_dst_id  = ON_SHORT_ID_BROADCAST;
+                node->sub_dl_len     = (uint8_t)plen;
+                memcpy(node->sub_dl_payload, payload, plen);
+            }
+            break;
+        }
+
+        case ON_FRAME_OTA_STATUS: {
+            on_ota_status_t st;
+            if (on_ota_status_unpack(payload, plen, &st) != ON_OK) break;
+            node->ota_rx_total++;
+            if (node->role == ON_ROLE_G && node->ota) {
+                on_ota_tx_on_status(&node->ota->tx, &st, node->current_sf_seq);
+                emit_event(node, "OTA_STATUS_RX", st.node_id, (int64_t)st.rx_chunks);
+            } else if (node->role == ON_ROLE_SUB_G && hdr.is_sub_g && plen <= sizeof(node->sub_ul_payload)) {
+                /* Sub-G forwards 2-hop child OTA_STATUS back to Primary G */
+                node->sub_ul_pending = true;
+                node->sub_ul_type    = (uint8_t)ON_FRAME_OTA_STATUS;
+                node->sub_ul_len     = (uint8_t)plen;
+                memcpy(node->sub_ul_payload, payload, plen);
+            }
+            break;
+        }
+
+        case ON_FRAME_OTA_COMMIT: {
+            on_ota_commit_t cm;
+            if (on_ota_commit_unpack(payload, plen, &cm) != ON_OK) break;
+            node->ota_rx_total++;
+            if (node->ota && node->role != ON_ROLE_G) {
+                if (on_ota_rx_on_commit(&node->ota->rx, &cm, node->short_id) == ON_OK) {
+                    emit_event(node, "OTA_COMMIT_ARMED", cm.ota_id, (int64_t)cm.commit_sf_seq);
+                }
+            }
+            if (node->role == ON_ROLE_SUB_G && !hdr.is_sub_g &&
+                (cm.target_id == ON_SHORT_ID_BROADCAST || cm.target_id >= 0x100u) &&
+                plen <= sizeof(node->sub_dl_payload)) {
+                node->sub_dl_pending = true;
+                node->sub_dl_type    = (uint8_t)ON_FRAME_OTA_COMMIT;
+                node->sub_dl_dst_id  = cm.target_id;
+                node->sub_dl_len     = (uint8_t)plen;
+                memcpy(node->sub_dl_payload, payload, plen);
+            }
+            break;
+        }
+
+        case ON_FRAME_GW_BRIDGE: {
+            on_gw_bridge_msg_t msg;
+            if (on_gw_bridge_unpack(payload, plen, &msg) != ON_OK) break;
+            node->gw_rx_total++;
+            bool is_uplink = (msg.bridge_type == ON_GW_MSG_TELEMETRY_UP ||
+                              msg.bridge_type == ON_GW_MSG_BLE_NOTIFY_UP);
+            if (is_uplink) {
+                if (node->role == ON_ROLE_G && node->gw) {
+                    on_gw_push_uplink(node->gw, &msg);
+                    emit_event(node, "GW_UPLINK_RX", msg.origin_id, (int64_t)msg.seq);
+                } else if (node->role == ON_ROLE_SUB_G && hdr.is_sub_g) {
+                    msg.flags |= ON_GW_FLAG_RELAYED_2HOP;
+                    size_t rlen = 0u;
+                    if (on_gw_bridge_pack(&msg, node->sub_ul_payload, sizeof(node->sub_ul_payload), &rlen) == ON_OK) {
+                        node->sub_ul_pending = true;
+                        node->sub_ul_type    = (uint8_t)ON_FRAME_GW_BRIDGE;
+                        node->sub_ul_len     = (uint8_t)rlen;
+                    }
+                }
+            } else {
+                /* Downlink command from Cloud Wi-Fi or BLE GATT */
+                bool for_self = (msg.origin_id == node->short_id || msg.origin_id == ON_SHORT_ID_BROADCAST);
+                if (for_self) {
+                    if (node->gw && node->gw->ops.on_downlink_delivered) {
+                        node->gw->ops.on_downlink_delivered(node->gw->ops.user_ctx, &msg);
+                    }
+                    emit_event(node, "GW_DOWNLINK_RX", msg.origin_id, (int64_t)msg.seq);
+                }
+                if (node->role == ON_ROLE_SUB_G && !hdr.is_sub_g &&
+                    (msg.origin_id == ON_SHORT_ID_BROADCAST || msg.origin_id >= 0x100u) &&
+                    plen <= sizeof(node->sub_dl_payload)) {
+                    node->sub_dl_pending = true;
+                    node->sub_dl_type    = (uint8_t)ON_FRAME_GW_BRIDGE;
+                    node->sub_dl_dst_id  = msg.origin_id;
+                    node->sub_dl_len     = (uint8_t)plen;
+                    memcpy(node->sub_dl_payload, payload, plen);
+                }
+            }
+            break;
+        }
+
         default:
             break;
     }
@@ -938,10 +1072,88 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
             if (node->afh.enabled) {
                 tune_channel(node, on_afh_channel_for(&node->afh, node->current_sf_seq, 0u));
             }
-            node->sync_rx_this_sf   = true;
-            node->act_fired_this_sf = false;
+            node->sync_rx_this_sf         = true;
+            node->act_fired_this_sf       = false;
+            node->service_tx_done_this_sf = false;
             send_sync_map(node, false);
             elapsed_ns = now_net_ns - node->current_sf_start_net_ns;
+        }
+
+        /* v5.0 Even-SF Downlink Service Slot (3200 us): Authenticated OTA & GW Bridge Downlink */
+        int64_t cra0_ns = (int64_t)node->sf_cfg.cra_start_us * 1000LL;
+        if (!node->service_tx_done_this_sf &&
+            ((node->current_sf_seq & 1u) == 0u) &&
+            elapsed_ns >= cra0_ns && elapsed_ns < cra0_ns + 80000LL) {
+            if (node->ota && node->ota->tx.active) {
+                node->service_tx_done_this_sf = true;
+                uint8_t pbuf[ON_MAX_PAYLOAD_LEN];
+                size_t plen = 0u;
+                on_mac_hdr_t hdr;
+                memset(&hdr, 0, sizeof(hdr));
+                hdr.version    = ON_PROTO_VERSION;
+                hdr.src_id     = node->short_id;
+                hdr.dst_id     = node->ota->tx.meta.target_id;
+                hdr.sf_seq_low = (uint8_t)(node->current_sf_seq & 0x0Fu);
+                hdr.slot_idx   = 14u;
+
+                if (!node->ota->tx.meta_sent || (node->ota->tx.meta_repeat_cnt > 0u && (node->current_sf_seq & 0x0Fu) == 0u)) {
+                    hdr.type = (uint8_t)ON_FRAME_OTA_META;
+                    if (on_ota_meta_pack(&node->ota->tx.meta, pbuf, sizeof(pbuf), &plen) == ON_OK) {
+                        send_frame(node, &hdr, pbuf, plen, now_local_ns);
+                        node->ota->tx.meta_sent = true;
+                        if (node->ota->tx.meta_repeat_cnt > 0u) node->ota->tx.meta_repeat_cnt--;
+                        node->ota_tx_total++;
+                    }
+                } else if (node->ota->tx.commit_sf_seq > 0u && !node->ota->tx.commit_sent) {
+                    on_ota_commit_t cm;
+                    cm.ota_id        = node->ota->tx.meta.ota_id;
+                    cm.commit_sf_seq = node->ota->tx.commit_sf_seq;
+                    cm.crc32         = node->ota->tx.meta.crc32;
+                    cm.target_id     = node->ota->tx.meta.target_id;
+                    cm.flags         = node->ota->tx.meta.flags;
+                    hdr.type = (uint8_t)ON_FRAME_OTA_COMMIT;
+                    if (on_ota_commit_pack(&cm, pbuf, sizeof(pbuf), &plen) == ON_OK) {
+                        send_frame(node, &hdr, pbuf, plen, now_local_ns);
+                        node->ota->tx.commit_sent = true;
+                        node->ota_tx_total++;
+                    }
+                } else {
+                    on_ota_chunk_t chunk;
+                    if (on_ota_tx_next_chunk(&node->ota->tx, &chunk) &&
+                        on_ota_chunk_pack(&chunk, pbuf, sizeof(pbuf), &plen) == ON_OK) {
+                        hdr.type = (uint8_t)ON_FRAME_OTA_CHUNK;
+                        /* If targeting a 2-hop node (>=0x100), route via Sub-G proxy */
+                        if (hdr.dst_id >= 0x100u && hdr.dst_id != ON_SHORT_ID_BROADCAST &&
+                            node->sub_g_id != ON_SHORT_ID_UNASSIGNED) {
+                            hdr.dst_id = node->sub_g_id;
+                        }
+                        send_frame(node, &hdr, pbuf, plen, now_local_ns);
+                        node->ota_tx_total++;
+                    }
+                }
+            } else if (node->gw && node->gw->downlink_q.count > 0u) {
+                on_gw_bridge_msg_t dl;
+                if (on_gw_pop_downlink(node->gw, &dl)) {
+                    node->service_tx_done_this_sf = true;
+                    uint8_t pbuf[ON_MAX_PAYLOAD_LEN];
+                    size_t plen = 0u;
+                    if (on_gw_bridge_pack(&dl, pbuf, sizeof(pbuf), &plen) == ON_OK) {
+                        on_mac_hdr_t hdr;
+                        memset(&hdr, 0, sizeof(hdr));
+                        hdr.version    = ON_PROTO_VERSION;
+                        hdr.type       = (uint8_t)ON_FRAME_GW_BRIDGE;
+                        hdr.src_id     = node->short_id;
+                        hdr.dst_id     = (dl.origin_id >= 0x100u && dl.origin_id != ON_SHORT_ID_BROADCAST &&
+                                          node->sub_g_id != ON_SHORT_ID_UNASSIGNED)
+                                         ? node->sub_g_id : dl.origin_id;
+                        hdr.sf_seq_low = (uint8_t)(node->current_sf_seq & 0x0Fu);
+                        hdr.slot_idx   = 14u;
+                        send_frame(node, &hdr, pbuf, plen, now_local_ns);
+                        node->gw->downlink_forwarded++;
+                        node->gw_tx_total++;
+                    }
+                }
+            }
         }
 
         /* Synchronized ACT/QUIET trigger */
@@ -1147,6 +1359,26 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
             node->hal.radio_set_channel(node->hal.user_ctx, base_ch);
             node->in_subg_z1_ch = false;
         }
+        if (node->role == ON_ROLE_SUB_G && !node->sub_dl_tx_done_this_sf &&
+            node->sub_dl_pending && ((node->current_sf_seq & 1u) != 0u)) {
+            int64_t sub_cra_ns = (int64_t)on_sf_subg_cra_start_us(&node->sf_cfg) * 1000LL;
+            if (elapsed_ns >= sub_cra_ns && elapsed_ns < sub_cra_ns + 60000LL) {
+                node->sub_dl_tx_done_this_sf = true;
+                node->sub_dl_pending         = false;
+                on_mac_hdr_t hdr;
+                memset(&hdr, 0, sizeof(hdr));
+                hdr.version    = ON_PROTO_VERSION;
+                hdr.type       = node->sub_dl_type;
+                hdr.is_sub_g   = true;
+                hdr.src_id     = node->short_id;
+                hdr.dst_id     = node->sub_dl_dst_id;
+                hdr.sf_seq_low = (uint8_t)(node->current_sf_seq & 0x0Fu);
+                hdr.slot_idx   = 13u;
+                send_frame(node, &hdr, node->sub_dl_payload, node->sub_dl_len, now_local_ns);
+                if (node->sub_dl_type == ON_FRAME_GW_BRIDGE) node->gw_tx_total++;
+                else node->ota_tx_total++;
+            }
+        }
     }
 
     /* Phase 2c: 2-hop Edge Node private Sub-TDMA TX inside Sub-G window (with Fast HARQ) */
@@ -1255,6 +1487,7 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
                 send_frame(node, &hdr, abuf, alen, now_local_ns);
             } else if ((node->role == ON_ROLE_T || node->role == ON_ROLE_SUB_G) &&
                        !node->hal.tx_timing_best_effort &&
+                       !(node->ota && node->ota->rx.state != ON_OTA_STATE_IDLE) &&
                        node->current_sf_seq >= node->rtt_next_sf &&
                        ((node->current_sf_seq % turn_mod) == my_turn)) {
                 /* Periodic 4-timestamp RTT calibration */
@@ -1284,6 +1517,90 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
                 send_frame(node, &hdr, rbuf, rlen, now_local_ns);
             }
         }
+    }
+
+    /* v5.0 Service Uplink Slot: OTA Status/NACK & Public Wi-Fi/BLE Gateway Uplink
+     * - 1-hop / Sub-G: Odd SF at C-RA slot 1 (3420 us) -> zero collision with G's Even-SF Downlink
+     * - 2-hop Edge:    Even SF at Sub-CRA (2940 us)    -> zero collision with Sub-G's Odd-SF Relay */
+    if (!node->service_tx_done_this_sf &&
+        (node->role == ON_ROLE_T || node->role == ON_ROLE_SUB_G) &&
+        node->short_id != ON_SHORT_ID_UNASSIGNED) {
+        bool my_sf_parity = node->is_sub_node ? ((node->current_sf_seq & 1u) == 0u)
+                                              : ((node->current_sf_seq & 1u) != 0u);
+        int64_t ul_ns = node->is_sub_node
+            ? (int64_t)on_sf_subg_cra_start_us(&node->sf_cfg) * 1000LL
+            : (int64_t)(node->sf_cfg.cra_start_us + 220u) * 1000LL;
+        if (my_sf_parity && elapsed_ns >= ul_ns && elapsed_ns < ul_ns + 60000LL) {
+            uint32_t half_sf = node->current_sf_seq >> 1u;
+            uint32_t ul_mod  = node->is_sub_node ? 4u : 12u;
+            uint32_t ul_turn = (uint32_t)(node->my_slot % ul_mod);
+
+            if (node->role == ON_ROLE_SUB_G && node->sub_ul_pending &&
+                ((half_sf % 12u) == 11u)) {
+                node->service_tx_done_this_sf = true;
+                node->sub_ul_pending          = false;
+                on_mac_hdr_t hdr;
+                memset(&hdr, 0, sizeof(hdr));
+                hdr.version    = ON_PROTO_VERSION;
+                hdr.type       = node->sub_ul_type;
+                hdr.is_sub_g   = false;
+                hdr.src_id     = node->short_id;
+                hdr.dst_id     = node->parent_id;
+                hdr.sf_seq_low = (uint8_t)(node->current_sf_seq & 0x0Fu);
+                hdr.slot_idx   = 15u;
+                send_frame(node, &hdr, node->sub_ul_payload, node->sub_ul_len, now_local_ns);
+                if (node->sub_ul_type == ON_FRAME_GW_BRIDGE) node->gw_tx_total++;
+                else node->ota_tx_total++;
+            } else if (node->gw_ul_pending && ((half_sf % ul_mod) == ul_turn)) {
+                node->service_tx_done_this_sf = true;
+                node->gw_ul_pending           = false;
+                uint8_t pbuf[ON_MAX_PAYLOAD_LEN];
+                size_t plen = 0u;
+                if (on_gw_bridge_pack(&node->gw_ul_msg, pbuf, sizeof(pbuf), &plen) == ON_OK) {
+                    on_mac_hdr_t hdr;
+                    memset(&hdr, 0, sizeof(hdr));
+                    hdr.version    = ON_PROTO_VERSION;
+                    hdr.type       = (uint8_t)ON_FRAME_GW_BRIDGE;
+                    hdr.is_sub_g   = node->is_sub_node;
+                    hdr.src_id     = node->short_id;
+                    hdr.dst_id     = node->parent_id;
+                    hdr.sf_seq_low = (uint8_t)(node->current_sf_seq & 0x0Fu);
+                    hdr.slot_idx   = 15u;
+                    send_frame(node, &hdr, pbuf, plen, now_local_ns);
+                    node->gw_tx_total++;
+                }
+            } else if (node->ota &&
+                       (node->ota->rx.status_dirty ||
+                        (node->ota->rx.state == ON_OTA_STATE_RECEIVING &&
+                         node->current_sf_seq >= node->ota->rx.last_status_sf + 8u)) &&
+                       ((half_sf % ul_mod) == ul_turn)) {
+                node->service_tx_done_this_sf = true;
+                node->ota->rx.status_dirty    = false;
+                node->ota->rx.last_status_sf  = node->current_sf_seq;
+                on_ota_status_t st;
+                on_ota_rx_build_status(&node->ota->rx, node->short_id, &st);
+                uint8_t sbuf[ON_OTA_STATUS_WIRE_LEN];
+                size_t slen = 0u;
+                if (on_ota_status_pack(&st, sbuf, sizeof(sbuf), &slen) == ON_OK) {
+                    on_mac_hdr_t hdr;
+                    memset(&hdr, 0, sizeof(hdr));
+                    hdr.version    = ON_PROTO_VERSION;
+                    hdr.type       = (uint8_t)ON_FRAME_OTA_STATUS;
+                    hdr.is_sub_g   = node->is_sub_node;
+                    hdr.src_id     = node->short_id;
+                    hdr.dst_id     = node->parent_id;
+                    hdr.sf_seq_low = (uint8_t)(node->current_sf_seq & 0x0Fu);
+                    hdr.slot_idx   = 15u;
+                    send_frame(node, &hdr, sbuf, slen, now_local_ns);
+                    node->ota_tx_total++;
+                }
+            }
+        }
+    }
+
+    /* v5.0 Synchronized Superframe-Aligned OTA Activation */
+    if (node->ota && on_ota_rx_step_commit(&node->ota->rx, node->current_sf_seq)) {
+        emit_event(node, "OTA_APPLIED", node->ota->rx.meta.ota_id, (int64_t)node->ota->rx.applied_version);
     }
 
     /* Phase 4: ACT / QUIET Silent Guard Band -> Synchronized Hardware Action Trigger */
@@ -1387,11 +1704,29 @@ bool on_node_is_rx_open(const on_node_t *node, int64_t now_local_ns) {
         /* 2-hop edge node wakes RX during Sub-G SYNC window (with 40 us pre-guard for clock jitter) */
         uint32_t sub0 = node->sf_cfg.sub_g_start_us;
         uint32_t pre  = (sub0 >= 40u) ? (sub0 - 40u) : 0u;
-        return (off_us >= pre && off_us < sub0 + 270u);
+        if (off_us >= pre && off_us < sub0 + 270u) {
+            return true;
+        }
+        /* v5.0 OTA / Gateway-capable 2-hop node also listens in Sub-CRA downlink window */
+        if (node->ota != NULL || node->gw != NULL) {
+            uint32_t sub_cra = on_sf_subg_cra_start_us(&node->sf_cfg);
+            uint32_t cra_pre = (sub_cra >= 40u) ? (sub_cra - 40u) : 0u;
+            if (off_us >= cra_pre && off_us < sub0 + node->sf_cfg.sub_g_len_us + 250u) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /* 1-hop T node & Sub-G wake RX during primary SYNC/MAP (0..270 us) */
     if (off_us < 270u || off_us >= (uint32_t)(node->sf_cfg.t_sf_us - 40u)) {
+        return true;
+    }
+
+    /* v5.0 OTA / Gateway-capable 1-hop node listens in C-RA downlink service window */
+    if ((node->ota != NULL || node->gw != NULL) &&
+        off_us + 40u >= node->sf_cfg.cra_start_us &&
+        off_us < node->sf_cfg.act_start_us + 100u) {
         return true;
     }
 
@@ -1419,4 +1754,86 @@ bool on_node_is_rx_open(const on_node_t *node, int64_t now_local_ns) {
 double on_node_duty_cycle_pct(const on_node_t *node) {
     if (!node || node->total_time_ns == 0u) return 0.0;
     return 100.0 * ((double)node->radio_active_ns / (double)node->total_time_ns);
+}
+
+/* ========================================================================== */
+/* v5.0 Node OTA & Public Wi-Fi/BLE Gateway Bridge Public Helpers             */
+/* ========================================================================== */
+
+void on_node_attach_ota(on_node_t *node, on_ota_ctx_t *ota) {
+    if (!node) return;
+    node->ota = ota;
+}
+
+void on_node_attach_gateway(on_node_t *node, on_gw_ctx_t *gw) {
+    if (!node) return;
+    node->gw = gw;
+}
+
+on_err_t on_node_ota_start_mem(on_node_t *node, uint16_t ota_id, uint32_t fw_version,
+                               uint16_t target_id, uint8_t hw_compat, uint8_t flags,
+                               const uint8_t *image_buf, uint32_t image_size,
+                               uint16_t chunk_size) {
+    if (!node || !node->ota || node->role != ON_ROLE_G) return ON_ERR_NOT_READY;
+    const uint8_t *auth_key = node->sec.enabled ? node->sec.master_key : NULL;
+    on_err_t rc = on_ota_tx_start_mem(&node->ota->tx, ota_id, fw_version,
+                                      target_id, hw_compat, flags,
+                                      image_buf, image_size, chunk_size, auth_key);
+    if (rc == ON_OK) {
+        node->ota->tx.meta_repeat_cnt = 2u;
+        emit_event(node, "OTA_TX_STARTED", ota_id, (int64_t)image_size);
+    }
+    return rc;
+}
+
+on_err_t on_node_ota_commit(on_node_t *node, uint32_t lead_sfs, uint8_t flags) {
+    if (!node || !node->ota || node->role != ON_ROLE_G || !node->ota->tx.active) {
+        return ON_ERR_NOT_READY;
+    }
+    if (lead_sfs < 2u) lead_sfs = 2u;
+    node->ota->tx.commit_sf_seq = node->current_sf_seq + lead_sfs;
+    node->ota->tx.commit_sent   = false;
+    node->ota->tx.meta.flags   |= flags;
+    emit_event(node, "OTA_COMMIT_SCHED", node->ota->tx.meta.ota_id,
+               (int64_t)node->ota->tx.commit_sf_seq);
+    return ON_OK;
+}
+
+on_err_t on_node_send_gw_uplink(on_node_t *node, on_gw_msg_type_t type,
+                                const uint8_t *payload, uint8_t len) {
+    if (!node || (!payload && len > 0u) || len > ON_GW_MAX_PAYLOAD_LEN) {
+        return ON_ERR_INVALID_ARG;
+    }
+    if (node->role == ON_ROLE_UNJOINED || node->short_id == ON_SHORT_ID_UNASSIGNED) {
+        return ON_ERR_NOT_READY;
+    }
+    memset(&node->gw_ul_msg, 0, sizeof(node->gw_ul_msg));
+    node->gw_ul_msg.bridge_type = (uint8_t)type;
+    node->gw_ul_msg.flags       = node->is_sub_node ? ON_GW_FLAG_RELAYED_2HOP : 0u;
+    node->gw_ul_msg.origin_id   = node->short_id;
+    node->gw_ul_msg.seq         = ++node->data_tx_seq;
+    node->gw_ul_msg.payload_len = len;
+    if (len > 0u) memcpy(node->gw_ul_msg.payload, payload, len);
+
+    if (node->role == ON_ROLE_G && node->gw) {
+        return on_gw_push_uplink(node->gw, &node->gw_ul_msg) ? ON_OK : ON_ERR_NO_MEM;
+    }
+    node->gw_ul_pending = true;
+    return ON_OK;
+}
+
+on_err_t on_node_send_gw_downlink(on_node_t *node, uint16_t target_id,
+                                  on_gw_msg_type_t type, const uint8_t *payload, uint8_t len) {
+    if (!node || !node->gw || node->role != ON_ROLE_G ||
+        (!payload && len > 0u) || len > ON_GW_MAX_PAYLOAD_LEN) {
+        return ON_ERR_INVALID_ARG;
+    }
+    on_gw_bridge_msg_t msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.bridge_type = (uint8_t)type;
+    msg.origin_id   = target_id & ON_SHORT_ID_MASK;
+    msg.seq         = ++node->gw->tx_seq;
+    msg.payload_len = len;
+    if (len > 0u) memcpy(msg.payload, payload, len);
+    return on_gw_push_downlink(node->gw, &msg) ? ON_OK : ON_ERR_NO_MEM;
 }

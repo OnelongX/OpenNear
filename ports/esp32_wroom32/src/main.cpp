@@ -4,6 +4,8 @@
 #include "on_node.h"
 #include "hal_esp32_raw80211.h"
 #include "act_capture.h"
+#include "esp32_ota_flash.h"
+#include "esp32_net_gateway.h"
 
 #ifndef OPENNEAR_IS_MASTER
 #define OPENNEAR_IS_MASTER 0
@@ -13,12 +15,32 @@
 #define OPENNEAR_CAPS 0x03u /* bit0: Backup_ID capable, bit1: Sub-G capable */
 #endif
 
+#ifndef OPENNEAR_FW_VERSION
+#define OPENNEAR_FW_VERSION 0x00050000u /* v5.0.0 */
+#endif
+
+#ifndef OPENNEAR_WIFI_SSID
+#define OPENNEAR_WIFI_SSID ""
+#endif
+#ifndef OPENNEAR_WIFI_PASS
+#define OPENNEAR_WIFI_PASS ""
+#endif
+#ifndef OPENNEAR_CLOUD_URL
+#define OPENNEAR_CLOUD_URL ""
+#endif
+
 static const uint8_t kDefaultNetMasterKey[ON_SEC_KEY_LEN] = {
     0x4F,0x50,0x45,0x4E,0x4E,0x45,0x41,0x52,
     0x33,0x30,0x2D,0x4B,0x45,0x59,0x21,0x01
 };
 
 static on_node_t g_node;
+#ifdef OPENNEAR_ENABLE_OTA
+static on_ota_ctx_t g_ota;
+#endif
+#if defined(OPENNEAR_ENABLE_WIFI_GW) || defined(OPENNEAR_ENABLE_BLE_GW)
+static on_gw_ctx_t g_gw;
+#endif
 static constexpr uint8_t kWifiBackupMissThreshold = 12u;
 static constexpr uint32_t kWifiBackupSilenceMs = 150u;
 static constexpr uint32_t kWifiPeerLeaseTimeoutSf = 250u; /* 1 s at the default 4 ms SF */
@@ -92,9 +114,18 @@ void setup() {
     pinMode(ON_ESP32_MASTER_STRAP_PIN, INPUT_PULLUP);
     bool is_master = (OPENNEAR_IS_MASTER != 0) || (digitalRead(ON_ESP32_MASTER_STRAP_PIN) == LOW);
 
+#if defined(OPENNEAR_ENABLE_WIFI_GW) || defined(OPENNEAR_ENABLE_BLE_GW)
+    on_esp32_net_gw_preinit_wifi(&g_gw, OPENNEAR_WIFI_SSID, OPENNEAR_WIFI_PASS, OPENNEAR_CLOUD_URL);
+#endif
+
     on_esp32_cfg_t cfg = {
-        .channel  = ON_ESP32_DEFAULT_CHANNEL,
-        .act_gpio = ON_ESP32_ACT_LED_GPIO
+        .channel             = ON_ESP32_DEFAULT_CHANNEL,
+        .act_gpio            = ON_ESP32_ACT_LED_GPIO,
+#ifdef OPENNEAR_ENABLE_WIFI_GW
+        .share_existing_wifi = true
+#else
+        .share_existing_wifi = false
+#endif
     };
     on_hal_ops_t hal;
     if (on_esp32_hal_init(&cfg, &hal) != ON_OK) {
@@ -108,6 +139,18 @@ void setup() {
     on_node_init(&g_node, &hal,
                  is_master ? ON_ROLE_G : ON_ROLE_UNJOINED,
                  is_master ? 0x00u : (uint8_t)OPENNEAR_CAPS);
+#ifdef OPENNEAR_ENABLE_OTA
+    on_esp32_ota_confirm_running_app();
+    on_ota_storage_ops_t ota_ops;
+    on_esp32_ota_storage_init(&ota_ops);
+    on_ota_init(&g_ota, OPENNEAR_FW_VERSION, 1u /* ESP32 */, &ota_ops);
+    on_node_attach_ota(&g_node, &g_ota);
+    Serial.printf("[OpenNear OTA] A/B Dual-Partition OTA armed (fw=0x%08X)\n",
+                  (unsigned)OPENNEAR_FW_VERSION);
+#endif
+#if defined(OPENNEAR_ENABLE_WIFI_GW) || defined(OPENNEAR_ENABLE_BLE_GW)
+    on_esp32_net_gw_start(&g_node, &g_gw, is_master ? "OpenNear-G-GW" : "OpenNear-T-Node");
+#endif
 #ifdef OPENNEAR_ACT_LOOKAHEAD
     g_node.act_lookahead_enabled = true;
     Serial.println("[OpenNear ACT] Lookahead GPIO demo enabled");
@@ -148,10 +191,15 @@ void loop() {
                       (unsigned)act.scheduled);
     }
 #endif
+#if defined(OPENNEAR_ENABLE_WIFI_GW) || defined(OPENNEAR_ENABLE_BLE_GW)
+    on_esp32_net_gw_poll(&g_node, &g_gw);
+#endif
 #ifdef OPENNEAR_ACT_CAPTURE
     on_esp32_act_capture_poll();
 #elif defined(OPENNEAR_ACT_TRACE)
     vTaskDelay(pdMS_TO_TICKS(10));
+#elif defined(OPENNEAR_ENABLE_WIFI_GW) || defined(OPENNEAR_ENABLE_BLE_GW)
+    vTaskDelay(pdMS_TO_TICKS(50));
 #else
     vTaskDelay(pdMS_TO_TICKS(1000));
 #endif

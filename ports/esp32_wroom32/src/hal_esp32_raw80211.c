@@ -207,11 +207,37 @@ static void esp32_radio_sleep(void *ctx) {
     (void)ctx;
 }
 
+static bool             s_wifi_ch_locked = false;
+static uint8_t          s_wifi_cur_ch = ON_ESP32_DEFAULT_CHANNEL;
+
+void on_esp32_hal_lock_wifi_channel(bool lock, uint8_t wifi_ch) {
+    s_wifi_ch_locked = lock;
+    if (wifi_ch >= 1u && wifi_ch <= 13u) {
+        s_wifi_cur_ch = wifi_ch;
+        if (!lock) {
+            esp_wifi_set_channel(wifi_ch, WIFI_SECOND_CHAN_NONE);
+        }
+    }
+}
+
+uint8_t on_esp32_hal_current_wifi_channel(void) {
+    uint8_t prim = s_wifi_cur_ch;
+    wifi_second_chan_t sec = WIFI_SECOND_CHAN_NONE;
+    if (esp_wifi_get_channel(&prim, &sec) == ESP_OK && prim >= 1u && prim <= 13u) {
+        s_wifi_cur_ch = prim;
+    }
+    return s_wifi_cur_ch;
+}
+
 static void esp32_radio_set_channel(void *ctx, uint8_t ch_idx) {
     (void)ctx;
+    if (s_wifi_ch_locked) {
+        return; /* Coexisting with public Wi-Fi STA router channel */
+    }
     /* Map 16 logical TSCH channels across non-overlapping 2.4 GHz Wi-Fi channels 1, 6, 11 */
     static const uint8_t kWifiCh[3] = { 1u, 6u, 11u };
-    esp_wifi_set_channel(kWifiCh[ch_idx % 3u], WIFI_SECOND_CHAN_NONE);
+    s_wifi_cur_ch = kWifiCh[ch_idx % 3u];
+    esp_wifi_set_channel(s_wifi_cur_ch, WIFI_SECOND_CHAN_NONE);
 }
 
 static void esp32_on_act_trigger(void *ctx, uint32_t sf_seq, uint8_t act_cmd, int64_t local_ns) {
@@ -262,17 +288,23 @@ on_err_t on_esp32_hal_init(const on_esp32_cfg_t *cfg, on_hal_ops_t *hal_out) {
     targs.name     = "on_act";
     esp_timer_create(&targs, &s_act_timer);
 
-    wifi_init_config_t wcfg = WIFI_INIT_CONFIG_DEFAULT();
-    if (esp_wifi_init(&wcfg) != ESP_OK) return ON_ERR_NOT_READY;
-    esp_wifi_set_storage(WIFI_STORAGE_RAM);
-    esp_wifi_set_mode(WIFI_MODE_STA);
+    bool share_wifi = (cfg && cfg->share_existing_wifi);
+    s_wifi_ch_locked = share_wifi;
+    s_wifi_cur_ch    = ch;
 
-    /* Lock raw 802.11 TX PHY rate to 54 Mbps BEFORE esp_wifi_start() */
-    esp_wifi_config_80211_tx_rate(WIFI_IF_STA, WIFI_PHY_RATE_54M);
+    if (!share_wifi) {
+        wifi_init_config_t wcfg = WIFI_INIT_CONFIG_DEFAULT();
+        if (esp_wifi_init(&wcfg) != ESP_OK) return ON_ERR_NOT_READY;
+        esp_wifi_set_storage(WIFI_STORAGE_RAM);
+        esp_wifi_set_mode(WIFI_MODE_STA);
 
-    if (esp_wifi_start() != ESP_OK) return ON_ERR_NOT_READY;
+        /* Lock raw 802.11 TX PHY rate to 54 Mbps BEFORE esp_wifi_start() */
+        esp_wifi_config_80211_tx_rate(WIFI_IF_STA, WIFI_PHY_RATE_54M);
+
+        if (esp_wifi_start() != ESP_OK) return ON_ERR_NOT_READY;
+        esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+    }
     if (esp_wifi_set_ps(WIFI_PS_NONE) != ESP_OK) return ON_ERR_NOT_READY;
-    esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
     esp_wifi_get_mac(WIFI_IF_STA, s_mac48);
 
     wifi_promiscuous_filter_t filt;

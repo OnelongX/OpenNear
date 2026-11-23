@@ -62,7 +62,12 @@ typedef enum {
     ON_FRAME_JOIN_ACK   = 0x4,
     ON_FRAME_RTT_REQ    = 0x5,
     ON_FRAME_RTT_RESP   = 0x6,
-    ON_FRAME_CRA_ALERT  = 0x7
+    ON_FRAME_CRA_ALERT  = 0x7,
+    ON_FRAME_OTA_META   = 0x8, /* v5.0: Firmware OTA manifest (version, size, CRC32, auth tag) */
+    ON_FRAME_OTA_CHUNK  = 0x9, /* v5.0: Firmware OTA data chunk (up to 96B/frame) */
+    ON_FRAME_OTA_STATUS = 0xA, /* v5.0: Node OTA progress + 32-bit selective-repeat NACK bitmap */
+    ON_FRAME_OTA_COMMIT = 0xB, /* v5.0: Synchronized SF-aligned OTA verify/activate/reboot command */
+    ON_FRAME_GW_BRIDGE  = 0xC  /* v5.0: Public Wi-Fi / BLE Gateway uplink & downlink tunnel */
 } on_frame_type_t;
 
 /* Node operational roles */

@@ -25,10 +25,15 @@ extern "C" {
 typedef struct {
     uint8_t channel;
     int     act_gpio;
+    bool    share_existing_wifi; /* True when sharing Wi-Fi STA with public Internet TCP/IP */
 } on_esp32_cfg_t;
 
 /* Initialize Wi-Fi STA + 54M raw TX + promiscuous 0xD0 RX filter + LED GPIO */
 on_err_t on_esp32_hal_init(const on_esp32_cfg_t *cfg, on_hal_ops_t *hal_out);
+
+/* v5.0: Lock/sync OpenNear channel to connected public Wi-Fi AP channel (1..13) */
+void     on_esp32_hal_lock_wifi_channel(bool lock, uint8_t wifi_ch);
+uint8_t  on_esp32_hal_current_wifi_channel(void);
 
 /* Drain lock-free ISR RX ring buffer into the OpenNear node state machine */
 void     on_esp32_hal_poll_rx(on_node_t *node);

@@ -27,6 +27,8 @@ $core = @(
     "$Root\core\src\on_amc.c",
     "$Root\core\src\on_sar.c",
     "$Root\core\src\on_ranging.c",
+    "$Root\core\src\on_ota.c",
+    "$Root\core\src\on_gateway.c",
     "$Root\core\src\on_node.c"
 )
 
@@ -116,8 +118,26 @@ if ((Test-Path $xbin) -and (Test-Path $sdk)) {
         "-I$sdk\include\lwip\port\esp32\include\arch",
         "-I$sdk\include\nvs_flash\include",
         "-I$sdk\include\spi_flash\include",
+        "-I$sdk\include\app_update\include",
+        "-I$sdk\include\bootloader_support\include",
         "-I$sdk\include\esp_ipc\include",
+        "-I$sdk\include\esp_ringbuf\include",
         "-I$sdk\include\esp32\include",
+        "-I$sdk\include\wifi_provisioning\include",
+        "-I$sdk\include\protocomm\include\common",
+        "-I$sdk\include\protocomm\include\security",
+        "-I$sdk\include\protocomm\include\transports",
+        "-I$sdk\include\bt\include\esp32\include",
+        "-I$sdk\include\bt\host\bluedroid\api\include\api",
+        "-I$sdk\include\bt\common\btc\include",
+        "-I$sdk\include\bt\common\osi\include",
+        "-I$sdk\include\mbedtls\port\include",
+        "-I$sdk\include\mbedtls\mbedtls\include",
+        "-I$fw\libraries\WiFi\src",
+        "-I$fw\libraries\WiFiClientSecure\src",
+        "-I$fw\libraries\HTTPClient\src",
+        "-I$fw\libraries\Preferences\src",
+        "-I$fw\libraries\BLE\src",
         "-DESP32", "-DESP_PLATFORM", "-DF_CPU=240000000L", "-DARDUINO=10812", "-DARDUINO_ARCH_ESP32",
         "-Wno-unused-parameter"
     )
@@ -132,6 +152,8 @@ if ((Test-Path $xbin) -and (Test-Path $sdk)) {
         "$Root\core\src\on_amc.c",
         "$Root\core\src\on_sar.c",
         "$Root\core\src\on_ranging.c",
+        "$Root\core\src\on_ota.c",
+        "$Root\core\src\on_gateway.c",
         "$Root\core\src\on_node.c",
         "$Root\ports\esp32_wroom32\src\hal_esp32_raw80211.c"
     )
@@ -140,13 +162,20 @@ if ((Test-Path $xbin) -and (Test-Path $sdk)) {
         & xtensa-esp32-elf-gcc -std=gnu11 -Os -Wall -Wextra -mlongcalls -c $f @espInc -o $obj
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     }
-    & xtensa-esp32-elf-g++ -std=gnu++11 -Os -Wall -Wextra -mlongcalls -fno-rtti -fno-exceptions `
-        -c "$Root\ports\esp32_wroom32\src\act_capture.cpp" @espInc -o "$BuildDir\esp32_obj\act_capture.o"
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    & xtensa-esp32-elf-g++ -std=gnu++11 -Os -Wall -Wextra -mlongcalls -fno-rtti -fno-exceptions `
-        -c "$Root\ports\esp32_wroom32\src\main.cpp" @espInc -o "$BuildDir\esp32_obj\main.o"
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    Write-Host "  OK: Route C ESP32-WROOM-32 Xtensa cross-compilation passed (14/14 object files)." -ForegroundColor Green
+    $espCpp = @(
+        "$Root\ports\esp32_wroom32\src\act_capture.cpp",
+        "$Root\ports\esp32_wroom32\src\esp32_ota_flash.cpp",
+        "$Root\ports\esp32_wroom32\src\esp32_net_gateway.cpp",
+        "$Root\ports\esp32_wroom32\src\main.cpp"
+    )
+    foreach ($f in $espCpp) {
+        $obj = Join-Path "$BuildDir\esp32_obj" ([IO.Path]::GetFileNameWithoutExtension($f) + ".o")
+        & xtensa-esp32-elf-g++ -std=gnu++11 -Os -Wall -Wextra -mlongcalls -fno-rtti -fno-exceptions `
+            -DOPENNEAR_ENABLE_OTA=1 -DOPENNEAR_ENABLE_WIFI_GW=1 -DOPENNEAR_ENABLE_BLE_GW=1 `
+            -c $f @espInc -o $obj
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    }
+    Write-Host "  OK: Route C ESP32-WROOM-32 Xtensa cross-compilation passed (18/18 object files, incl. OTA + Wi-Fi STA + BLE GATT)." -ForegroundColor Green
 } else {
     Write-Host "  SKIP: ESP32 Xtensa toolchain not found in default PlatformIO path." -ForegroundColor Yellow
 }

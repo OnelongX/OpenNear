@@ -7,6 +7,8 @@
 #include "on_superframe.h"
 #include "on_sec.h"
 #include "on_afh.h"
+#include "on_ota.h"
+#include "on_gateway.h"
 #include "../../hal/on_hal.h"
 
 #ifdef __cplusplus
@@ -139,6 +141,32 @@ typedef struct {
     /* v3.0 AFH unjoined discovery scanner state */
     int64_t        scan_last_hop_local_ns;
     uint8_t        scan_ch_idx;
+
+    /* v5.0 Optional Node OTA & Public Wi-Fi/BLE Gateway Bridge */
+    on_ota_ctx_t  *ota;
+    on_gw_ctx_t   *gw;
+    bool           service_tx_done_this_sf;
+    bool           sub_dl_tx_done_this_sf;
+    uint32_t       ota_tx_total;
+    uint32_t       ota_rx_total;
+    uint32_t       gw_tx_total;
+    uint32_t       gw_rx_total;
+
+    /* Pending terminal-side uplink GW message */
+    bool               gw_ul_pending;
+    on_gw_bridge_msg_t gw_ul_msg;
+
+    /* Sub-G transparent 2-hop relay slots for OTA & Gateway bridge frames */
+    bool           sub_dl_pending;
+    uint8_t        sub_dl_type;
+    uint16_t       sub_dl_dst_id;
+    uint8_t        sub_dl_len;
+    uint8_t        sub_dl_payload[ON_MAX_PAYLOAD_LEN];
+
+    bool           sub_ul_pending;
+    uint8_t        sub_ul_type;
+    uint8_t        sub_ul_len;
+    uint8_t        sub_ul_payload[ON_MAX_PAYLOAD_LEN];
 } on_node_t;
 
 /* Initialize node as Primary G coordinator or Unjoined Terminal */
@@ -184,6 +212,23 @@ bool     on_node_is_rx_open(const on_node_t *node, int64_t now_local_ns);
 
 /* Compute radio duty cycle percentage (0.0 .. 100.0) */
 double   on_node_duty_cycle_pct(const on_node_t *node);
+
+/* v5.0: Attach Node OTA engine & Public Wi-Fi/BLE Gateway Bridge */
+void     on_node_attach_ota(on_node_t *node, on_ota_ctx_t *ota);
+void     on_node_attach_gateway(on_node_t *node, on_gw_ctx_t *gw);
+
+/* v5.0: Coordinator G OTA session control */
+on_err_t on_node_ota_start_mem(on_node_t *node, uint16_t ota_id, uint32_t fw_version,
+                               uint16_t target_id, uint8_t hw_compat, uint8_t flags,
+                               const uint8_t *image_buf, uint32_t image_size,
+                               uint16_t chunk_size);
+on_err_t on_node_ota_commit(on_node_t *node, uint32_t lead_sfs, uint8_t flags);
+
+/* v5.0: Bidirectional Public Wi-Fi / BLE Gateway tunnel helpers */
+on_err_t on_node_send_gw_uplink(on_node_t *node, on_gw_msg_type_t type,
+                                const uint8_t *payload, uint8_t len);
+on_err_t on_node_send_gw_downlink(on_node_t *node, uint16_t target_id,
+                                  on_gw_msg_type_t type, const uint8_t *payload, uint8_t len);
 
 #ifdef __cplusplus
 }
