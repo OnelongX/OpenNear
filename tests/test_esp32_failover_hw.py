@@ -9,10 +9,13 @@ import re
 import threading
 import time
 
-import serial
+try:
+    import serial
+except ImportError:
+    serial = None
 
 PATTERNS = (
-    re.compile(r'\[OpenNear v3\.0\] SF=(\d+) role=(\d+) id=(0x[0-9A-Fa-f]+)'),
+    re.compile(r'\[OpenNear v\d+\.\d+\] SF=(\d+) role=(\d+) id=(0x[0-9A-Fa-f]+)'),
     re.compile(r'\[OpenNear TX\] accepted=(\d+) failed=(\d+)'),
     re.compile(r'\[OpenNear Link\] sync_rx=(\d+) data_tx=(\d+) data_rx=(\d+) missed=(\d+) takeovers=(\d+) backup=(0x[0-9A-Fa-f]+) rejoins=(\d+)'),
 )

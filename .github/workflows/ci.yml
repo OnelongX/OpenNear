@@ -56,3 +56,7 @@ jobs:
           make -C ports/nrf52840_bare MASTER=0
           make -C ports/nrf52840_bare clean
           make -C ports/nrf52840_bare MASTER=1
+
+      - name: Run Python Real-Hardware Log Analyzer & GPIO Sync Unit Tests
+        run: |
+          python3 -m unittest -v tests/test_analyze_esp32_hw_log.py tests/test_measure_esp32_gpio_sync.py

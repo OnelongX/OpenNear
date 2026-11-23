@@ -36,6 +36,7 @@ opennear/
 ├── tools/
 │   ├── dashboard.html               # 交互式 HTML 协议可视化与极限破坏性压测工作台
 │   ├── chaos_server.mjs             # 在线调用底层 C11 仿真引擎的交互式混沌压测本地服务器
+│   ├── analyze_esp32_hw_log.py      # ESP32 真机串口日志自动化诊断工具（离线文件 / 实时 COM 口）
 │   └── opennear_dissector.lua       # Wireshark Lua 抓包解析插件（DLT_USER0 = 147）
 └── ports/
     ├── esp32_wroom32/               # 路线 C：ESP32-WROOM-32 裸 0xD0 @ 54M + esp_timer 硬件 ACT + TRNG Salt
@@ -88,6 +89,18 @@ python .\tests\test_esp32_failover_hw.py --primary COM3 --backup COM4
 将端口号替换成实际值。这个测试会通过 RTS 多次复位主控（要求主控板的 USB 串口支持 RTS 拉住 EN），不会擦除 Flash 或重新烧录。默认先观察 180 秒，再做 12 轮主备切换，最后观察 30 秒。每轮检查备用接管、原主恢复后备用无需重启即可重新入网并再次获得备用资格。短地址是动态分配的，脚本不会将备用地址固定为某个值。前后观察阶段检查两板角色和接管计数、意外重启，以及同步帧和上行数据计数是否持续增长。
 
 串口原始日志和 JSON 摘要写到 `build/hardware-esp32/`，失败时返回非零状态。串口状态约每秒输出一次，记录的时间是观测时间，不用于测量精确接管延迟或 GPIO 对齐精度。
+
+#### 真机串口日志自动化诊断（离线 / 实时 COM 口）
+
+对已保存的单板/多板串口日志（或直接监听 ESP32 串口）一键生成健康评分、TX 丢包率、NCO 晶振漂移统计、主备切换/重连根因与事件时间线：
+
+```powershell
+# 离线分析单个日志或整个目录，并导出 Markdown + JSON 报告
+py .\tools\analyze_esp32_hw_log.py .\build\hardware-esp32\ --md hw_report.md --json hw_report.json
+
+# 直接监听真实 ESP32 串口 60 秒，保存原始日志并立即诊断
+py .\tools\analyze_esp32_hw_log.py --port COM3 --duration 60 --save esp32_run.log --md hw_report.md
+```
 
 #### 双板 GPIO 同步测量（无外置逻辑分析仪）
 
