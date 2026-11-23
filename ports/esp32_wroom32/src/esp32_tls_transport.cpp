@@ -20,6 +20,7 @@ static char             s_ca_pem[ON_ESP32_TLS_MAX_CA_LEN] = {0};
 static bool             s_has_ca_pem = false;
 
 static void apply_ca_config(WiFiClientSecure &cli) {
+    cli.setHandshakeTimeout(8u);
     if (s_has_ca_pem && s_ca_pem[0] != '\0') {
         cli.setCACert(s_ca_pem);
     } else {

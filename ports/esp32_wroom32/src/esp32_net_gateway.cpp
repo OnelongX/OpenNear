@@ -438,12 +438,13 @@ static void start_local_http_api(void) {
 
 static void start_softap_portal(void) {
     if (s_ap_active) return;
+    /* Initialize Wi-Fi driver BEFORE reading factory MAC so SSID suffix is never 0000 */
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.setSleep(false);
     uint8_t mac[6] = {0};
     WiFi.macAddress(mac);
     snprintf(s_ap_ssid, sizeof(s_ap_ssid), "OpenNear-Setup-%02X%02X",
              (unsigned)mac[4], (unsigned)mac[5]);
-    WiFi.mode(WIFI_AP_STA);
-    WiFi.setSleep(false);
     WiFi.softAP(s_ap_ssid, nullptr, ON_ESP32_DEFAULT_CHANNEL);
     s_ap_active    = true;
     s_ap_off_at_ms = 0u;
@@ -503,6 +504,13 @@ static void esp32_pull_http_ota(on_node_t *node, on_gw_ctx_t *gw) {
 
     Serial.printf("[OpenNear OTA] Pulling firmware from %s (target=0x%03X ver=0x%08X)...\n",
                   gw->cfg.ota_url, (unsigned)gw->cfg.ota_target_id, (unsigned)gw->cfg.ota_target_ver);
+
+    /* Free ~35 KB TLS heap before an HTTPS OTA download on ESP32-WROOM-32 (MQTT auto-reconnects after) */
+    if (strncmp(gw->cfg.ota_url, "https://", 8u) == 0 && gw->cfg.mqtt_use_tls) {
+        on_esp32_tls_stop_mqtt_clients();
+        s_active_mqtt_cli  = nullptr;
+        gw->mqtt_connected = false;
+    }
 
     HTTPClient http;
     http.setConnectTimeout(3000);

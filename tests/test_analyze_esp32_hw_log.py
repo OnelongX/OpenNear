@@ -16,7 +16,7 @@ HEALTHY_V63_LOG = """
 0000.100 [OpenNear Portal] SoftAP 'OpenNear-Setup-A1B2' active -> connect & open http://192.168.4.1
 0000.200 [OpenNear] ESP32-WROOM-32 booted as PRIMARY G (0x001) on Wi-Fi ch=6 (54M 0xD0, RTT off, backup after 12 missed beacons and 150 ms silence)
 0004.500 [OpenNear GW] Wi-Fi ONLINE http://192.168.1.55/ ch=6 rssi=-48
-0005.100 [OpenNear MQTT] Connected to 192.168.1.100:1883 (HA Discovery + cmd/# armed)
+0005.100 [OpenNear MQTT] Connected to mqtts://broker.emqx.io:8883 (HA Discovery + cmd/# armed)
 0009.550 [OpenNear Portal] Fallback SoftAP closed; Web Portal stays live on LAN STA IP
 0010.200 [OpenNear OTA] Boot confirmed on partition ota_0 (rollback cancelled)
 0011.000 [OpenNear v6.2] SF=2750 role=1 id=0x001 hop=0 slot=0 nco=0.00ppm rtt=0ns harq=0 acts=2750
