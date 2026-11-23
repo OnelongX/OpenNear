@@ -29,6 +29,8 @@ $core = @(
     "$Root\core\src\on_ranging.c",
     "$Root\core\src\on_ota.c",
     "$Root\core\src\on_gateway.c",
+    "$Root\core\src\on_mesh.c",
+    "$Root\core\src\on_mqtt.c",
     "$Root\core\src\on_node.c"
 )
 
@@ -157,6 +159,8 @@ if ((Test-Path $xbin) -and (Test-Path $sdk)) {
         "$Root\core\src\on_ranging.c",
         "$Root\core\src\on_ota.c",
         "$Root\core\src\on_gateway.c",
+        "$Root\core\src\on_mesh.c",
+        "$Root\core\src\on_mqtt.c",
         "$Root\core\src\on_node.c",
         "$Root\ports\esp32_wroom32\src\hal_esp32_raw80211.c"
     )
@@ -174,11 +178,11 @@ if ((Test-Path $xbin) -and (Test-Path $sdk)) {
     foreach ($f in $espCpp) {
         $obj = Join-Path "$BuildDir\esp32_obj" ([IO.Path]::GetFileNameWithoutExtension($f) + ".o")
         & xtensa-esp32-elf-g++ -std=gnu++11 -Os -Wall -Wextra -mlongcalls -fno-rtti -fno-exceptions `
-            -DOPENNEAR_ENABLE_OTA=1 -DOPENNEAR_ENABLE_WIFI_GW=1 -DOPENNEAR_ENABLE_BLE_GW=1 `
+            -DOPENNEAR_ENABLE_OTA=1 -DOPENNEAR_ENABLE_WIFI_GW=1 -DOPENNEAR_ENABLE_BLE_GW=1 -DOPENNEAR_LEADERLESS_BOOT=1 `
             -c $f @espInc -o $obj
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     }
-    Write-Host "  OK: Route C ESP32-WROOM-32 Xtensa cross-compilation passed (18/18 object files, incl. OTA + Wi-Fi STA + BLE GATT)." -ForegroundColor Green
+    Write-Host "  OK: Route C ESP32-WROOM-32 Xtensa cross-compilation passed (20/20 object files, incl. Mesh + MQTT/HA + OTA + Wi-Fi + BLE)." -ForegroundColor Green
 } else {
     Write-Host "  SKIP: ESP32 Xtensa toolchain not found in default PlatformIO path." -ForegroundColor Yellow
 }

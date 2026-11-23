@@ -339,7 +339,8 @@ static bool is_secured_frame_type(uint8_t type) {
             type == ON_FRAME_OTA_CHUNK  ||
             type == ON_FRAME_OTA_STATUS ||
             type == ON_FRAME_OTA_COMMIT ||
-            type == ON_FRAME_GW_BRIDGE);
+            type == ON_FRAME_GW_BRIDGE  ||
+            type == ON_FRAME_MESH);
 }
 
 static void tune_channel(on_node_t *node, uint8_t ch_idx) {
@@ -425,6 +426,7 @@ static void send_sync_map(on_node_t *node, bool is_sub_sync) {
         : (((node->current_sf_seq & 1u) == 0u) &&
            ((node->ota && node->ota->tx.active) ||
             (node->topo_resp_q.count > 0u) ||
+            (node->mesh_tx_pending) ||
             (node->gw && node->gw->downlink_q.count > 0u)));
     sp.flags              = (uint8_t)(((node->afh_countdown & 0x0Fu) << 4) |
                                       (has_dl_service ? 0x08u : 0x00u) |
@@ -755,9 +757,12 @@ void on_node_on_rx_raw(on_node_t *node, const uint8_t *frame, size_t len, int64_
         case ON_FRAME_SUB_SYNC: {
             bool is_sub = (hdr.type == ON_FRAME_SUB_SYNC);
 
-            /* A current primary only considers beacons from a lower-ID primary. */
+            /* A current primary only considers beacons from a lower-ID primary
+             * (or equal-ID leaderless split-brain with strictly lower session_salt). */
             bool yielding_primary = node->role == ON_ROLE_G;
-            if (yielding_primary && (is_sub || hdr.src_id >= node->short_id)) break;
+            if (yielding_primary && (is_sub || hdr.src_id > node->short_id)) break;
+            if (yielding_primary && hdr.src_id == node->short_id &&
+                !node->leaderless_boot_enabled) break;
 
             /* Never let a 1-hop node that hears Primary SYNC_MAP downgrade to SUB_SYNC. */
             if (is_sub && node->heard_primary_sync) break;
@@ -770,6 +775,11 @@ void on_node_on_rx_raw(on_node_t *node, const uint8_t *frame, size_t len, int64_
 
             on_sync_payload_t sp;
             if (on_sync_payload_unpack(payload, plen, &sp) != ON_OK) break;
+
+            if (yielding_primary && hdr.src_id == node->short_id &&
+                sp.session_salt >= node->sec.session_salt) {
+                break; /* Leaderless split-brain tie-breaker: lower session_salt wins */
+            }
 
             /* v3.0 Verify 32-bit AES-CBC-MAC anti-spoofing tag before trusting beacon */
             if (node->sec.enabled) {
@@ -1195,6 +1205,65 @@ void on_node_on_rx_raw(on_node_t *node, const uint8_t *frame, size_t len, int64_
             break;
         }
 
+        case ON_FRAME_MESH: {
+            if (!node->mesh) break;
+            on_mesh_pkt_t mpkt, fwd;
+            if (on_mesh_pkt_unpack(payload, plen, &mpkt) != ON_OK) break;
+            node->mesh_rx_total++;
+            on_mesh_action_t act = on_mesh_process_rx(node->mesh, hdr.src_id, &mpkt,
+                                                      node->current_sf_seq, &fwd);
+            if (act == ON_MESH_ACT_DELIVER || act == ON_MESH_ACT_DELIV_FWD) {
+                if (node->role == ON_ROLE_G &&
+                    (mpkt.mesh_type == ON_MESH_DATA_UP || mpkt.mesh_type == ON_MESH_TOPO_REPORT)) {
+                    /* Auto-register 3~6-hop Mesh node into Primary G's cluster_tbl & Gateway uplink! */
+                    on_cluster_node_t *cn = cluster_find_or_alloc(node, mpkt.src_id);
+                    if (cn) {
+                        cn->parent_id     = hdr.src_id;
+                        cn->hop_depth     = mpkt.hop_count;
+                        cn->role          = (uint8_t)ON_ROLE_T;
+                        cn->last_seen_sf  = node->current_sf_seq;
+                        cn->rx_packets++;
+                        cn->last_seq      = mpkt.msg_id;
+                        cn->last_data_len = (mpkt.payload_len <= 8u) ? mpkt.payload_len : 8u;
+                        if (cn->last_data_len > 0u) {
+                            memcpy(cn->last_data, mpkt.payload, cn->last_data_len);
+                        }
+                    }
+                    if (node->gw) {
+                        on_gw_bridge_msg_t umsg;
+                        memset(&umsg, 0, sizeof(umsg));
+                        umsg.bridge_type = (uint8_t)ON_GW_MSG_TELEMETRY_UP;
+                        umsg.flags       = ON_GW_FLAG_RELAYED_2HOP;
+                        umsg.origin_id   = mpkt.src_id;
+                        umsg.seq         = mpkt.msg_id;
+                        umsg.payload_len = (mpkt.payload_len <= ON_GW_MAX_PAYLOAD_LEN)
+                                           ? mpkt.payload_len : ON_GW_MAX_PAYLOAD_LEN;
+                        if (umsg.payload_len > 0u) memcpy(umsg.payload, mpkt.payload, umsg.payload_len);
+                        on_gw_push_uplink(node->gw, &umsg);
+                    }
+                    emit_event(node, "MESH_DATA_UP_RX", mpkt.src_id, (int64_t)mpkt.hop_count);
+                } else if (mpkt.mesh_type == ON_MESH_CMD_DOWN) {
+                    if (node->gw && node->gw->ops.on_downlink_delivered) {
+                        on_gw_bridge_msg_t dmsg;
+                        memset(&dmsg, 0, sizeof(dmsg));
+                        dmsg.bridge_type = (uint8_t)ON_GW_MSG_CLOUD_CMD_DOWN;
+                        dmsg.origin_id   = mpkt.dst_id;
+                        dmsg.seq         = mpkt.msg_id;
+                        dmsg.payload_len = (mpkt.payload_len <= ON_GW_MAX_PAYLOAD_LEN)
+                                           ? mpkt.payload_len : ON_GW_MAX_PAYLOAD_LEN;
+                        if (dmsg.payload_len > 0u) memcpy(dmsg.payload, mpkt.payload, dmsg.payload_len);
+                        node->gw->ops.on_downlink_delivered(node->gw->ops.user_ctx, &dmsg);
+                    }
+                    emit_event(node, "MESH_CMD_DOWN_RX", mpkt.src_id, (int64_t)mpkt.hop_count);
+                }
+            }
+            if (act == ON_MESH_ACT_FORWARD || act == ON_MESH_ACT_DELIV_FWD) {
+                node->mesh_tx_pkt     = fwd;
+                node->mesh_tx_pending = true;
+            }
+            break;
+        }
+
         default:
             break;
     }
@@ -1379,6 +1448,23 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
                     send_frame(node, &hdr, pbuf, plen, now_local_ns);
                     node->gw_tx_total++;
                 }
+            } else if (node->mesh_tx_pending) {
+                node->service_tx_done_this_sf = true;
+                node->mesh_tx_pending         = false;
+                uint8_t mbuf[ON_MAX_PAYLOAD_LEN];
+                size_t mlen = 0u;
+                if (on_mesh_pkt_pack(&node->mesh_tx_pkt, mbuf, sizeof(mbuf), &mlen) == ON_OK) {
+                    on_mac_hdr_t hdr;
+                    memset(&hdr, 0, sizeof(hdr));
+                    hdr.version    = ON_PROTO_VERSION;
+                    hdr.type       = (uint8_t)ON_FRAME_MESH;
+                    hdr.src_id     = node->short_id;
+                    hdr.dst_id     = node->mesh_tx_pkt.next_hop_id;
+                    hdr.sf_seq_low = (uint8_t)(node->current_sf_seq & 0x0Fu);
+                    hdr.slot_idx   = 14u;
+                    send_frame(node, &hdr, mbuf, mlen, now_local_ns);
+                    node->mesh_tx_total++;
+                }
             } else if (node->gw && node->gw->downlink_q.count > 0u) {
                 on_gw_bridge_msg_t dl;
                 if (on_gw_pop_downlink(node->gw, &dl)) {
@@ -1432,6 +1518,36 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
                 node->scan_last_hop_local_ns = now_local_ns;
                 node->scan_ch_idx = (uint8_t)((node->scan_ch_idx + 1u) % ON_AFH_NUM_CHANNELS);
                 tune_channel(node, node->scan_ch_idx);
+            }
+        }
+        /* v6.0 Leaderless Cold-Boot Auto-Election (lowest MAC48 promotes to Primary G) */
+        if (node->leaderless_boot_enabled && node->role == ON_ROLE_UNJOINED) {
+            if (node->boot_listen_start_ns == 0) {
+                node->boot_listen_start_ns = now_local_ns;
+            } else {
+                int64_t mac_backoff_ns = (int64_t)node->mac48[5] * 4000000LL;
+                int64_t wait_ns = node->leaderless_base_timeout_ns + mac_backoff_ns;
+                if ((now_local_ns - node->boot_listen_start_ns) >= wait_ns) {
+                    node->role                    = ON_ROLE_G;
+                    node->short_id                = ON_SHORT_ID_G_DEFAULT;
+                    node->sync.locked             = true;
+                    node->sync.ref_local_ns       = now_local_ns;
+                    node->sync.ref_net_ns         = now_local_ns;
+                    node->current_sf_start_net_ns = now_local_ns;
+                    node->current_sf_seq          = 0u;
+                    node->sync_rx_this_sf         = true;
+                    node->act_fired_this_sf       = false;
+                    node->act_cmd                 = 1u;
+                    if (node->sec.enabled) {
+                        uint32_t mac_salt = ((uint32_t)node->mac48[2] << 24) |
+                                            ((uint32_t)node->mac48[3] << 16) |
+                                            ((uint32_t)node->mac48[4] << 8)  |
+                                            (uint32_t)node->mac48[5];
+                        on_sec_set_session(&node->sec, mac_salt, node->sec.key_epoch);
+                    }
+                    send_sync_map(node, false);
+                    emit_event(node, "LEADERLESS_ELECTED_G", node->short_id, (int64_t)node->mac48[5]);
+                }
             }
         }
         return;
@@ -1519,10 +1635,11 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
         elapsed_ns = now_net_ns - node->current_sf_start_net_ns;
     }
 
-    /* Phase 2a: Primary D-TDMA private slot TX (with Piggyback Group-ACK Fast HARQ) */
+    /* Phase 2a: Primary D-TDMA private slot TX (with Piggyback Group-ACK Fast HARQ & v6.0 Epoch-TDMA) */
     if ((node->role == ON_ROLE_T || node->role == ON_ROLE_SUB_G) &&
         !node->is_sub_node && !node->tdma_tx_done_this_sf &&
-        !(node->afh.enabled && node->missed_sync_count > 6u)) {
+        !(node->afh.enabled && node->missed_sync_count > 6u) &&
+        on_epoch_is_my_sf(node->current_sf_seq, node->epoch_phase, node->epoch_period)) {
         int64_t slot_ns = (int64_t)on_sf_slot_start_us(&node->sf_cfg, node->my_slot) * 1000LL;
         if (elapsed_ns >= slot_ns && elapsed_ns < slot_ns + 80000LL) {
             node->tdma_tx_done_this_sf = true;
@@ -1811,6 +1928,24 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
                 send_frame(node, &hdr, node->sub_ul_payload, node->sub_ul_len, now_local_ns);
                 if (node->sub_ul_type == ON_FRAME_GW_BRIDGE) node->gw_tx_total++;
                 else node->ota_tx_total++;
+            } else if (node->mesh_tx_pending && ((half_sf % ul_mod) == ul_turn)) {
+                node->service_tx_done_this_sf = true;
+                node->mesh_tx_pending         = false;
+                uint8_t mbuf[ON_MAX_PAYLOAD_LEN];
+                size_t mlen = 0u;
+                if (on_mesh_pkt_pack(&node->mesh_tx_pkt, mbuf, sizeof(mbuf), &mlen) == ON_OK) {
+                    on_mac_hdr_t hdr;
+                    memset(&hdr, 0, sizeof(hdr));
+                    hdr.version    = ON_PROTO_VERSION;
+                    hdr.type       = (uint8_t)ON_FRAME_MESH;
+                    hdr.is_sub_g   = node->is_sub_node;
+                    hdr.src_id     = node->short_id;
+                    hdr.dst_id     = node->mesh_tx_pkt.next_hop_id;
+                    hdr.sf_seq_low = (uint8_t)(node->current_sf_seq & 0x0Fu);
+                    hdr.slot_idx   = 15u;
+                    send_frame(node, &hdr, mbuf, mlen, now_local_ns);
+                    node->mesh_tx_total++;
+                }
             } else if (node->gw_ul_pending && ((half_sf % ul_mod) == ul_turn)) {
                 node->service_tx_done_this_sf = true;
                 node->gw_ul_pending           = false;
@@ -1984,9 +2119,9 @@ bool on_node_is_rx_open(const on_node_t *node, int64_t now_local_ns) {
         return true;
     }
 
-    /* v5.0/v5.1 OTA / Gateway / Topology-query 1-hop node listens in C-RA downlink service window */
+    /* v5.0/v5.1/v6.0 OTA / Gateway / Topology / Mesh 1-hop node listens in C-RA service window */
     if ((node->service_dl_reserved_this_sf || node->ota != NULL || node->gw != NULL ||
-         node->topo_query_in_flight || node->sub_dl_listen_sfs > 0u) &&
+         node->mesh != NULL || node->topo_query_in_flight || node->sub_dl_listen_sfs > 0u) &&
         off_us + 40u >= node->sf_cfg.cra_start_us &&
         off_us < node->sf_cfg.act_start_us + 100u) {
         return true;
@@ -2319,4 +2454,45 @@ size_t on_node_format_cluster_json(const on_node_t *node, bool include_data,
     int tail = snprintf(out_buf + pos, out_cap - (size_t)pos, "]}");
     if (tail <= 0 || (size_t)(pos + tail) >= out_cap) return 0u;
     return (size_t)(pos + tail);
+}
+
+/* ========================================================================== */
+/* v6.0 Leaderless Auto-Boot, 256-Node Epoch-TDMA & 3~6-Hop Hybrid Mesh       */
+/* ========================================================================== */
+
+void on_node_enable_leaderless_boot(on_node_t *node, uint32_t base_timeout_ms) {
+    if (!node) return;
+    node->leaderless_boot_enabled    = (base_timeout_ms > 0u);
+    node->leaderless_base_timeout_ns = (int64_t)base_timeout_ms * 1000000LL;
+    node->boot_listen_start_ns       = 0;
+}
+
+void on_node_set_epoch_schedule(on_node_t *node, uint8_t epoch_phase, uint8_t epoch_period) {
+    if (!node) return;
+    node->epoch_phase  = epoch_phase;
+    node->epoch_period = epoch_period;
+}
+
+void on_node_attach_mesh(on_node_t *node, on_mesh_ctx_t *mesh) {
+    if (!node) return;
+    node->mesh = mesh;
+}
+
+on_err_t on_node_send_mesh_uplink(on_node_t *node, const uint8_t *payload, uint8_t len) {
+    if (!node || !node->mesh) return ON_ERR_NOT_READY;
+    on_err_t rc = on_mesh_build_uplink(node->mesh, ON_MESH_DATA_UP, payload, len, &node->mesh_tx_pkt);
+    if (rc == ON_OK) {
+        node->mesh_tx_pending = true;
+    }
+    return rc;
+}
+
+on_err_t on_node_send_mesh_downlink(on_node_t *node, uint16_t target_id,
+                                    const uint8_t *payload, uint8_t len) {
+    if (!node || !node->mesh) return ON_ERR_NOT_READY;
+    on_err_t rc = on_mesh_build_downlink(node->mesh, target_id, payload, len, &node->mesh_tx_pkt);
+    if (rc == ON_OK) {
+        node->mesh_tx_pending = true;
+    }
+    return rc;
 }

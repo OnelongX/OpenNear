@@ -9,6 +9,8 @@
 #include "on_amc.h"
 #include "on_sar.h"
 #include "on_ranging.h"
+#include "on_mesh.h"
+#include "on_mqtt.h"
 #include "on_node.h"
 #include "../sim/sim_world.h"
 
@@ -1664,9 +1666,284 @@ static void test_v51_any_node_cluster_topology_and_data_query(void) {
            "BLE/HTTP DATA? control query parsed cleanly");
 }
 
+/* ========================================================================== */
+/* TEST 29: v6.0 Leaderless Cold-Boot Auto-Election (All-Unjoined Self-Form)  */
+/* ========================================================================== */
+static void test_v60_leaderless_cold_boot_auto_election(void) {
+    printf("[TEST 29] v6.0 Leaderless Cold-Boot Auto-Election (Zero Pre-Configured Master)...\n");
+
+    sim_world_t w;
+    sim_world_init(&w, 0x60A12026ULL);
+    sim_world_setup_10node_demo(&w, false);
+
+    /* Force ALL 10 nodes to boot as ON_ROLE_UNJOINED (zero pre-designated Primary G!) */
+    for (uint32_t i = 0u; i < w.num_nodes; ++i) {
+        on_hal_ops_t hal_copy = w.nodes[i].hal;
+        uint8_t caps = (i < 8u) ? 0x03u : 0x00u;
+        on_node_init(&w.nodes[i], &hal_copy, ON_ROLE_UNJOINED, caps);
+        if (i < 8u) {
+            /* Enable leaderless auto-election on all 1-hop-capable nodes (lowest MAC wins!) */
+            on_node_enable_leaderless_boot(&w.nodes[i], 20u);
+        }
+    }
+
+    /* Run 200 ms: lowest-MAC node (idx=0, mac[5]=1) elects itself G, all others auto-join! */
+    sim_world_run_us(&w, 200000, 10);
+
+    uint32_t g_count = 0u, joined_1h = 0u, joined_2h = 0u;
+    for (uint32_t i = 0u; i < w.num_nodes; ++i) {
+        if (w.nodes[i].role == ON_ROLE_G) g_count++;
+        else if (w.nodes[i].role == ON_ROLE_T || w.nodes[i].role == ON_ROLE_SUB_G) {
+            if (w.nodes[i].is_sub_node) joined_2h++;
+            else joined_1h++;
+        }
+    }
+
+    printf("    -> Leaderless Election: G_count=%u (id=0x%03X, backup=0x%03X, subg=0x%03X) | 1-hop=%u | 2-hop=%u | Collisions=%u\n",
+           g_count, (unsigned)w.nodes[0].short_id, (unsigned)w.nodes[0].backup_id,
+           (unsigned)w.nodes[0].sub_g_id, joined_1h, joined_2h,
+           w.tdma_subg_collisions + w.cra_collisions);
+
+    EXPECT(g_count == 1u && w.nodes[0].role == ON_ROLE_G,
+           "Exactly one lowest-MAC node self-elected as Primary G without manual config");
+    EXPECT(joined_1h == 7u && w.nodes[0].backup_id != ON_SHORT_ID_UNASSIGNED &&
+           w.nodes[0].sub_g_id != ON_SHORT_ID_UNASSIGNED,
+           "All 7 1-hop peers auto-joined, elected Backup_ID and Sub-G proxy");
+    EXPECT(w.tdma_subg_collisions == 0u && w.cra_collisions == 0u,
+           "Zero RF collisions during leaderless cold-boot self-organization");
+}
+
+/* ========================================================================== */
+/* TEST 30: v6.0 6-Hop Hybrid Mesh Routing + Self-Healing + 256-Node Epoch    */
+/* ========================================================================== */
+static void test_v60_6hop_mesh_routing_and_256node_epoch_tdma(void) {
+    printf("[TEST 30] v6.0 6-Hop Hybrid Mesh Routing, Parent Failover & 256-Node Epoch-TDMA...\n");
+
+    /* 1. Build 6-hop chain: Root(0x001) - N1(0x002) - N2(0x100) - N3(0x301) - N4(0x401) - N5(0x501) - N6(0x601)
+     *    plus standby 3-hop relay N3b(0x302) reachable from N2 and N4 for self-healing failover! */
+    enum { IDX_G = 0, IDX_N1, IDX_N2, IDX_N3, IDX_N3B, IDX_N4, IDX_N5, IDX_N6, NUM_M = 8 };
+    static const uint16_t kIds[NUM_M] = { 0x001u, 0x002u, 0x100u, 0x301u, 0x302u, 0x401u, 0x501u, 0x601u };
+
+    on_mesh_ctx_t m[NUM_M];
+    on_mesh_init(&m[IDX_G], kIds[IDX_G], 0u, ON_SHORT_ID_UNASSIGNED);
+    for (int i = 1; i < NUM_M; ++i) {
+        on_mesh_init(&m[i], kIds[i], 0xFFu, ON_SHORT_ID_UNASSIGNED);
+    }
+
+    /* Propagate beacons along links (N3 has higher LQI=220 than standby N3b LQI=180) */
+    on_mesh_on_beacon(&m[IDX_N1],  kIds[IDX_G],   m[IDX_G].my_hop_depth,   240u, 10u);
+    on_mesh_on_beacon(&m[IDX_N2],  kIds[IDX_N1],  m[IDX_N1].my_hop_depth,  230u, 10u);
+    on_mesh_on_beacon(&m[IDX_N3],  kIds[IDX_N2],  m[IDX_N2].my_hop_depth,  220u, 10u);
+    on_mesh_on_beacon(&m[IDX_N3B], kIds[IDX_N2],  m[IDX_N2].my_hop_depth,  190u, 10u);
+    on_mesh_on_beacon(&m[IDX_N4],  kIds[IDX_N3],  m[IDX_N3].my_hop_depth,  220u, 10u);
+    on_mesh_on_beacon(&m[IDX_N4],  kIds[IDX_N3B], m[IDX_N3B].my_hop_depth, 180u, 10u);
+    on_mesh_on_beacon(&m[IDX_N5],  kIds[IDX_N4],  m[IDX_N4].my_hop_depth,  210u, 10u);
+    on_mesh_on_beacon(&m[IDX_N6],  kIds[IDX_N5],  m[IDX_N5].my_hop_depth,  200u, 10u);
+
+    EXPECT(m[IDX_N6].my_hop_depth == 6u && m[IDX_N4].parent_id == kIds[IDX_N3],
+           "6-hop basement sensor N6 auto-discovers 6-hop tree & N4 picks higher-LQI parent N3");
+
+    /* Send 6-hop uplink telemetry from N6 -> N5 -> N4 -> N3 -> N2 -> N1 -> Root G */
+    const uint8_t up_data[4] = { 0x66u, 0x77u, 0x88u, 0x99u };
+    on_mesh_pkt_t pkt, fwd;
+    EXPECT(on_mesh_build_uplink(&m[IDX_N6], ON_MESH_DATA_UP, up_data, 4u, &pkt) == ON_OK,
+           "6-hop N6 builds uplink packet");
+
+    static const int kUpPath[6] = { IDX_N5, IDX_N4, IDX_N3, IDX_N2, IDX_N1, IDX_G };
+    uint16_t prev_id = kIds[IDX_N6];
+    on_mesh_action_t act = ON_MESH_ACT_DROP;
+    for (int step = 0; step < 6; ++step) {
+        int cur = kUpPath[step];
+        act = on_mesh_process_rx(&m[cur], prev_id, &pkt, 12u, &fwd);
+        prev_id = kIds[cur];
+        if (step < 5) {
+            EXPECT(act == ON_MESH_ACT_FORWARD, "Intermediate relay forwards 6-hop uplink");
+            pkt = fwd;
+        }
+    }
+    EXPECT(act == ON_MESH_ACT_DELIVER && pkt.src_id == kIds[IDX_N6] &&
+           pkt.hop_count == 6u && memcmp(pkt.payload, up_data, 4u) == 0,
+           "6-hop uplink telemetry delivered intact to Root G across 6 hops");
+
+    /* Verify duplicate rejection on replay */
+    EXPECT(on_mesh_process_rx(&m[IDX_G], kIds[IDX_N1], &pkt, 13u, &fwd) == ON_MESH_ACT_DROP &&
+           m[IDX_G].dedup_drops == 1u,
+           "32-entry LRU dedup cache rejects duplicate mesh packet");
+
+    /* Send tree-routed downlink command from Root G -> N1 -> N2 -> N3 -> N4 -> N5 -> N6 (ZERO flood!) */
+    const char *cmd = "VALVE_OPEN";
+    EXPECT(on_mesh_build_downlink(&m[IDX_G], kIds[IDX_N6], (const uint8_t *)cmd, 10u, &pkt) == ON_OK &&
+           pkt.next_hop_id == kIds[IDX_N1] && (pkt.flags & ON_MESH_FLAG_FLOOD_FALLBACK) == 0u,
+           "Root G routes downlink strictly along learned reverse tree (no flood)");
+
+    static const int kDownPath[6] = { IDX_N1, IDX_N2, IDX_N3, IDX_N4, IDX_N5, IDX_N6 };
+    prev_id = kIds[IDX_G];
+    for (int step = 0; step < 6; ++step) {
+        int cur = kDownPath[step];
+        act = on_mesh_process_rx(&m[cur], prev_id, &pkt, 14u, &fwd);
+        prev_id = kIds[cur];
+        if (step < 5) {
+            EXPECT(act == ON_MESH_ACT_FORWARD, "Intermediate relay tree-routes downlink");
+            pkt = fwd;
+        }
+    }
+    EXPECT(act == ON_MESH_ACT_DELIVER && memcmp(pkt.payload, cmd, 10u) == 0,
+           "6-hop downlink command 'VALVE_OPEN' delivered to basement sensor N6");
+
+    /* Kill relay N3 (only standby N3b refreshes beacon at SF=50) -> N4 self-heals to N3b! */
+    on_mesh_on_beacon(&m[IDX_N4], kIds[IDX_N3B], m[IDX_N3B].my_hop_depth, 185u, 50u);
+    EXPECT(m[IDX_N4].parent_id == kIds[IDX_N3B] && m[IDX_N4].parent_switches == 1u,
+           "When 3-hop relay N3 dies, N4 self-heals to standby relay N3b automatically");
+
+    /* 2. Verify 256-Node Multi-Epoch TDMA Zero-Collision Scheduler (mixed periods 1, 8, 32) */
+    on_epoch_sched_t sched;
+    on_epoch_sched_init(&sched);
+    on_epoch_grant_t grants[256];
+    uint32_t allocated = 0u;
+
+    /* Allocate 1 high-rate 250 Hz actuator (period=1, 1 full slot), 8 medium sensors (period=8, 1 slot),
+     * and 192 sleeping IoT sensors (period=32, 6 slots) = 201 heterogeneous nodes filling 100% of 8x32 matrix! */
+    for (uint16_t i = 0u; i < 1u; ++i) {
+        if (on_epoch_alloc(&sched, (uint16_t)(0x010u + i), 1u, 0u, &grants[allocated]) == ON_OK) allocated++;
+    }
+    for (uint16_t i = 0u; i < 8u; ++i) {
+        if (on_epoch_alloc(&sched, (uint16_t)(0x020u + i), 8u, 0u, &grants[allocated]) == ON_OK) allocated++;
+    }
+    for (uint16_t i = 0u; i < 192u; ++i) {
+        if (on_epoch_alloc(&sched, (uint16_t)(0x100u + i), 32u, 0u, &grants[allocated]) == ON_OK) allocated++;
+    }
+
+    /* Exhaustive collision check across every (sf, slot) in a full 32-SF epoch */
+    uint32_t epoch_collisions = 0u;
+    for (uint32_t sf = 0u; sf < 32u; ++sf) {
+        uint8_t slot_hits[ON_EPOCH_MAX_SLOTS];
+        memset(slot_hits, 0, sizeof(slot_hits));
+        for (uint32_t i = 0u; i < allocated; ++i) {
+            if (on_epoch_is_my_sf(sf, grants[i].epoch_phase, grants[i].epoch_period)) {
+                slot_hits[grants[i].slot_idx]++;
+                if (slot_hits[grants[i].slot_idx] > 1u) epoch_collisions++;
+            }
+        }
+    }
+
+    /* Pure 256-node period=32 capacity test */
+    on_epoch_sched_t sched256;
+    on_epoch_sched_init(&sched256);
+    uint32_t alloc256 = 0u;
+    for (uint16_t i = 0u; i < 256u; ++i) {
+        on_epoch_grant_t g;
+        if (on_epoch_alloc(&sched256, (uint16_t)(0x200u + i), 32u, 0u, &g) == ON_OK) alloc256++;
+    }
+
+    printf("    -> 6-Hop Mesh: N6 depth=%u failover=N3->N3b | Epoch-TDMA: mixed=%u (coll=%u), max_cap=%u, duty(p32)=%.2f%%\n",
+           (unsigned)m[IDX_N6].my_hop_depth, allocated, epoch_collisions, alloc256,
+           on_epoch_duty_cycle_pct(32u));
+
+    EXPECT(allocated == 201u && epoch_collisions == 0u,
+           "Heterogeneous Epoch-TDMA (250Hz + 31Hz + 7.8Hz) schedules 201 nodes with ZERO collisions");
+    EXPECT(alloc256 == 256u && on_epoch_duty_cycle_pct(32u) < 0.35,
+           "Full Epoch-TDMA supports 256 sleeping IoT nodes per cluster at < 0.35% duty cycle");
+}
+
+/* ========================================================================== */
+/* TEST 31: v6.0 OASIS MQTT 3.1.1 Codec & Home Assistant Auto-Discovery       */
+/* ========================================================================== */
+typedef struct {
+    uint32_t pub_count;
+    char     last_topic[64];
+    char     last_payload[256];
+} test_mqtt_mock_t;
+
+static on_err_t mock_mqtt_pub(void *ctx, const char *topic, const char *payload, bool retain) {
+    (void)retain;
+    test_mqtt_mock_t *m = (test_mqtt_mock_t *)ctx;
+    m->pub_count++;
+    strncpy(m->last_topic, topic, sizeof(m->last_topic) - 1u);
+    strncpy(m->last_payload, payload, sizeof(m->last_payload) - 1u);
+    return ON_OK;
+}
+
+static void test_v60_mqtt311_and_home_assistant_discovery(void) {
+    printf("[TEST 31] v6.0 OASIS MQTT 3.1.1 Wire Codec & Home Assistant Auto-Discovery...\n");
+
+    /* 1. CONNECT / CONNACK / SUBSCRIBE / PINGREQ round-trip */
+    uint8_t buf[512];
+    size_t clen = on_mqtt_encode_connect("opennear_gw_01", "ha_user", "secret", 30u, buf, sizeof(buf));
+    EXPECT(clen > 20u && buf[0] == ON_MQTT_PKT_CONNECT && memcmp(buf + 4, "MQTT", 4u) == 0,
+           "MQTT 3.1.1 CONNECT packet encoded cleanly with auth & keepalive");
+
+    const uint8_t connack_ok[4] = { 0x20u, 0x02u, 0x00u, 0x00u };
+    uint8_t rc = 0xFFu;
+    EXPECT(on_mqtt_decode_connack(connack_ok, sizeof(connack_ok), &rc) && rc == 0u,
+           "MQTT CONNACK accepted (rc=0) decoded cleanly");
+
+    size_t slen = on_mqtt_encode_subscribe(1u, "opennear/cmd/#", buf, sizeof(buf));
+    EXPECT(slen > 18u && buf[0] == ON_MQTT_PKT_SUBSCRIBE,
+           "MQTT SUBSCRIBE for opennear/cmd/# encoded cleanly");
+
+    /* 2. Home Assistant MQTT Auto-Discovery JSON + PUBLISH encode/decode */
+    char ha_topic[96], ha_json[512];
+    EXPECT(on_mqtt_format_ha_discovery(0x601u, 6u, "T", ha_topic, sizeof(ha_topic),
+                                       ha_json, sizeof(ha_json)) &&
+           strcmp(ha_topic, "homeassistant/sensor/opennear_601/config") == 0 &&
+           strstr(ha_json, "\"stat_t\":\"opennear/node/0x601/state\"") != NULL &&
+           strstr(ha_json, "\"cmd_t\":\"opennear/cmd/0x601\"") != NULL,
+           "Home Assistant Discovery topic & JSON generated for 6-hop Mesh node 0x601");
+
+    size_t plen = on_mqtt_encode_publish(ha_topic, (const uint8_t *)ha_json, strlen(ha_json),
+                                         true, buf, sizeof(buf));
+    on_mqtt_pub_view_t view;
+    EXPECT(plen > strlen(ha_json) && on_mqtt_decode_publish(buf, plen, &view) &&
+           view.retain && view.topic_len == strlen(ha_topic) &&
+           view.payload_len == strlen(ha_json) &&
+           memcmp(view.payload, ha_json, view.payload_len) == 0,
+           "MQTT retained PUBLISH encode/decode round-trip matches bit-for-bit");
+
+    /* 3. Inbound MQTT Command & OTA Trigger topic parser + BLE MQTT provisioning + Gateway forward */
+    uint16_t tid = 0u;
+    bool is_ota = false;
+    EXPECT(on_mqtt_parse_cmd_topic("opennear/cmd/0x601", 18u, &tid, &is_ota) &&
+           tid == 0x601u && !is_ota,
+           "Inbound Home Assistant command topic opennear/cmd/0x601 resolves target=0x601");
+    EXPECT(on_mqtt_parse_cmd_topic("opennear/ota/trigger", 20u, &tid, &is_ota) && is_ota,
+           "Inbound MQTT OTA trigger topic opennear/ota/trigger detected");
+
+    test_mqtt_mock_t mm;
+    memset(&mm, 0, sizeof(mm));
+    on_gw_transport_ops_t ops;
+    memset(&ops, 0, sizeof(ops));
+    ops.user_ctx     = &mm;
+    ops.mqtt_publish = mock_mqtt_pub;
+
+    on_gw_ctx_t gw;
+    on_gw_init(&gw, ON_GW_MODE_WIFI_AND_BLE, &ops);
+    const char *mprov = "MQTT:192.168.1.50|1883|ha_user|ha_pass";
+    EXPECT(on_gw_handle_control_text(&gw, mprov, strlen(mprov), true) == ON_OK &&
+           strcmp(gw.cfg.mqtt_host, "192.168.1.50") == 0 && gw.cfg.mqtt_port == 1883u &&
+           strcmp(gw.cfg.mqtt_user, "ha_user") == 0,
+           "BLE/HTTP MQTT:<host>|<port>|<user>|<pass> provisioning parsed cleanly");
+
+    gw.mqtt_connected = true;
+    on_gw_bridge_msg_t up;
+    memset(&up, 0, sizeof(up));
+    up.bridge_type = ON_GW_MSG_TELEMETRY_UP;
+    up.origin_id   = 0x601u;
+    up.seq         = 7u;
+    up.payload[0]  = 0xABu;
+    up.payload[1]  = 0xCDu;
+    up.payload_len = 2u;
+    on_gw_push_uplink(&gw, &up);
+    on_gw_poll_network(&gw);
+
+    printf("    -> HA Discovery: %s | MQTT Pub: %s -> %s\n", ha_topic, mm.last_topic, mm.last_payload);
+    EXPECT(mm.pub_count == 1u && strcmp(mm.last_topic, "opennear/node/0x601/state") == 0 &&
+           strstr(mm.last_payload, "ABCD") != NULL,
+           "Gateway poller forwards 6-hop node telemetry directly to MQTT broker topic");
+}
+
 int main(void) {
     printf("============================================================\n");
-    printf("       OpenNear v5.0 Core Protocol Automated Test Suite     \n");
+    printf("       OpenNear v6.0 Core Protocol Automated Test Suite     \n");
     printf("============================================================\n");
 
     test_6byte_header_and_frame();
@@ -1697,6 +1974,9 @@ int main(void) {
     test_v50_multihop_authenticated_node_ota();
     test_v50_public_wifi_ble_gateway_bridge();
     test_v51_any_node_cluster_topology_and_data_query();
+    test_v60_leaderless_cold_boot_auto_election();
+    test_v60_6hop_mesh_routing_and_256node_epoch_tdma();
+    test_v60_mqtt311_and_home_assistant_discovery();
 
     printf("\n------------------------------------------------------------\n");
     printf("SUMMARY: %d passed, %d failed\n", g_tests_passed, g_tests_failed);

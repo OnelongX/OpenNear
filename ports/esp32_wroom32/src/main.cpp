@@ -155,6 +155,12 @@ void setup() {
     g_node.act_lookahead_enabled = true;
     Serial.println("[OpenNear ACT] Lookahead GPIO demo enabled");
 #endif
+#ifdef OPENNEAR_LEADERLESS_BOOT
+    if (!is_master) {
+        on_node_enable_leaderless_boot(&g_node, 1500u);
+        Serial.println("[OpenNear Mesh] Leaderless cold-boot auto-election enabled (1500 ms)");
+    }
+#endif
     /* Raw Wi-Fi is contended; tolerate a short burst of delayed/missed beacons. */
     g_node.peer_lease_timeout_sf = kWifiPeerLeaseTimeoutSf;
     g_node.backup_miss_threshold = kWifiBackupMissThreshold;

@@ -1,6 +1,7 @@
 #include "esp32_net_gateway.h"
 #include "hal_esp32_raw80211.h"
 #include "esp32_ota_flash.h"
+#include "on_mqtt.h"
 #include <Arduino.h>
 #include <string.h>
 
@@ -26,9 +27,126 @@ static on_node_t   *s_node_ref = nullptr;
 #ifdef OPENNEAR_ENABLE_WIFI_GW
 static Preferences s_prefs;
 static WebServer   s_http_srv(80);
+static WiFiClient  s_mqtt_tcp;
 static bool        s_http_srv_started   = false;
 static bool        s_wifi_was_connected = false;
 static uint32_t    s_last_wifi_retry_ms = 0u;
+static uint32_t    s_last_mqtt_retry_ms = 0u;
+static uint32_t    s_last_mqtt_ping_ms  = 0u;
+static uint32_t    s_last_ha_pub_ms     = 0u;
+
+static on_err_t esp32_mqtt_publish_cb(void *ctx, const char *topic,
+                                      const char *payload, bool retain) {
+    (void)ctx;
+    if (!s_mqtt_tcp.connected() || !topic || !payload) return ON_ERR_NOT_READY;
+    static uint8_t pkt[640];
+    size_t n = on_mqtt_encode_publish(topic, reinterpret_cast<const uint8_t *>(payload),
+                                      strlen(payload), retain, pkt, sizeof(pkt));
+    if (n == 0u) return ON_ERR_TOO_LONG;
+    return (s_mqtt_tcp.write(pkt, n) == n) ? ON_OK : ON_ERR_NOT_READY;
+}
+
+static void esp32_mqtt_poll(on_node_t *node, on_gw_ctx_t *gw) {
+    if (!gw || WiFi.status() != WL_CONNECTED || gw->cfg.mqtt_host[0] == '\0') {
+        if (gw) gw->mqtt_connected = false;
+        return;
+    }
+    if (gw->cfg.mqtt_creds_updated) {
+        gw->cfg.mqtt_creds_updated = false;
+        if (s_mqtt_tcp.connected()) s_mqtt_tcp.stop();
+        if (s_prefs.begin("opennear_gw", false)) {
+            s_prefs.putString("mhost", gw->cfg.mqtt_host);
+            s_prefs.putUShort("mport", gw->cfg.mqtt_port);
+            s_prefs.putString("muser", gw->cfg.mqtt_user);
+            s_prefs.putString("mpass", gw->cfg.mqtt_pass);
+            s_prefs.end();
+        }
+    }
+
+    uint32_t now_ms = millis();
+    if (!s_mqtt_tcp.connected()) {
+        gw->mqtt_connected = false;
+        if ((now_ms - s_last_mqtt_retry_ms) < 5000u) return;
+        s_last_mqtt_retry_ms = now_ms;
+        uint16_t port = gw->cfg.mqtt_port ? gw->cfg.mqtt_port : 1883u;
+        if (s_mqtt_tcp.connect(gw->cfg.mqtt_host, port)) {
+            uint8_t cbuf[192];
+            size_t clen = on_mqtt_encode_connect("opennear_gw", gw->cfg.mqtt_user,
+                                                 gw->cfg.mqtt_pass, 30u, cbuf, sizeof(cbuf));
+            if (clen > 0u && s_mqtt_tcp.write(cbuf, clen) == clen) {
+                uint8_t sbuf[64];
+                size_t s1 = on_mqtt_encode_subscribe(1u, "opennear/cmd/#", sbuf, sizeof(sbuf));
+                if (s1 > 0u) s_mqtt_tcp.write(sbuf, s1);
+                size_t s2 = on_mqtt_encode_subscribe(2u, "opennear/ota/trigger", sbuf, sizeof(sbuf));
+                if (s2 > 0u) s_mqtt_tcp.write(sbuf, s2);
+                gw->mqtt_connected  = true;
+                s_last_mqtt_ping_ms = now_ms;
+                s_last_ha_pub_ms    = 0u;
+                Serial.printf("[OpenNear MQTT] Connected to %s:%u (HA Discovery + cmd/# armed)\n",
+                              gw->cfg.mqtt_host, (unsigned)port);
+            }
+        }
+        return;
+    }
+
+    /* Keepalive PINGREQ every 20 s */
+    if ((now_ms - s_last_mqtt_ping_ms) > 20000u) {
+        s_last_mqtt_ping_ms = now_ms;
+        uint8_t ping[2];
+        on_mqtt_encode_pingreq(ping);
+        s_mqtt_tcp.write(ping, 2u);
+    }
+
+    /* Periodically publish Home Assistant MQTT Auto-Discovery + full cluster topology every 15 s */
+    if (node && (s_last_ha_pub_ms == 0u || (now_ms - s_last_ha_pub_ms) > 15000u)) {
+        s_last_ha_pub_ms = now_ms;
+        on_cluster_snapshot_t snap;
+        on_node_get_cluster_snapshot(node, &snap);
+        static char topic[96];
+        static char payload[512];
+        for (uint8_t i = 0u; i < snap.active_count; ++i) {
+            const on_cluster_node_t *cn = &snap.nodes[i];
+            const char *rname = (cn->role == ON_ROLE_G) ? "G" :
+                                (cn->role == ON_ROLE_SUB_G ? "SUB_G" : "T");
+            if (on_mqtt_format_ha_discovery(cn->short_id, cn->hop_depth, rname,
+                                            topic, sizeof(topic), payload, sizeof(payload))) {
+                esp32_mqtt_publish_cb(gw, topic, payload, true);
+            }
+            if (on_mqtt_format_node_state(cn->short_id, cn->parent_id, cn->hop_depth,
+                                          cn->last_skew_ns, cn->last_data, cn->last_data_len,
+                                          topic, sizeof(topic), payload, sizeof(payload))) {
+                esp32_mqtt_publish_cb(gw, topic, payload, false);
+            }
+        }
+    }
+
+    /* Drain inbound MQTT PUBLISH packets (Home Assistant / Cloud commands & OTA triggers) */
+    if (s_mqtt_tcp.available() >= 4) {
+        static uint8_t rxbuf[384];
+        int n = s_mqtt_tcp.read(rxbuf, sizeof(rxbuf));
+        if (n >= 4) {
+            on_mqtt_pub_view_t pub;
+            if (on_mqtt_decode_publish(rxbuf, static_cast<size_t>(n), &pub)) {
+                uint16_t target_id = 0u;
+                bool is_ota = false;
+                if (on_mqtt_parse_cmd_topic(pub.topic, pub.topic_len, &target_id, &is_ota)) {
+                    if (is_ota) {
+                        char cmd_txt[192];
+                        int cl = snprintf(cmd_txt, sizeof(cmd_txt), "OTA:%.*s",
+                                          static_cast<int>(pub.payload_len),
+                                          reinterpret_cast<const char *>(pub.payload));
+                        if (cl > 4) on_gw_handle_control_text(gw, cmd_txt, static_cast<size_t>(cl), false);
+                    } else if (node) {
+                        uint8_t plen = (pub.payload_len <= ON_GW_MAX_PAYLOAD_LEN)
+                                       ? static_cast<uint8_t>(pub.payload_len) : ON_GW_MAX_PAYLOAD_LEN;
+                        on_node_send_gw_downlink(node, target_id, ON_GW_MSG_CLOUD_CMD_DOWN,
+                                                 pub.payload, plen);
+                    }
+                }
+            }
+        }
+    }
+}
 
 static void start_local_http_api(void) {
     if (s_http_srv_started) return;
@@ -285,6 +403,7 @@ void on_esp32_net_gw_preinit_wifi(on_gw_ctx_t *gw, const char *default_ssid,
 #ifdef OPENNEAR_ENABLE_WIFI_GW
     ops.wifi_connect          = esp32_wifi_connect_cb;
     ops.cloud_post_json       = esp32_cloud_post_cb;
+    ops.mqtt_publish          = esp32_mqtt_publish_cb;
     ops.on_channel_align      = esp32_channel_align_cb;
 #endif
 #ifdef OPENNEAR_ENABLE_BLE_GW
@@ -377,6 +496,7 @@ void on_esp32_net_gw_poll(on_node_t *node, on_gw_ctx_t *gw) {
     if (s_http_srv_started) {
         s_http_srv.handleClient();
     }
+    esp32_mqtt_poll(node, gw);
 
     if (connected && gw->cfg.ota_pull_requested) {
         gw->cfg.ota_pull_requested = false;

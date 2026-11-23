@@ -65,9 +65,14 @@ typedef struct {
     char     wifi_pass[ON_GW_PASS_MAX_LEN];
     char     cloud_url[ON_GW_URL_MAX_LEN];
     char     ota_url[ON_GW_URL_MAX_LEN];
+    char     mqtt_host[64];
+    uint16_t mqtt_port;
+    char     mqtt_user[32];
+    char     mqtt_pass[32];
     uint16_t ota_target_id;
     uint32_t ota_target_ver;
     bool     wifi_creds_updated;
+    bool     mqtt_creds_updated;
     bool     ota_pull_requested;
     bool     topo_query_requested;
     bool     topo_include_data;
@@ -88,6 +93,7 @@ typedef struct {
     on_err_t (*wifi_connect)(void *ctx, const char *ssid, const char *pass);
     on_err_t (*cloud_post_json)(void *ctx, const char *url, const char *json_body);
     on_err_t (*ble_notify)(void *ctx, const uint8_t *data, size_t len);
+    on_err_t (*mqtt_publish)(void *ctx, const char *topic, const char *payload, bool retain);
     on_err_t (*on_channel_align)(void *ctx, uint8_t wifi_ch);
     on_err_t (*on_downlink_delivered)(void *ctx, const on_gw_bridge_msg_t *msg);
 } on_gw_transport_ops_t;
@@ -104,6 +110,7 @@ typedef struct {
     uint8_t               wifi_ip[4];
     bool                  ble_connected;
     uint16_t              ble_mtu;
+    bool                  mqtt_connected;
     uint8_t               aligned_opennear_ch; /* Channel synchronized with Wi-Fi AP */
 
     /* Bidirectional bridge queues */

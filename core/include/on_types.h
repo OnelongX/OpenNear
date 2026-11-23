@@ -67,7 +67,8 @@ typedef enum {
     ON_FRAME_OTA_CHUNK  = 0x9, /* v5.0: Firmware OTA data chunk (up to 96B/frame) */
     ON_FRAME_OTA_STATUS = 0xA, /* v5.0: Node OTA progress + 32-bit selective-repeat NACK bitmap */
     ON_FRAME_OTA_COMMIT = 0xB, /* v5.0: Synchronized SF-aligned OTA verify/activate/reboot command */
-    ON_FRAME_GW_BRIDGE  = 0xC  /* v5.0: Public Wi-Fi / BLE Gateway uplink & downlink tunnel */
+    ON_FRAME_GW_BRIDGE  = 0xC, /* v5.0: Public Wi-Fi / BLE Gateway uplink & downlink tunnel */
+    ON_FRAME_MESH       = 0xD  /* v6.0: 3~6-hop Hybrid Mesh routing & discovery frame */
 } on_frame_type_t;
 
 /* Node operational roles */

@@ -9,6 +9,7 @@
 #include "on_afh.h"
 #include "on_ota.h"
 #include "on_gateway.h"
+#include "on_mesh.h"
 #include "../../hal/on_hal.h"
 
 #ifdef __cplusplus
@@ -218,6 +219,18 @@ typedef struct {
     uint16_t          topo_rx_pages_mask;
     uint8_t           topo_rx_total_pages;
     on_gw_ring_t      topo_resp_q;        /* Coordinator G paginated TOPO_RESP downlink queue */
+
+    /* v6.0 Leaderless Cold-Boot Auto-Election, Epoch-TDMA & 3~6-Hop Hybrid Mesh */
+    bool              leaderless_boot_enabled;
+    int64_t           leaderless_base_timeout_ns;
+    int64_t           boot_listen_start_ns;
+    uint8_t           epoch_phase;        /* 0..(epoch_period - 1) */
+    uint8_t           epoch_period;       /* 0 or 1 = every SF; 2/4/8/16/32 = sleeping IoT */
+    on_mesh_ctx_t    *mesh;
+    bool              mesh_tx_pending;
+    on_mesh_pkt_t     mesh_tx_pkt;
+    uint32_t          mesh_rx_total;
+    uint32_t          mesh_tx_total;
 } on_node_t;
 
 /* Initialize node as Primary G coordinator or Unjoined Terminal */
@@ -287,6 +300,14 @@ on_err_t on_node_request_cluster_snapshot(on_node_t *node);
 size_t   on_node_get_cluster_snapshot(const on_node_t *node, on_cluster_snapshot_t *out);
 size_t   on_node_format_cluster_json(const on_node_t *node, bool include_data,
                                      char *out_buf, size_t out_cap);
+
+/* v6.0: Leaderless Auto-Boot, 256-Node Epoch-TDMA & 3~6-Hop Hybrid Mesh */
+void     on_node_enable_leaderless_boot(on_node_t *node, uint32_t base_timeout_ms);
+void     on_node_set_epoch_schedule(on_node_t *node, uint8_t epoch_phase, uint8_t epoch_period);
+void     on_node_attach_mesh(on_node_t *node, on_mesh_ctx_t *mesh);
+on_err_t on_node_send_mesh_uplink(on_node_t *node, const uint8_t *payload, uint8_t len);
+on_err_t on_node_send_mesh_downlink(on_node_t *node, uint16_t target_id,
+                                    const uint8_t *payload, uint8_t len);
 
 #ifdef __cplusplus
 }
