@@ -7,6 +7,7 @@
 #ifdef OPENNEAR_ENABLE_WIFI_GW
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WebServer.h>
 #include <Preferences.h>
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
@@ -24,8 +25,39 @@ static on_node_t   *s_node_ref = nullptr;
 
 #ifdef OPENNEAR_ENABLE_WIFI_GW
 static Preferences s_prefs;
+static WebServer   s_http_srv(80);
+static bool        s_http_srv_started   = false;
 static bool        s_wifi_was_connected = false;
 static uint32_t    s_last_wifi_retry_ms = 0u;
+
+static void start_local_http_api(void) {
+    if (s_http_srv_started) return;
+    s_http_srv.on("/api/topology", HTTP_GET, []() {
+        static char json[2048];
+        if (!s_node_ref) { s_http_srv.send(503, "application/json", "{\"error\":\"no_node\"}"); return; }
+        size_t n = on_node_format_cluster_json(s_node_ref, false, json, sizeof(json));
+        s_http_srv.send(200, "application/json", (n > 0u) ? json : "{}");
+    });
+    s_http_srv.on("/api/data", HTTP_GET, []() {
+        static char json[2048];
+        if (!s_node_ref) { s_http_srv.send(503, "application/json", "{\"error\":\"no_node\"}"); return; }
+        size_t n = on_node_format_cluster_json(s_node_ref, true, json, sizeof(json));
+        s_http_srv.send(200, "application/json", (n > 0u) ? json : "{}");
+    });
+    s_http_srv.on("/api/cmd", HTTP_POST, []() {
+        if (!s_gw_ref || !s_http_srv.hasArg("plain")) {
+            s_http_srv.send(400, "application/json", "{\"ok\":false}");
+            return;
+        }
+        String body = s_http_srv.arg("plain");
+        on_err_t rc = on_gw_handle_control_text(s_gw_ref, body.c_str(), body.length(), false);
+        s_http_srv.send((rc == ON_OK) ? 200 : 400, "application/json",
+                        (rc == ON_OK) ? "{\"ok\":true}" : "{\"ok\":false}");
+    });
+    s_http_srv.begin();
+    s_http_srv_started = true;
+    Serial.println("[OpenNear GW] HTTP API server started: GET /api/topology, GET /api/data, POST /api/cmd");
+}
 
 static void save_wifi_nvs(const char *ssid, const char *pass, const char *url) {
     if (s_prefs.begin("opennear_gw", false)) {
@@ -330,6 +362,7 @@ void on_esp32_net_gw_poll(on_node_t *node, on_gw_ctx_t *gw) {
         uint8_t ip4[4] = { ip[0], ip[1], ip[2], ip[3] };
         uint8_t ch = static_cast<uint8_t>(WiFi.channel());
         on_gw_on_wifi_connected(gw, ch, static_cast<int8_t>(WiFi.RSSI()), ip4);
+        start_local_http_api();
         Serial.printf("[OpenNear GW] Wi-Fi ONLINE ip=%u.%u.%u.%u ch=%u rssi=%d\n",
                       ip4[0], ip4[1], ip4[2], ip4[3], (unsigned)ch, (int)WiFi.RSSI());
     } else if (!connected && s_wifi_was_connected) {
@@ -341,6 +374,9 @@ void on_esp32_net_gw_poll(on_node_t *node, on_gw_ctx_t *gw) {
         s_last_wifi_retry_ms = millis();
         WiFi.reconnect();
     }
+    if (s_http_srv_started) {
+        s_http_srv.handleClient();
+    }
 
     if (connected && gw->cfg.ota_pull_requested) {
         gw->cfg.ota_pull_requested = false;
@@ -349,6 +385,24 @@ void on_esp32_net_gw_poll(on_node_t *node, on_gw_ctx_t *gw) {
 #else
     (void)node;
 #endif
+
+    if (node && gw->cfg.topo_query_requested) {
+        gw->cfg.topo_query_requested = false;
+        if (node->role != ON_ROLE_G && !node->cluster_snapshot_valid) {
+            on_node_request_cluster_snapshot(node);
+        }
+        static char topo_json[1024];
+        size_t jlen = on_node_format_cluster_json(node, gw->cfg.topo_include_data,
+                                                  topo_json, sizeof(topo_json));
+        if (jlen > 0u) {
+            Serial.printf("[OpenNear Cluster] %s\n", topo_json);
+#ifdef OPENNEAR_ENABLE_BLE_GW
+            if (gw->ble_connected) {
+                esp32_ble_notify_cb(gw, reinterpret_cast<const uint8_t *>(topo_json), jlen);
+            }
+#endif
+        }
+    }
 
     on_gw_poll_network(gw);
 }

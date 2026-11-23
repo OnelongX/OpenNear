@@ -28,6 +28,42 @@ typedef struct {
     uint32_t rx_packets;
 } on_peer_entry_t;
 
+/* v5.1 Cluster-wide multi-hop node record (0-hop G + 1-hop T/Sub-G + 2-hop edge + live data) */
+#define ON_MAX_CLUSTER_NODES  24u
+#define ON_TOPO_PAGE_NODES    2u  /* 6B page hdr + 2 * 18B = 42B -> 224 us air (fits inside Sub-CRA <3160 us!) */
+
+typedef struct {
+    bool     active;
+    uint16_t short_id;
+    uint16_t parent_id;       /* 0x000 for Primary G, G_id for 1-hop, Sub-G_id for 2-hop */
+    uint8_t  role;            /* on_role_t */
+    uint8_t  hop_depth;       /* 0 = Primary G, 1 = 1-hop, 2 = 2-hop wall-blocked edge */
+    uint8_t  slot_idx;
+    uint8_t  capabilities;
+    bool     is_backup;
+    uint32_t last_seen_sf;
+    int16_t  last_skew_ns;
+    uint32_t rx_packets;
+    uint16_t last_seq;
+    uint8_t  last_data[8];
+    uint8_t  last_data_len;
+    uint8_t  ota_state;       /* on_ota_state_t */
+    uint16_t ota_rx_chunks;
+} on_cluster_node_t;
+
+typedef struct {
+    uint32_t          sf_seq;
+    uint16_t          g_id;
+    uint16_t          backup_id;
+    uint16_t          sub_g_id;
+    uint16_t          sub_g_id_2;
+    uint16_t          tdma_bitmap;
+    uint16_t          channel_map;
+    uint8_t           active_count;
+    bool              is_remote_cached; /* True when fetched over the air by a non-G node */
+    on_cluster_node_t nodes[ON_MAX_CLUSTER_NODES];
+} on_cluster_snapshot_t;
+
 /* Complete OpenNear Node Context */
 typedef struct {
     on_hal_ops_t   hal;
@@ -147,6 +183,7 @@ typedef struct {
     on_gw_ctx_t   *gw;
     bool           service_tx_done_this_sf;
     bool           sub_dl_tx_done_this_sf;
+    bool           service_dl_reserved_this_sf; /* Set from SYNC_MAP flags bit 3 */
     uint32_t       ota_tx_total;
     uint32_t       ota_rx_total;
     uint32_t       gw_tx_total;
@@ -167,6 +204,20 @@ typedef struct {
     uint8_t        sub_ul_type;
     uint8_t        sub_ul_len;
     uint8_t        sub_ul_payload[ON_MAX_PAYLOAD_LEN];
+    uint8_t        sub_dl_listen_sfs;  /* Sub-G temporary C-RA RX window after 2-hop uplink */
+
+    /* v5.1 Custom application telemetry payload (sent in node's TDMA / Sub-TDMA slot) */
+    uint8_t        app_tx_data[8];
+    uint8_t        app_tx_data_len;
+
+    /* v5.1 Full cluster-wide topology & live node data table (maintained by G, cached on query) */
+    on_cluster_node_t cluster_tbl[ON_MAX_CLUSTER_NODES];
+    uint16_t          cluster_g_id;
+    bool              cluster_snapshot_valid;
+    bool              topo_query_in_flight;
+    uint16_t          topo_rx_pages_mask;
+    uint8_t           topo_rx_total_pages;
+    on_gw_ring_t      topo_resp_q;        /* Coordinator G paginated TOPO_RESP downlink queue */
 } on_node_t;
 
 /* Initialize node as Primary G coordinator or Unjoined Terminal */
@@ -229,6 +280,13 @@ on_err_t on_node_send_gw_uplink(on_node_t *node, on_gw_msg_type_t type,
                                 const uint8_t *payload, uint8_t len);
 on_err_t on_node_send_gw_downlink(on_node_t *node, uint16_t target_id,
                                   on_gw_msg_type_t type, const uint8_t *payload, uint8_t len);
+
+/* v5.1: Application sensor payload & Cluster-Wide Topology / Live Data Introspection */
+void     on_node_set_tx_payload(on_node_t *node, const uint8_t *data, uint8_t len);
+on_err_t on_node_request_cluster_snapshot(on_node_t *node);
+size_t   on_node_get_cluster_snapshot(const on_node_t *node, on_cluster_snapshot_t *out);
+size_t   on_node_format_cluster_json(const on_node_t *node, bool include_data,
+                                     char *out_buf, size_t out_cap);
 
 #ifdef __cplusplus
 }

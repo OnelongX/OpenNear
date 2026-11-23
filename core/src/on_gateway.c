@@ -247,6 +247,14 @@ on_err_t on_gw_handle_control_text(on_gw_ctx_t *gw, const char *text, size_t len
         return on_gw_push_downlink(gw, &msg) ? ON_OK : ON_ERR_NO_MEM;
     }
 
+    /* Format 4: TOPO? / DATA? -> Query full cluster topology & live node data */
+    if ((clean_len == 5u && memcmp(text, "TOPO?", 5u) == 0) ||
+        (clean_len == 5u && memcmp(text, "DATA?", 5u) == 0)) {
+        gw->cfg.topo_query_requested = true;
+        gw->cfg.topo_include_data    = (text[0] == 'D');
+        return ON_OK;
+    }
+
     return ON_ERR_INVALID_ARG;
 }
 

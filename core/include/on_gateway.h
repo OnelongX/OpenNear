@@ -41,7 +41,9 @@ typedef enum {
     ON_GW_MSG_BLE_NOTIFY_UP  = 0x03, /* Terminal -> G -> Phone BLE GATT */
     ON_GW_MSG_BLE_CMD_DOWN   = 0x04, /* Phone BLE GATT -> G -> Terminal */
     ON_GW_MSG_WIFI_PROV      = 0x05, /* BLE Wi-Fi provisioning config */
-    ON_GW_MSG_OTA_TRIGGER    = 0x06  /* Cloud/BLE trigger to pull & push OTA */
+    ON_GW_MSG_OTA_TRIGGER    = 0x06, /* Cloud/BLE trigger to pull & push OTA */
+    ON_GW_MSG_TOPO_REQ       = 0x07, /* v5.1: Any-node request for cluster topology & data */
+    ON_GW_MSG_TOPO_RESP      = 0x08  /* v5.1: Paginated cluster topology & data snapshot from G */
 } on_gw_msg_type_t;
 
 #define ON_GW_FLAG_RELAYED_2HOP  0x01u
@@ -67,6 +69,8 @@ typedef struct {
     uint32_t ota_target_ver;
     bool     wifi_creds_updated;
     bool     ota_pull_requested;
+    bool     topo_query_requested;
+    bool     topo_include_data;
 } on_gw_config_t;
 
 /* SPSC ring buffer for cross-core/cross-task decoupling */

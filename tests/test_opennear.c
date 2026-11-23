@@ -1574,6 +1574,96 @@ static void test_v50_public_wifi_ble_gateway_bridge(void) {
            "Zero RF collisions during bidirectional Wi-Fi/BLE Gateway bridging");
 }
 
+/* ========================================================================== */
+/* TEST 28: v5.1 Any-Node Full Cluster Topology & Live Sensor Data Query      */
+/* ========================================================================== */
+static void test_v51_any_node_cluster_topology_and_data_query(void) {
+    printf("[TEST 28] v5.1 Any-Node Full Cluster Topology & Live Sensor Data Introspection (G + 1-Hop T5 + 2-Hop T8)...\n");
+
+    static const uint8_t kKey[ON_SEC_KEY_LEN] = {
+        0xAA,0xBB,0xCC,0xDD,0x11,0x22,0x33,0x44,
+        0x55,0x66,0x77,0x88,0x99,0x00,0x12,0x34
+    };
+
+    sim_world_t w;
+    sim_world_init(&w, 0x51C12026ULL);
+    sim_world_setup_10node_demo(&w, true);
+    for (uint32_t i = 0u; i < w.num_nodes; ++i) {
+        on_node_enable_security(&w.nodes[i], kKey);
+    }
+
+    /* Set custom application sensor payloads on 1-hop T4 and 2-hop wall-blocked T8 */
+    const uint8_t t4_sensor[4] = { 0x11u, 0x22u, 0x33u, 0x44u };
+    const uint8_t t8_sensor[4] = { 0xCAu, 0xFEu, 0xBAu, 0xBEu };
+    on_node_set_tx_payload(&w.nodes[4], t4_sensor, 4u);
+    on_node_set_tx_payload(&w.nodes[8], t8_sensor, 4u);
+
+    /* Run 10-node cluster so 1-hop + 2-hop nodes join and stream sensor data to Primary G */
+    sim_world_run_us(&w, 120000, 10);
+
+    /* 1. Direct query on Primary G -> must see all 10 nodes (0-hop + 1-hop + 2-hop) + live payloads */
+    on_cluster_snapshot_t g_snap;
+    size_t g_cnt = on_node_get_cluster_snapshot(&w.nodes[0], &g_snap);
+    char json_buf[2048];
+    size_t jlen = on_node_format_cluster_json(&w.nodes[0], true, json_buf, sizeof(json_buf));
+
+    printf("    -> Primary G snapshot: count=%u | JSON len=%u | T8_2hop=%s\n",
+           (unsigned)g_cnt, (unsigned)jlen,
+           strstr(json_buf, "CAFEBABE") ? "FOUND(CAFEBABE)" : "MISSING");
+
+    EXPECT(g_cnt == 10u && jlen > 100u &&
+           strstr(json_buf, "\"id\":\"0x100\"") != NULL &&
+           strstr(json_buf, "\"hop\":2") != NULL &&
+           strstr(json_buf, "11223344") != NULL &&
+           strstr(json_buf, "CAFEBABE") != NULL,
+           "Primary G tracks all 10 nodes (incl. 2-hop T8/T9) and exports live sensor payloads as JSON");
+
+    /* 2. Query from an ordinary 1-hop Terminal node (T5) over encrypted OpenNear air */
+    EXPECT(on_node_request_cluster_snapshot(&w.nodes[5]) == ON_OK,
+           "1-hop terminal T5 requests full cluster snapshot from Primary G");
+    sim_world_run_us(&w, 140000, 10);
+
+    on_cluster_snapshot_t t5_snap;
+    size_t t5_cnt = on_node_get_cluster_snapshot(&w.nodes[5], &t5_snap);
+    char t5_json[2048];
+    on_node_format_cluster_json(&w.nodes[5], true, t5_json, sizeof(t5_json));
+    printf("    -> 1-Hop Terminal T5 remote snapshot: valid=%d count=%u cached=%d\n",
+           w.nodes[5].cluster_snapshot_valid ? 1 : 0, (unsigned)t5_cnt,
+           t5_snap.is_remote_cached ? 1 : 0);
+    EXPECT(w.nodes[5].cluster_snapshot_valid && t5_cnt == 10u && t5_snap.is_remote_cached &&
+           strstr(t5_json, "CAFEBABE") != NULL && strstr(t5_json, "11223344") != NULL,
+           "1-hop terminal T5 fetches entire 10-node topology & live sensor data from G over air");
+
+    /* 3. Query from a wall-blocked 2-hop Edge node (T8, 0x100) through Sub-G proxy! */
+    EXPECT(on_node_request_cluster_snapshot(&w.nodes[8]) == ON_OK,
+           "Wall-blocked 2-hop edge node T8 requests full cluster snapshot via Sub-G");
+    sim_world_run_us(&w, 180000, 10);
+
+    on_cluster_snapshot_t t8_snap;
+    size_t t8_cnt = on_node_get_cluster_snapshot(&w.nodes[8], &t8_snap);
+    char t8_json[2048];
+    on_node_format_cluster_json(&w.nodes[8], true, t8_json, sizeof(t8_json));
+    printf("    -> 2-Hop Edge T8 remote snapshot: valid=%d count=%u | T4_data=%s | Collisions=%u\n",
+           w.nodes[8].cluster_snapshot_valid ? 1 : 0, (unsigned)t8_cnt,
+           strstr(t8_json, "11223344") ? "FOUND" : "MISSING",
+           w.tdma_subg_collisions + w.cra_collisions);
+    EXPECT(w.nodes[8].cluster_snapshot_valid && t8_cnt == 10u && t8_snap.is_remote_cached &&
+           strstr(t8_json, "11223344") != NULL && strstr(t8_json, "\"id\":\"0x001\"") != NULL,
+           "Wall-blocked 2-hop edge node T8 fetches entire 10-node cluster topology & data through Sub-G");
+    EXPECT(w.tdma_subg_collisions == 0u && w.cra_collisions == 0u,
+           "Zero RF collisions during multi-hop paginated cluster topology queries");
+
+    /* 4. Verify BLE/HTTP control text TOPO? and DATA? commands */
+    on_gw_ctx_t gw;
+    on_gw_init(&gw, ON_GW_MODE_WIFI_AND_BLE, NULL);
+    EXPECT(on_gw_handle_control_text(&gw, "TOPO?", 5u, true) == ON_OK &&
+           gw.cfg.topo_query_requested && !gw.cfg.topo_include_data,
+           "BLE/HTTP TOPO? control query parsed cleanly");
+    EXPECT(on_gw_handle_control_text(&gw, "DATA?", 5u, true) == ON_OK &&
+           gw.cfg.topo_query_requested && gw.cfg.topo_include_data,
+           "BLE/HTTP DATA? control query parsed cleanly");
+}
+
 int main(void) {
     printf("============================================================\n");
     printf("       OpenNear v5.0 Core Protocol Automated Test Suite     \n");
@@ -1606,6 +1696,7 @@ int main(void) {
     test_queued_tx_min_delay_envelope();
     test_v50_multihop_authenticated_node_ota();
     test_v50_public_wifi_ble_gateway_bridge();
+    test_v51_any_node_cluster_topology_and_data_query();
 
     printf("\n------------------------------------------------------------\n");
     printf("SUMMARY: %d passed, %d failed\n", g_tests_passed, g_tests_failed);

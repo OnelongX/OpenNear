@@ -1,4 +1,5 @@
 #include "on_node.h"
+#include <stdio.h>
 #include <string.h>
 
 #define ON_ACT_DEMO_PERIOD_SF 10u
@@ -83,6 +84,198 @@ static on_peer_entry_t *find_peer_by_id(on_node_t *node, uint16_t short_id) {
         }
     }
     return NULL;
+}
+
+/* ========================================================================== */
+/* v5.1 Cluster-Wide Topology & Live Node Data Registry Helpers               */
+/* ========================================================================== */
+
+static on_cluster_node_t *cluster_find_or_alloc(on_node_t *node, uint16_t short_id) {
+    if (!node || short_id == ON_SHORT_ID_UNASSIGNED) return NULL;
+    on_cluster_node_t *empty = NULL;
+    for (uint32_t i = 0u; i < ON_MAX_CLUSTER_NODES; ++i) {
+        if (node->cluster_tbl[i].active && node->cluster_tbl[i].short_id == short_id) {
+            return &node->cluster_tbl[i];
+        }
+        if (!node->cluster_tbl[i].active && !empty) {
+            empty = &node->cluster_tbl[i];
+        }
+    }
+    if (empty) {
+        memset(empty, 0, sizeof(*empty));
+        empty->active   = true;
+        empty->short_id = short_id & ON_SHORT_ID_MASK;
+    }
+    return empty;
+}
+
+static void cluster_mark_inactive(on_node_t *node, uint16_t short_id) {
+    if (!node) return;
+    for (uint32_t i = 0u; i < ON_MAX_CLUSTER_NODES; ++i) {
+        if (node->cluster_tbl[i].active && node->cluster_tbl[i].short_id == short_id) {
+            node->cluster_tbl[i].active = false;
+            break;
+        }
+    }
+}
+
+static void cluster_record_tdma(on_node_t *node, const on_mac_hdr_t *hdr,
+                                const on_data_payload_t *dp, const on_peer_entry_t *pe) {
+    if (!node || !hdr || !dp) return;
+    /* 1. Always refresh the direct 1-hop sender */
+    on_cluster_node_t *c1 = cluster_find_or_alloc(node, hdr->src_id);
+    if (c1) {
+        c1->parent_id    = node->short_id;
+        c1->hop_depth    = 1u;
+        c1->role         = (hdr->src_id == node->sub_g_id || hdr->src_id == node->sub_g_id_2)
+                           ? (uint8_t)ON_ROLE_SUB_G : (uint8_t)ON_ROLE_T;
+        c1->slot_idx     = pe ? pe->slot_idx : hdr->slot_idx;
+        c1->capabilities = pe ? pe->capabilities : (uint8_t)((dp->flags >> 6) & 0x03u);
+        c1->is_backup    = (hdr->src_id == node->backup_id);
+        c1->last_seen_sf = node->current_sf_seq;
+        c1->rx_packets++;
+        if (dp->origin_id == hdr->src_id && (dp->flags & 0x02u) == 0u) {
+            c1->last_skew_ns  = dp->skew_ns_est;
+            c1->last_seq      = dp->seq;
+            c1->last_data_len = (dp->data_len <= 8u) ? dp->data_len : 8u;
+            if (c1->last_data_len > 0u) memcpy(c1->last_data, dp->data, c1->last_data_len);
+        }
+    }
+    /* 2. If relayed from a 2-hop wall-blocked edge node via Sub-G, track it too! */
+    if ((dp->flags & 0x02u) != 0u || (dp->origin_id != ON_SHORT_ID_UNASSIGNED && dp->origin_id != hdr->src_id)) {
+        on_cluster_node_t *c2 = cluster_find_or_alloc(node, dp->origin_id);
+        if (c2) {
+            c2->parent_id     = hdr->src_id; /* Sub-G proxy ID */
+            c2->hop_depth     = (dp->hop_count >= 2u) ? dp->hop_count : 2u;
+            c2->role          = (uint8_t)ON_ROLE_T;
+            c2->slot_idx      = (uint8_t)(dp->origin_id & 0x0Fu);
+            c2->is_backup     = false;
+            c2->last_seen_sf  = node->current_sf_seq;
+            c2->last_skew_ns  = dp->skew_ns_est;
+            c2->rx_packets++;
+            c2->last_seq      = dp->seq;
+            c2->last_data_len = (dp->data_len <= 8u) ? dp->data_len : 8u;
+            if (c2->last_data_len > 0u) memcpy(c2->last_data, dp->data, c2->last_data_len);
+        }
+    }
+}
+
+static void cluster_record_ota(on_node_t *node, const on_ota_status_t *st) {
+    if (!node || !st) return;
+    on_cluster_node_t *c = cluster_find_or_alloc(node, st->node_id);
+    if (c) {
+        c->ota_state     = st->state;
+        c->ota_rx_chunks = st->rx_chunks;
+        c->last_seen_sf  = node->current_sf_seq;
+    }
+}
+
+static void topo_put_u16(uint8_t *p, uint16_t v) {
+    p[0] = (uint8_t)(v & 0xFFu);
+    p[1] = (uint8_t)((v >> 8) & 0xFFu);
+}
+static uint16_t topo_get_u16(const uint8_t *p) {
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static void topo_queue_resp_pages(on_node_t *node, uint16_t requester_id) {
+    if (!node || node->role != ON_ROLE_G) return;
+    on_cluster_snapshot_t snap;
+    size_t n = on_node_get_cluster_snapshot(node, &snap);
+    uint8_t total_pages = (uint8_t)((n + ON_TOPO_PAGE_NODES - 1u) / ON_TOPO_PAGE_NODES);
+    if (total_pages == 0u) total_pages = 1u;
+
+    for (uint8_t p = 0u; p < total_pages; ++p) {
+        on_gw_bridge_msg_t resp;
+        memset(&resp, 0, sizeof(resp));
+        resp.bridge_type = (uint8_t)ON_GW_MSG_TOPO_RESP;
+        resp.origin_id   = requester_id & ON_SHORT_ID_MASK;
+        resp.seq         = ++node->data_tx_seq;
+
+        uint8_t start = (uint8_t)(p * ON_TOPO_PAGE_NODES);
+        uint8_t cnt   = (start < (uint8_t)n) ? (uint8_t)(n - start) : 0u;
+        if (cnt > ON_TOPO_PAGE_NODES) cnt = ON_TOPO_PAGE_NODES;
+
+        uint8_t *b = resp.payload;
+        b[0] = p;
+        b[1] = total_pages;
+        b[2] = (uint8_t)n;
+        b[3] = cnt;
+        topo_put_u16(b + 4, node->short_id);
+
+        size_t off = 6u;
+        for (uint8_t k = 0u; k < cnt; ++k) {
+            const on_cluster_node_t *cn = &snap.nodes[start + k];
+            topo_put_u16(b + off + 0, cn->short_id);
+            topo_put_u16(b + off + 2, cn->parent_id);
+            b[off + 4] = (uint8_t)(((cn->hop_depth & 0x03u) << 6) |
+                                   ((cn->role & 0x03u) << 4) |
+                                   (cn->slot_idx & 0x0Fu));
+            b[off + 5] = cn->ota_state;
+            topo_put_u16(b + off + 6, (uint16_t)cn->last_skew_ns);
+            topo_put_u16(b + off + 8, cn->last_seq);
+            uint8_t dlen = (cn->last_data_len <= 7u) ? cn->last_data_len : 7u;
+            b[off + 10] = dlen;
+            memset(b + off + 11, 0, 7u);
+            if (dlen > 0u) memcpy(b + off + 11, cn->last_data, dlen);
+            off += 18u;
+        }
+        resp.payload_len = (uint8_t)off;
+
+        if (node->topo_resp_q.count < ON_GW_RING_DEPTH) {
+            node->topo_resp_q.items[node->topo_resp_q.tail] = resp;
+            node->topo_resp_q.tail = (uint8_t)((node->topo_resp_q.tail + 1u) % ON_GW_RING_DEPTH);
+            node->topo_resp_q.count++;
+        }
+    }
+}
+
+static void topo_ingest_resp_page(on_node_t *node, const on_gw_bridge_msg_t *msg) {
+    if (!node || !msg || msg->payload_len < 6u) return;
+    const uint8_t *b = msg->payload;
+    uint8_t page_idx    = b[0];
+    uint8_t total_pages = b[1];
+    uint8_t cnt         = b[3];
+    uint16_t g_id       = topo_get_u16(b + 4) & ON_SHORT_ID_MASK;
+    if (total_pages == 0u || total_pages > 12u || page_idx >= total_pages) return;
+    if ((size_t)msg->payload_len < 6u + (size_t)cnt * 18u) return;
+
+    if (node->topo_rx_pages_mask == 0u) {
+        memset(node->cluster_tbl, 0, sizeof(node->cluster_tbl));
+    }
+    node->cluster_g_id        = g_id;
+    node->topo_rx_total_pages = total_pages;
+
+    size_t off = 6u;
+    for (uint8_t k = 0u; k < cnt; ++k) {
+        uint16_t sid = topo_get_u16(b + off + 0) & ON_SHORT_ID_MASK;
+        on_cluster_node_t *cn = cluster_find_or_alloc(node, sid);
+        if (cn) {
+            cn->parent_id     = topo_get_u16(b + off + 2) & ON_SHORT_ID_MASK;
+            uint8_t packed    = b[off + 4];
+            cn->hop_depth     = (uint8_t)((packed >> 6) & 0x03u);
+            cn->role          = (uint8_t)((packed >> 4) & 0x03u);
+            cn->slot_idx      = (uint8_t)(packed & 0x0Fu);
+            cn->ota_state     = b[off + 5];
+            cn->last_skew_ns  = (int16_t)topo_get_u16(b + off + 6);
+            cn->last_seq      = topo_get_u16(b + off + 8);
+            cn->last_data_len = (b[off + 10] <= 7u) ? b[off + 10] : 7u;
+            cn->is_backup     = (sid == node->backup_id);
+            cn->last_seen_sf  = node->current_sf_seq;
+            if (cn->last_data_len > 0u) {
+                memcpy(cn->last_data, b + off + 11, cn->last_data_len);
+            }
+        }
+        off += 18u;
+    }
+
+    node->topo_rx_pages_mask |= (uint16_t)(1u << page_idx);
+    uint16_t expect_mask = (uint16_t)((1u << total_pages) - 1u);
+    if ((node->topo_rx_pages_mask & expect_mask) == expect_mask) {
+        node->cluster_snapshot_valid = true;
+        node->topo_query_in_flight   = false;
+        emit_event(node, "CLUSTER_SNAPSHOT_RX", g_id, (int64_t)b[2]);
+    }
 }
 
 static uint16_t select_next_backup_id(const on_node_t *node) {
@@ -227,7 +420,15 @@ static void send_sync_map(on_node_t *node, bool is_sub_sync) {
     if (!is_sub_sync && node->act_lookahead_enabled) {
         sp.act_flip_lead_sf = demo_act_flip_lead(sp.sf_seq);
     }
-    sp.flags              = (uint8_t)(((node->afh_countdown & 0x0Fu) << 4) | (ON_PHY_LE_MSK_2M & 0x0Fu));
+    bool has_dl_service = is_sub_sync
+        ? (node->sub_dl_pending && ((node->current_sf_seq & 1u) != 0u))
+        : (((node->current_sf_seq & 1u) == 0u) &&
+           ((node->ota && node->ota->tx.active) ||
+            (node->topo_resp_q.count > 0u) ||
+            (node->gw && node->gw->downlink_q.count > 0u)));
+    sp.flags              = (uint8_t)(((node->afh_countdown & 0x0Fu) << 4) |
+                                      (has_dl_service ? 0x08u : 0x00u) |
+                                      (ON_PHY_LE_MSK_2M & 0x07u));
 
     uint8_t pbuf[ON_SYNC_PAYLOAD_WIRE_LEN];
     size_t plen = 0u;
@@ -699,6 +900,8 @@ void on_node_on_rx_raw(on_node_t *node, const uint8_t *frame, size_t len, int64_
             node->ch_pretuned_this_sf      = false;
             node->service_tx_done_this_sf  = false;
             node->sub_dl_tx_done_this_sf   = false;
+            node->service_dl_reserved_this_sf = ((sp.flags & 0x08u) != 0u);
+            if (node->sub_dl_listen_sfs > 0u) node->sub_dl_listen_sfs--;
             break;
         }
 
@@ -794,6 +997,7 @@ void on_node_on_rx_raw(on_node_t *node, const uint8_t *frame, size_t len, int64_
                     pe->last_skew_ns = dp.skew_ns_est;
                     pe->rx_packets++;
                 }
+                cluster_record_tdma(node, &hdr, &dp, pe);
                 if (hdr.type == ON_FRAME_CRA_ALERT) {
                     emit_event(node, "CRA_ALERT_RX", dp.origin_id, dp.data_len > 0 ? dp.data[0] : 0);
                 }
@@ -812,7 +1016,17 @@ void on_node_on_rx_raw(on_node_t *node, const uint8_t *frame, size_t len, int64_
                 on_data_payload_t rdp = dp;
                 rdp.hop_count++;
                 rdp.flags |= 0x02u; /* mark relayed */
-                if (node->relay_count < ON_DEFAULT_SUBG_MAX_SLOTS) {
+                /* Fair per-origin coalescing: update queued stale sample from same child so no 2-hop node starves */
+                bool updated_in_place = false;
+                for (uint8_t qi = 0u; qi < node->relay_count; ++qi) {
+                    uint8_t idx = (uint8_t)((node->relay_head + qi) % ON_DEFAULT_SUBG_MAX_SLOTS);
+                    if (node->relay_q[idx].origin_id == rdp.origin_id) {
+                        node->relay_q[idx] = rdp;
+                        updated_in_place = true;
+                        break;
+                    }
+                }
+                if (!updated_in_place && node->relay_count < ON_DEFAULT_SUBG_MAX_SLOTS) {
                     node->relay_q[node->relay_tail] = rdp;
                     node->relay_tail = (uint8_t)((node->relay_tail + 1u) % ON_DEFAULT_SUBG_MAX_SLOTS);
                     node->relay_count++;
@@ -896,6 +1110,7 @@ void on_node_on_rx_raw(on_node_t *node, const uint8_t *frame, size_t len, int64_
             node->ota_rx_total++;
             if (node->role == ON_ROLE_G && node->ota) {
                 on_ota_tx_on_status(&node->ota->tx, &st, node->current_sf_seq);
+                cluster_record_ota(node, &st);
                 emit_event(node, "OTA_STATUS_RX", st.node_id, (int64_t)st.rx_chunks);
             } else if (node->role == ON_ROLE_SUB_G && hdr.is_sub_g && plen <= sizeof(node->sub_ul_payload)) {
                 /* Sub-G forwards 2-hop child OTA_STATUS back to Primary G */
@@ -933,28 +1148,39 @@ void on_node_on_rx_raw(on_node_t *node, const uint8_t *frame, size_t len, int64_
             if (on_gw_bridge_unpack(payload, plen, &msg) != ON_OK) break;
             node->gw_rx_total++;
             bool is_uplink = (msg.bridge_type == ON_GW_MSG_TELEMETRY_UP ||
-                              msg.bridge_type == ON_GW_MSG_BLE_NOTIFY_UP);
+                              msg.bridge_type == ON_GW_MSG_BLE_NOTIFY_UP ||
+                              msg.bridge_type == ON_GW_MSG_TOPO_REQ);
             if (is_uplink) {
-                if (node->role == ON_ROLE_G && node->gw) {
-                    on_gw_push_uplink(node->gw, &msg);
-                    emit_event(node, "GW_UPLINK_RX", msg.origin_id, (int64_t)msg.seq);
+                if (node->role == ON_ROLE_G) {
+                    if (msg.bridge_type == ON_GW_MSG_TOPO_REQ) {
+                        topo_queue_resp_pages(node, msg.origin_id);
+                        emit_event(node, "TOPO_REQ_RX", msg.origin_id, (int64_t)node->current_sf_seq);
+                    } else if (node->gw) {
+                        on_gw_push_uplink(node->gw, &msg);
+                        emit_event(node, "GW_UPLINK_RX", msg.origin_id, (int64_t)msg.seq);
+                    }
                 } else if (node->role == ON_ROLE_SUB_G && hdr.is_sub_g) {
                     msg.flags |= ON_GW_FLAG_RELAYED_2HOP;
                     size_t rlen = 0u;
                     if (on_gw_bridge_pack(&msg, node->sub_ul_payload, sizeof(node->sub_ul_payload), &rlen) == ON_OK) {
-                        node->sub_ul_pending = true;
-                        node->sub_ul_type    = (uint8_t)ON_FRAME_GW_BRIDGE;
-                        node->sub_ul_len     = (uint8_t)rlen;
+                        node->sub_ul_pending    = true;
+                        node->sub_ul_type       = (uint8_t)ON_FRAME_GW_BRIDGE;
+                        node->sub_ul_len        = (uint8_t)rlen;
+                        node->sub_dl_listen_sfs = 48u; /* Stay awake in C-RA to catch all paginated responses for 2-hop child */
                     }
                 }
             } else {
-                /* Downlink command from Cloud Wi-Fi or BLE GATT */
+                /* Downlink command or cluster topology snapshot response */
                 bool for_self = (msg.origin_id == node->short_id || msg.origin_id == ON_SHORT_ID_BROADCAST);
                 if (for_self) {
-                    if (node->gw && node->gw->ops.on_downlink_delivered) {
-                        node->gw->ops.on_downlink_delivered(node->gw->ops.user_ctx, &msg);
+                    if (msg.bridge_type == ON_GW_MSG_TOPO_RESP) {
+                        topo_ingest_resp_page(node, &msg);
+                    } else {
+                        if (node->gw && node->gw->ops.on_downlink_delivered) {
+                            node->gw->ops.on_downlink_delivered(node->gw->ops.user_ctx, &msg);
+                        }
+                        emit_event(node, "GW_DOWNLINK_RX", msg.origin_id, (int64_t)msg.seq);
                     }
-                    emit_event(node, "GW_DOWNLINK_RX", msg.origin_id, (int64_t)msg.seq);
                 }
                 if (node->role == ON_ROLE_SUB_G && !hdr.is_sub_g &&
                     (msg.origin_id == ON_SHORT_ID_BROADCAST || msg.origin_id >= 0x100u) &&
@@ -1054,6 +1280,7 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
                         uint8_t  dead_slot = node->peers[i].slot_idx;
                         node->tdma_bitmap &= (uint16_t)(~(1u << dead_slot));
                         node->peers[i].active = false;
+                        cluster_mark_inactive(node, dead_id);
                         node->lease_reclaim_count++;
                         emit_event(node, "PEER_LEASE_EXPIRED", dead_id, dead_slot);
 
@@ -1130,6 +1357,27 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
                         send_frame(node, &hdr, pbuf, plen, now_local_ns);
                         node->ota_tx_total++;
                     }
+                }
+            } else if (node->topo_resp_q.count > 0u) {
+                on_gw_bridge_msg_t dl = node->topo_resp_q.items[node->topo_resp_q.head];
+                node->topo_resp_q.head = (uint8_t)((node->topo_resp_q.head + 1u) % ON_GW_RING_DEPTH);
+                node->topo_resp_q.count--;
+                node->service_tx_done_this_sf = true;
+                uint8_t pbuf[ON_MAX_PAYLOAD_LEN];
+                size_t plen = 0u;
+                if (on_gw_bridge_pack(&dl, pbuf, sizeof(pbuf), &plen) == ON_OK) {
+                    on_mac_hdr_t hdr;
+                    memset(&hdr, 0, sizeof(hdr));
+                    hdr.version    = ON_PROTO_VERSION;
+                    hdr.type       = (uint8_t)ON_FRAME_GW_BRIDGE;
+                    hdr.src_id     = node->short_id;
+                    hdr.dst_id     = (dl.origin_id >= 0x100u && dl.origin_id != ON_SHORT_ID_BROADCAST &&
+                                      node->sub_g_id != ON_SHORT_ID_UNASSIGNED)
+                                     ? node->sub_g_id : dl.origin_id;
+                    hdr.sf_seq_low = (uint8_t)(node->current_sf_seq & 0x0Fu);
+                    hdr.slot_idx   = 14u;
+                    send_frame(node, &hdr, pbuf, plen, now_local_ns);
+                    node->gw_tx_total++;
                 }
             } else if (node->gw && node->gw->downlink_q.count > 0u) {
                 on_gw_bridge_msg_t dl;
@@ -1299,8 +1547,14 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
                                           (node->sync.last_err_ns < -32000 ? -32000 : node->sync.last_err_ns));
                 dp.hop_count   = 1u;
                 dp.flags       = (uint8_t)((node->capabilities & 0x03u) << 6);
-                dp.data[0]     = (uint8_t)(node->current_sf_seq & 0xFFu);
-                dp.data_len    = 1u;
+                if (node->app_tx_data_len > 0u) {
+                    uint8_t n = (node->app_tx_data_len <= 8u) ? node->app_tx_data_len : 8u;
+                    memcpy(dp.data, node->app_tx_data, n);
+                    dp.data_len = n;
+                } else {
+                    dp.data[0]  = (uint8_t)(node->current_sf_seq & 0xFFu);
+                    dp.data_len = 1u;
+                }
                 node->last_tx_data = dp;
             }
             node->awaiting_ack = true;
@@ -1400,8 +1654,14 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
                 dp.skew_ns_est = (int16_t)(node->sync.last_err_ns > 32000 ? 32000 :
                                           (node->sync.last_err_ns < -32000 ? -32000 : node->sync.last_err_ns));
                 dp.hop_count   = 1u;
-                dp.data[0]     = 0xE8u; /* edge sensor marker */
-                dp.data_len    = 1u;
+                if (node->app_tx_data_len > 0u) {
+                    uint8_t n = (node->app_tx_data_len <= 8u) ? node->app_tx_data_len : 8u;
+                    memcpy(dp.data, node->app_tx_data, n);
+                    dp.data_len = n;
+                } else {
+                    dp.data[0]  = 0xE8u; /* edge sensor marker */
+                    dp.data_len = 1u;
+                }
                 node->last_tx_data = dp;
             }
             node->awaiting_ack = true;
@@ -1426,7 +1686,7 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
     }
 
     /* Phase 3: C-RA Contention Micro-Slot (JOIN_REQ, RTT_REQ, or Emergency Alert) */
-    if (!node->cra_tx_done_this_sf) {
+    if (!node->cra_tx_done_this_sf && !node->service_dl_reserved_this_sf) {
         /* Deterministic stagger by MAC byte[5] (mod 2 for Sub-CRA 2-hop, mod 7 for 1-hop C-RA) */
         uint32_t turn_mod = node->is_sub_node ? 2u : 7u;
         uint32_t my_turn  = node->is_sub_node ? ((node->mac48[5] + 1u) % 2u) : (node->mac48[5] % 7u);
@@ -1522,14 +1782,14 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
     /* v5.0 Service Uplink Slot: OTA Status/NACK & Public Wi-Fi/BLE Gateway Uplink
      * - 1-hop / Sub-G: Odd SF at C-RA slot 1 (3420 us) -> zero collision with G's Even-SF Downlink
      * - 2-hop Edge:    Even SF at Sub-CRA (2940 us)    -> zero collision with Sub-G's Odd-SF Relay */
-    if (!node->service_tx_done_this_sf &&
+    if (!node->service_tx_done_this_sf && !node->cra_tx_done_this_sf &&
         (node->role == ON_ROLE_T || node->role == ON_ROLE_SUB_G) &&
         node->short_id != ON_SHORT_ID_UNASSIGNED) {
         bool my_sf_parity = node->is_sub_node ? ((node->current_sf_seq & 1u) == 0u)
                                               : ((node->current_sf_seq & 1u) != 0u);
         int64_t ul_ns = node->is_sub_node
             ? (int64_t)on_sf_subg_cra_start_us(&node->sf_cfg) * 1000LL
-            : (int64_t)(node->sf_cfg.cra_start_us + 220u) * 1000LL;
+            : (int64_t)(node->sf_cfg.cra_start_us + 300u) * 1000LL;
         if (my_sf_parity && elapsed_ns >= ul_ns && elapsed_ns < ul_ns + 60000LL) {
             uint32_t half_sf = node->current_sf_seq >> 1u;
             uint32_t ul_mod  = node->is_sub_node ? 4u : 12u;
@@ -1707,8 +1967,9 @@ bool on_node_is_rx_open(const on_node_t *node, int64_t now_local_ns) {
         if (off_us >= pre && off_us < sub0 + 270u) {
             return true;
         }
-        /* v5.0 OTA / Gateway-capable 2-hop node also listens in Sub-CRA downlink window */
-        if (node->ota != NULL || node->gw != NULL) {
+        /* v5.0/v5.1 OTA / Gateway / Topology-query 2-hop node also listens in Sub-CRA downlink window */
+        if (node->service_dl_reserved_this_sf || node->ota != NULL ||
+            node->gw != NULL || node->topo_query_in_flight) {
             uint32_t sub_cra = on_sf_subg_cra_start_us(&node->sf_cfg);
             uint32_t cra_pre = (sub_cra >= 40u) ? (sub_cra - 40u) : 0u;
             if (off_us >= cra_pre && off_us < sub0 + node->sf_cfg.sub_g_len_us + 250u) {
@@ -1723,8 +1984,9 @@ bool on_node_is_rx_open(const on_node_t *node, int64_t now_local_ns) {
         return true;
     }
 
-    /* v5.0 OTA / Gateway-capable 1-hop node listens in C-RA downlink service window */
-    if ((node->ota != NULL || node->gw != NULL) &&
+    /* v5.0/v5.1 OTA / Gateway / Topology-query 1-hop node listens in C-RA downlink service window */
+    if ((node->service_dl_reserved_this_sf || node->ota != NULL || node->gw != NULL ||
+         node->topo_query_in_flight || node->sub_dl_listen_sfs > 0u) &&
         off_us + 40u >= node->sf_cfg.cra_start_us &&
         off_us < node->sf_cfg.act_start_us + 100u) {
         return true;
@@ -1836,4 +2098,225 @@ on_err_t on_node_send_gw_downlink(on_node_t *node, uint16_t target_id,
     msg.payload_len = len;
     if (len > 0u) memcpy(msg.payload, payload, len);
     return on_gw_push_downlink(node->gw, &msg) ? ON_OK : ON_ERR_NO_MEM;
+}
+
+/* ========================================================================== */
+/* v5.1 Application Sensor Payload & Cluster Topology / Live Data Export      */
+/* ========================================================================== */
+
+void on_node_set_tx_payload(on_node_t *node, const uint8_t *data, uint8_t len) {
+    if (!node) return;
+    if (!data || len == 0u) {
+        node->app_tx_data_len = 0u;
+        return;
+    }
+    uint8_t n = (len <= 8u) ? len : 8u;
+    memcpy(node->app_tx_data, data, n);
+    node->app_tx_data_len = n;
+}
+
+on_err_t on_node_request_cluster_snapshot(on_node_t *node) {
+    if (!node) return ON_ERR_INVALID_ARG;
+    if (node->role == ON_ROLE_G) {
+        node->cluster_snapshot_valid = true;
+        return ON_OK;
+    }
+    if (node->role == ON_ROLE_UNJOINED || node->short_id == ON_SHORT_ID_UNASSIGNED) {
+        return ON_ERR_NOT_READY;
+    }
+    node->topo_query_in_flight   = true;
+    node->topo_rx_pages_mask     = 0u;
+    node->topo_rx_total_pages    = 0u;
+    node->cluster_snapshot_valid = false;
+    return on_node_send_gw_uplink(node, ON_GW_MSG_TOPO_REQ, NULL, 0u);
+}
+
+size_t on_node_get_cluster_snapshot(const on_node_t *node, on_cluster_snapshot_t *out) {
+    if (!node || !out) return 0u;
+    memset(out, 0, sizeof(*out));
+    out->sf_seq      = node->current_sf_seq;
+    out->backup_id   = node->backup_id;
+    out->sub_g_id    = node->sub_g_id;
+    out->sub_g_id_2  = node->sub_g_id_2;
+    out->tdma_bitmap = node->tdma_bitmap;
+    out->channel_map = node->afh.channel_map;
+
+    uint8_t count = 0u;
+
+    if (node->role == ON_ROLE_G) {
+        out->g_id             = node->short_id;
+        out->is_remote_cached = false;
+
+        /* Entry 0: Primary G itself */
+        on_cluster_node_t *g = &out->nodes[count++];
+        g->active        = true;
+        g->short_id      = node->short_id;
+        g->parent_id     = ON_SHORT_ID_UNASSIGNED;
+        g->role          = (uint8_t)ON_ROLE_G;
+        g->hop_depth     = 0u;
+        g->slot_idx      = 0u;
+        g->capabilities  = node->capabilities;
+        g->last_seen_sf  = node->current_sf_seq;
+        g->last_skew_ns  = 0;
+        g->rx_packets    = node->tdma_rx_total;
+        g->last_data_len = node->app_tx_data_len;
+        if (g->last_data_len > 0u) memcpy(g->last_data, node->app_tx_data, g->last_data_len);
+        if (node->ota) g->ota_state = (uint8_t)node->ota->rx.state;
+
+        /* Copy all tracked 1-hop & 2-hop cluster nodes (skip stale 2-hop > 2*lease) */
+        uint32_t max_age = (node->peer_lease_timeout_sf > 0u) ? (node->peer_lease_timeout_sf * 2u) : 60u;
+        for (uint32_t i = 0u; i < ON_MAX_CLUSTER_NODES && count < ON_MAX_CLUSTER_NODES; ++i) {
+            const on_cluster_node_t *c = &node->cluster_tbl[i];
+            if (!c->active || c->short_id == node->short_id) continue;
+            if (node->current_sf_seq > c->last_seen_sf + max_age) continue;
+            out->nodes[count]           = *c;
+            out->nodes[count].is_backup = (c->short_id == node->backup_id);
+            if (c->hop_depth == 1u) {
+                out->nodes[count].role = (c->short_id == node->sub_g_id || c->short_id == node->sub_g_id_2)
+                                         ? (uint8_t)ON_ROLE_SUB_G : (uint8_t)ON_ROLE_T;
+            }
+            count++;
+        }
+        /* Include any joined 1-hop peer that hasn't sent its first TDMA data packet yet */
+        for (uint32_t i = 0u; i < ON_MAX_NODES_TABLE && count < ON_MAX_CLUSTER_NODES; ++i) {
+            const on_peer_entry_t *pe = &node->peers[i];
+            if (!pe->active || pe->is_sub_slot) continue;
+            bool exists = false;
+            for (uint8_t j = 0u; j < count; ++j) {
+                if (out->nodes[j].short_id == pe->short_id) { exists = true; break; }
+            }
+            if (!exists) {
+                on_cluster_node_t *dst = &out->nodes[count++];
+                dst->active       = true;
+                dst->short_id     = pe->short_id;
+                dst->parent_id    = node->short_id;
+                dst->hop_depth    = 1u;
+                dst->role         = (pe->short_id == node->sub_g_id || pe->short_id == node->sub_g_id_2)
+                                    ? (uint8_t)ON_ROLE_SUB_G : (uint8_t)ON_ROLE_T;
+                dst->slot_idx     = pe->slot_idx;
+                dst->capabilities = pe->capabilities;
+                dst->is_backup    = (pe->short_id == node->backup_id);
+                dst->last_seen_sf = pe->last_seen_sf;
+                dst->last_skew_ns = pe->last_skew_ns;
+                dst->rx_packets   = pe->rx_packets;
+            }
+        }
+    } else if (node->cluster_snapshot_valid) {
+        /* Cached full-cluster snapshot fetched from Primary G over OpenNear air */
+        out->g_id             = node->cluster_g_id;
+        out->is_remote_cached = true;
+        for (uint32_t i = 0u; i < ON_MAX_CLUSTER_NODES && count < ON_MAX_CLUSTER_NODES; ++i) {
+            if (node->cluster_tbl[i].active) {
+                out->nodes[count++] = node->cluster_tbl[i];
+            }
+        }
+    } else {
+        /* Local-only neighborhood view (self + Sub-G children if Sub-G) */
+        out->g_id             = node->is_sub_node ? ON_SHORT_ID_G_DEFAULT : node->parent_id;
+        out->is_remote_cached = false;
+        if (node->short_id != ON_SHORT_ID_UNASSIGNED) {
+            on_cluster_node_t *me = &out->nodes[count++];
+            me->active        = true;
+            me->short_id      = node->short_id;
+            me->parent_id     = node->parent_id;
+            me->role          = (uint8_t)node->role;
+            me->hop_depth     = node->is_sub_node ? 2u : 1u;
+            me->slot_idx      = node->my_slot;
+            me->capabilities  = node->capabilities;
+            me->is_backup     = (node->short_id == node->backup_id);
+            me->last_seen_sf  = node->current_sf_seq;
+            me->last_skew_ns  = (int16_t)(node->sync.last_err_ns > 32000 ? 32000 :
+                                         (node->sync.last_err_ns < -32000 ? -32000 : node->sync.last_err_ns));
+            me->last_data_len = node->app_tx_data_len;
+            if (me->last_data_len > 0u) memcpy(me->last_data, node->app_tx_data, me->last_data_len);
+            if (node->ota) me->ota_state = (uint8_t)node->ota->rx.state;
+        }
+        if (node->role == ON_ROLE_SUB_G) {
+            for (uint32_t i = 0u; i < ON_MAX_NODES_TABLE && count < ON_MAX_CLUSTER_NODES; ++i) {
+                const on_peer_entry_t *pe = &node->peers[i];
+                if (!pe->active || !pe->is_sub_slot) continue;
+                on_cluster_node_t *ch = &out->nodes[count++];
+                ch->active       = true;
+                ch->short_id     = pe->short_id;
+                ch->parent_id    = node->short_id;
+                ch->role         = (uint8_t)ON_ROLE_T;
+                ch->hop_depth    = 2u;
+                ch->slot_idx     = pe->slot_idx;
+                ch->last_seen_sf = pe->last_seen_sf;
+                ch->last_skew_ns = pe->last_skew_ns;
+                ch->rx_packets   = pe->rx_packets;
+            }
+        }
+    }
+
+    out->active_count = count;
+    return (size_t)count;
+}
+
+static const char *role_str(uint8_t role) {
+    switch ((on_role_t)role) {
+        case ON_ROLE_G:     return "G";
+        case ON_ROLE_SUB_G: return "SUB_G";
+        case ON_ROLE_T:     return "T";
+        default:            return "UNJOINED";
+    }
+}
+
+size_t on_node_format_cluster_json(const on_node_t *node, bool include_data,
+                                   char *out_buf, size_t out_cap) {
+    if (!node || !out_buf || out_cap < 128u) return 0u;
+    on_cluster_snapshot_t snap;
+    on_node_get_cluster_snapshot(node, &snap);
+
+    static const char kHex[] = "0123456789ABCDEF";
+    int pos = snprintf(out_buf, out_cap,
+                       "{\"sf\":%u,\"g\":\"0x%03X\",\"backup\":\"0x%03X\",\"sub_g\":\"0x%03X\","
+                       "\"ch_map\":\"0x%04X\",\"cached\":%u,\"count\":%u,\"nodes\":[",
+                       (unsigned)snap.sf_seq,
+                       (unsigned)snap.g_id,
+                       (unsigned)snap.backup_id,
+                       (unsigned)snap.sub_g_id,
+                       (unsigned)snap.channel_map,
+                       snap.is_remote_cached ? 1u : 0u,
+                       (unsigned)snap.active_count);
+    if (pos <= 0 || (size_t)pos >= out_cap) return 0u;
+
+    for (uint8_t i = 0u; i < snap.active_count; ++i) {
+        const on_cluster_node_t *c = &snap.nodes[i];
+        char dhex[17];
+        uint8_t dlen = (c->last_data_len <= 8u) ? c->last_data_len : 8u;
+        for (uint8_t k = 0u; k < dlen; ++k) {
+            dhex[k * 2u]      = kHex[(c->last_data[k] >> 4) & 0x0Fu];
+            dhex[k * 2u + 1u] = kHex[c->last_data[k] & 0x0Fu];
+        }
+        dhex[dlen * 2u] = '\0';
+
+        int n;
+        if (include_data) {
+            n = snprintf(out_buf + pos, out_cap - (size_t)pos,
+                         "%s{\"id\":\"0x%03X\",\"parent\":\"0x%03X\",\"hop\":%u,\"role\":\"%s\","
+                         "\"slot\":%u,\"skew_ns\":%d,\"rx\":%u,\"seq\":%u,\"ota\":%u,\"data\":\"%s\"}",
+                         (i > 0u) ? "," : "",
+                         (unsigned)c->short_id, (unsigned)c->parent_id,
+                         (unsigned)c->hop_depth, role_str(c->role),
+                         (unsigned)c->slot_idx, (int)c->last_skew_ns,
+                         (unsigned)c->rx_packets, (unsigned)c->last_seq,
+                         (unsigned)c->ota_state, dhex);
+        } else {
+            n = snprintf(out_buf + pos, out_cap - (size_t)pos,
+                         "%s{\"id\":\"0x%03X\",\"parent\":\"0x%03X\",\"hop\":%u,\"role\":\"%s\","
+                         "\"slot\":%u,\"skew_ns\":%d,\"ota\":%u}",
+                         (i > 0u) ? "," : "",
+                         (unsigned)c->short_id, (unsigned)c->parent_id,
+                         (unsigned)c->hop_depth, role_str(c->role),
+                         (unsigned)c->slot_idx, (int)c->last_skew_ns,
+                         (unsigned)c->ota_state);
+        }
+        if (n <= 0 || (size_t)(pos + n + 4) >= out_cap) break;
+        pos += n;
+    }
+
+    int tail = snprintf(out_buf + pos, out_cap - (size_t)pos, "]}");
+    if (tail <= 0 || (size_t)(pos + tail) >= out_cap) return 0u;
+    return (size_t)(pos + tail);
 }

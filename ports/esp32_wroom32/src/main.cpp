@@ -194,6 +194,20 @@ void loop() {
 #if defined(OPENNEAR_ENABLE_WIFI_GW) || defined(OPENNEAR_ENABLE_BLE_GW)
     on_esp32_net_gw_poll(&g_node, &g_gw);
 #endif
+    /* Interactive USB Serial query: type "TOPO?" or "DATA?" on ANY node to dump cluster JSON */
+    if (Serial.available() > 0) {
+        String cmd = Serial.readStringUntil('\n');
+        cmd.trim();
+        if (cmd.equalsIgnoreCase("TOPO?") || cmd.equalsIgnoreCase("DATA?")) {
+            if (g_node.role != ON_ROLE_G && !g_node.cluster_snapshot_valid) {
+                on_node_request_cluster_snapshot(&g_node);
+            }
+            static char s_json[1024];
+            size_t n = on_node_format_cluster_json(&g_node, cmd.equalsIgnoreCase("DATA?"),
+                                                   s_json, sizeof(s_json));
+            if (n > 0u) Serial.println(s_json);
+        }
+    }
 #ifdef OPENNEAR_ACT_CAPTURE
     on_esp32_act_capture_poll();
 #elif defined(OPENNEAR_ACT_TRACE)
