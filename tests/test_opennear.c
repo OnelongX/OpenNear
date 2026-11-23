@@ -11,6 +11,7 @@
 #include "on_ranging.h"
 #include "on_mesh.h"
 #include "on_mqtt.h"
+#include "on_locate.h"
 #include "on_node.h"
 #include "../sim/sim_world.h"
 
@@ -2508,9 +2509,222 @@ static void test_v68_failover_mac_recovery_and_mac_mqtt_routing(void) {
            (unsigned)w.nodes[bk_idx].short_id, (unsigned)resolved_t4, (unsigned)resolved_t8);
 }
 
+/* 39. Test v7.0 Zero-Preconfig Dynamic Tagging, Multi-Anchor RSSI Reporting & 2D Indoor Positioning */
+typedef struct {
+    uint32_t count;
+    uint16_t last_anchor_id;
+    uint16_t last_target_id;
+    int8_t   last_rssi_dbm;
+    bool     matched_expected;
+    uint16_t expect_anchor_id;
+    uint16_t expect_target_id;
+    int8_t   expect_rssi_dbm;
+} test_v70_rssi_cb_t;
+
+static void test_v70_rssi_cb(void *ctx, uint16_t anchor_id, uint16_t target_id, int8_t rssi_dbm) {
+    test_v70_rssi_cb_t *st = (test_v70_rssi_cb_t *)ctx;
+    st->count++;
+    st->last_anchor_id = anchor_id;
+    st->last_target_id = target_id;
+    st->last_rssi_dbm  = rssi_dbm;
+    if (anchor_id == st->expect_anchor_id &&
+        target_id == st->expect_target_id &&
+        rssi_dbm  == st->expect_rssi_dbm) {
+        st->matched_expected = true;
+    }
+}
+
+static void test_v70_indoor_locate_rssi_and_tags(void) {
+    printf("[TEST 39] v7.0 Zero-Preconfig Tags, Anchor RSSI Overhearing & 2D Indoor Positioning...\n");
+
+    /* Part A: 4-Anchor 2D trilateration + log-distance path-loss solver */
+    on_loc_ctx_t loc;
+    on_loc_init(&loc);
+
+    const uint8_t a_mac[4][6] = {
+        { 0xAA, 0x10, 0x00, 0x00, 0x00, 0x01 },
+        { 0xAA, 0x10, 0x00, 0x00, 0x00, 0x02 },
+        { 0xAA, 0x10, 0x00, 0x00, 0x00, 0x03 },
+        { 0xAA, 0x10, 0x00, 0x00, 0x00, 0x04 }
+    };
+    const int32_t ax[4] = { 0, 600, 600, 0 };
+    const int32_t ay[4] = { 0, 0,   400, 400 };
+    const char   *ar[4] = { "Living", "Bedroom", "Study", "Kitchen" };
+    for (int i = 0; i < 4; ++i) {
+        EXPECT(on_loc_set_anchor(&loc, a_mac[i], (uint16_t)(i + 1), ar[i], ax[i], ay[i]) == ON_OK,
+               "Anchor registered in indoor positioning engine");
+    }
+
+    const uint8_t tgt_mac[6] = { 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x09 };
+    const double true_x = 200.0, true_y = 150.0; /* Nearest to Living (0,0), d=250cm */
+    for (uint32_t step = 0u; step < 5u; ++step) {
+        uint32_t now_ms = 1000u + step * 500u;
+        for (int i = 0; i < 4; ++i) {
+            double dx = (true_x - (double)ax[i]) / 100.0;
+            double dy = (true_y - (double)ay[i]) / 100.0;
+            double dm = sqrt(dx * dx + dy * dy);
+            if (dm < 0.25) dm = 0.25;
+            double rssi_f = -45.0 - 10.0 * 2.5 * log10(dm);
+            int8_t rssi = (int8_t)llround(rssi_f);
+            EXPECT(on_loc_observe_rssi(&loc, a_mac[i], tgt_mac, 0x009u, rssi, now_ms) == ON_OK,
+                   "on_loc_observe_rssi accepts anchor reading");
+        }
+    }
+
+    on_loc_estimate_t est, est_a;
+    EXPECT(on_loc_solve(&loc, tgt_mac, 3500u, &est) && est.valid, "2D indoor solve succeeds");
+    est_a = est;
+    EXPECT(est.anchor_count == 4u, "2D solve uses all 4 active anchors");
+    EXPECT(strcmp(est.room, "Living") == 0, "Room classifier picks nearest anchor Living");
+    int32_t err_x = est.x_cm - (int32_t)true_x;
+    int32_t err_y = est.y_cm - (int32_t)true_y;
+    if (err_x < 0) err_x = -err_x;
+    if (err_y < 0) err_y = -err_y;
+    EXPECT(err_x <= 35 && err_y <= 35, "Gauss-Newton 2D trilateration converges within 35 cm");
+
+    char loc_json[1024];
+    size_t jlen = on_loc_format_json(&loc, 3500u, loc_json, sizeof(loc_json));
+    EXPECT(jlen > 40u &&
+           strstr(loc_json, "\"anchors\":[") != NULL &&
+           strstr(loc_json, "\"targets\":[") != NULL &&
+           strstr(loc_json, "\"Living\"") != NULL &&
+           strstr(loc_json, "DE:AD:BE:EF:00:09") != NULL,
+           "on_loc_format_json emits valid anchors & solved target JSON");
+
+    /* Part B: +4 dB hysteresis prevents room ping-pong, +6 dB switches cleanly */
+    on_loc_ctx_t hloc;
+    on_loc_init(&hloc);
+    EXPECT(on_loc_set_anchor(&hloc, a_mac[0], 1u, "Living", 0, 0) == ON_OK, "Hysteresis anchor 0");
+    EXPECT(on_loc_set_anchor(&hloc, a_mac[1], 2u, "Bedroom", 500, 0) == ON_OK, "Hysteresis anchor 1");
+    for (uint32_t s = 0u; s < 4u; ++s) {
+        on_loc_observe_rssi(&hloc, a_mac[0], tgt_mac, 0x009u, -50, 1000u + s * 200u);
+        on_loc_observe_rssi(&hloc, a_mac[1], tgt_mac, 0x009u, -56, 1000u + s * 200u);
+    }
+    EXPECT(on_loc_solve(&hloc, tgt_mac, 2000u, &est) && strcmp(est.room, "Living") == 0,
+           "Target initializes in Living");
+
+    /* Bedroom rises to -48 dBm (+2 dB over Living -50 dBm): below +4 dB hysteresis -> MUST stay Living */
+    for (uint32_t s = 0u; s < 5u; ++s) {
+        on_loc_observe_rssi(&hloc, a_mac[0], tgt_mac, 0x009u, -50, 2200u + s * 200u);
+        on_loc_observe_rssi(&hloc, a_mac[1], tgt_mac, 0x009u, -48, 2200u + s * 200u);
+    }
+    EXPECT(on_loc_solve(&hloc, tgt_mac, 3200u, &est) && strcmp(est.room, "Living") == 0,
+           "+4 dB hysteresis prevents room ping-pong on small +2 dB fluctuation");
+
+    /* Bedroom rises to -43 dBm (+7 dB over Living -50 dBm): exceeds +4 dB -> switches to Bedroom */
+    for (uint32_t s = 0u; s < 6u; ++s) {
+        on_loc_observe_rssi(&hloc, a_mac[0], tgt_mac, 0x009u, -50, 3500u + s * 200u);
+        on_loc_observe_rssi(&hloc, a_mac[1], tgt_mac, 0x009u, -43, 3500u + s * 200u);
+    }
+    EXPECT(on_loc_solve(&hloc, tgt_mac, 4800u, &est) && strcmp(est.room, "Bedroom") == 0,
+           "Target transitions cleanly to Bedroom when RSSI exceeds +4 dB hysteresis");
+
+    /* Removing anchor with empty room name succeeds */
+    EXPECT(on_loc_set_anchor(&hloc, a_mac[1], 2u, "", 0, 0) == ON_OK,
+           "Empty room name dynamically removes anchor");
+    EXPECT(!hloc.anchors[1].active, "Removed anchor slot marked inactive");
+
+    /* Part C: Live 10-node cluster promiscuous RSSI overhearing + zero-collision ON_GW_MSG_RSSI_REPORT */
+    sim_world_t w;
+    sim_world_init(&w, 0x70A12026ULL);
+    sim_world_setup_10node_demo(&w, true);
+    sim_world_run_us(&w, 160000, 10); /* 40 SFs steady-state */
+
+    on_node_t *g_node  = &w.nodes[0];
+    on_node_t *a_node  = &w.nodes[3]; /* 1-hop node acting as fixed Anchor */
+    on_node_t *t_node  = &w.nodes[4]; /* 1-hop target node overheard by Anchor */
+    EXPECT(a_node->role == ON_ROLE_T && t_node->role == ON_ROLE_T,
+           "Anchor T3 and target T4 joined 1-hop cluster");
+
+    test_v70_rssi_cb_t cb_st;
+    memset(&cb_st, 0, sizeof(cb_st));
+    cb_st.expect_anchor_id = a_node->short_id;
+    cb_st.expect_target_id = t_node->short_id;
+    cb_st.expect_rssi_dbm  = -58;
+    on_node_set_rssi_observer(g_node, test_v70_rssi_cb, &cb_st);
+    on_node_enable_rssi_anchor_report(a_node, true);
+
+    /* Inject a promiscuously overheard unicast frame (src=T4, dst=G) with RSSI=-58 dBm into Anchor T3 */
+    on_mac_hdr_t oh;
+    memset(&oh, 0, sizeof(oh));
+    oh.version    = ON_PROTO_VERSION;
+    oh.type       = (uint8_t)ON_FRAME_TDMA_DATA;
+    oh.src_id     = t_node->short_id;
+    oh.dst_id     = g_node->short_id; /* Unicast to G (NOT addressed to T3!) */
+    oh.sf_seq_low = (uint8_t)(a_node->current_sf_seq & 0x0Fu);
+    oh.slot_idx   = t_node->my_slot;
+    uint8_t dummy_pay[4] = { 0x01u, 0x02u, 0x03u, 0x04u };
+    uint8_t raw_overheard[ON_MAX_FRAME_LEN];
+    size_t  raw_len = 0u;
+    EXPECT(on_frame_pack(&oh, dummy_pay, sizeof(dummy_pay), raw_overheard, sizeof(raw_overheard), &raw_len) == ON_OK,
+           "Packed overheard peer frame for RSSI injection");
+
+    int64_t a_local_ns = sim_phys_to_local_ns(&w, 3u, w.phys_now_ns);
+    on_node_on_rx_raw_rssi(a_node, raw_overheard, raw_len, a_local_ns, -58);
+    EXPECT(a_node->rssi_obs_count >= 1u, "Anchor records overheard peer RSSI before unicast filter");
+
+    /* Run 75 SFs (300 ms) so Anchor T3's 64-SF D-TDMA RSSI_REPORT slot fires with zero collisions */
+    sim_world_run_us(&w, 300000, 10);
+    EXPECT(w.tdma_subg_collisions == 0u && w.cra_collisions == 0u,
+           "Zero-collision ON_GW_MSG_RSSI_REPORT delivery");
+    EXPECT(cb_st.matched_expected, "Primary G received Anchor T3 overheard RSSI (-58 dBm) for T4");
+
+    uint8_t resolved_mac[6];
+    EXPECT(on_node_find_mac_by_short_id(g_node, t_node->short_id, resolved_mac) &&
+           memcmp(resolved_mac, t_node->mac48, 6u) == 0,
+           "on_node_find_mac_by_short_id resolves permanent hardware MAC48");
+
+    /* Part D: Zero-preconfig TAG:, CMD_TAG:, ANCHOR: control commands + admin_token gating */
+    on_gw_ctx_t gw;
+    on_gw_init(&gw, ON_GW_MODE_WIFI_AND_BLE, NULL);
+    on_gw_set_admin_token(&gw, "v7secret");
+
+    const char *c1 = "TAG:A4CF12AABBCC|living,light";
+    const char *c2 = "CMD_TAG:living|RELAY_ON";
+    const char *c3 = "ANCHOR:A4CF12AABBCC|Living|250|120";
+    EXPECT(on_gw_handle_control_text(&gw, c1, strlen(c1), false) == ON_ERR_DECODE_FAIL,
+           "Unauthenticated TAG rejected when admin_token is set");
+    EXPECT(on_gw_handle_control_text(&gw, c2, strlen(c2), false) == ON_ERR_DECODE_FAIL,
+           "Unauthenticated CMD_TAG rejected when admin_token is set");
+    EXPECT(on_gw_handle_control_text(&gw, c3, strlen(c3), false) == ON_ERR_DECODE_FAIL,
+           "Unauthenticated ANCHOR rejected when admin_token is set");
+
+    const char *a1 = "AUTH:v7secret|TAG:A4CF12AABBCC|living,light";
+    EXPECT(on_gw_handle_control_text(&gw, a1, strlen(a1), false) == ON_OK &&
+           gw.cfg.tag_updated &&
+           gw.cfg.tag_mac[0] == 0xA4u && gw.cfg.tag_mac[5] == 0xCCu &&
+           strcmp(gw.cfg.tag_list, "living,light") == 0,
+           "Authenticated TAG:<MAC>|<tags> parsed cleanly");
+
+    const char *a2 = "AUTH:v7secret|CMD_TAG:living|RELAY_ON";
+    EXPECT(on_gw_handle_control_text(&gw, a2, strlen(a2), false) == ON_OK &&
+           gw.cfg.cmd_tag_requested &&
+           strcmp(gw.cfg.cmd_tag, "living") == 0 &&
+           gw.cfg.cmd_tag_payload_len == 8u &&
+           memcmp(gw.cfg.cmd_tag_payload, "RELAY_ON", 8u) == 0,
+           "Authenticated CMD_TAG:<tag>|<payload> parsed cleanly");
+
+    const char *a3 = "AUTH:v7secret|ANCHOR:A4CF12AABBCC|Living|250|120";
+    EXPECT(on_gw_handle_control_text(&gw, a3, strlen(a3), false) == ON_OK &&
+           gw.cfg.anchor_updated &&
+           strcmp(gw.cfg.anchor_room, "Living") == 0 &&
+           gw.cfg.anchor_x_cm == 250 && gw.cfg.anchor_y_cm == 120,
+           "Authenticated ANCHOR:<MAC>|<room>|<x>|<y> parsed cleanly");
+
+    gw.cfg.anchor_updated = false;
+    const char *a4 = "AUTH:v7secret|ANCHOR:A4CF12AABBCC||0|0";
+    EXPECT(on_gw_handle_control_text(&gw, a4, strlen(a4), false) == ON_OK &&
+           gw.cfg.anchor_updated &&
+           gw.cfg.anchor_room[0] == '\0',
+           "Authenticated ANCHOR with empty room parses removal command");
+
+    printf("    -> 4-Anchor 2D est=(%d,%d)cm (err %d,%d cm) | Hysteresis OK | Live RSSI_REPORT OK | TAG/CMD_TAG/ANCHOR OK\n",
+           (int)est_a.x_cm, (int)est_a.y_cm, (int)err_x, (int)err_y);
+}
+
 int main(void) {
     printf("============================================================\n");
-    printf("       OpenNear v6.8 Core Protocol Automated Test Suite     \n");
+    printf("       OpenNear v7.0 Core Protocol Automated Test Suite     \n");
     printf("============================================================\n");
 
     test_6byte_header_and_frame();
@@ -2552,6 +2766,7 @@ int main(void) {
     test_v66_multihop_gc_6hop_mac_and_system_cmds();
     test_v67_mqtt_lwt_alias_and_netkey();
     test_v68_failover_mac_recovery_and_mac_mqtt_routing();
+    test_v70_indoor_locate_rssi_and_tags();
 
     printf("\n------------------------------------------------------------\n");
     printf("SUMMARY: %d passed, %d failed\n", g_tests_passed, g_tests_failed);

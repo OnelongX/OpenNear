@@ -44,7 +44,8 @@ typedef enum {
     ON_GW_MSG_OTA_TRIGGER    = 0x06, /* Cloud/BLE trigger to pull & push OTA */
     ON_GW_MSG_TOPO_REQ       = 0x07, /* v5.1: Any-node request for cluster topology & data */
     ON_GW_MSG_TOPO_RESP      = 0x08, /* v5.1: Paginated cluster topology & data snapshot from G */
-    ON_GW_MSG_MAC_REPORT     = 0x09  /* v6.5: Sub-G -> G 2-hop child hardware MAC48 registration */
+    ON_GW_MSG_MAC_REPORT     = 0x09, /* v6.5: Sub-G -> G 2-hop child hardware MAC48 registration */
+    ON_GW_MSG_RSSI_REPORT    = 0x0A  /* v7.0: Anchor -> G overheard peer RSSI observation batch */
 } on_gw_msg_type_t;
 
 #define ON_GW_FLAG_RELAYED_2HOP  0x01u
@@ -88,6 +89,18 @@ typedef struct {
     uint8_t  alias_mac[6];     /* v6.7 MAC-anchored node alias update (ALIAS:<MAC>|<name>) */
     char     alias_name[24];
     bool     alias_updated;
+    uint8_t  tag_mac[6];       /* v7.0 MAC-anchored node tags (TAG:<MAC>|<tag1,tag2>) */
+    char     tag_list[32];
+    bool     tag_updated;
+    char     cmd_tag[24];      /* v7.0 Tag group command (CMD_TAG:<tag>|<payload>) */
+    uint8_t  cmd_tag_payload[ON_GW_MAX_PAYLOAD_LEN];
+    uint8_t  cmd_tag_payload_len;
+    bool     cmd_tag_requested;
+    uint8_t  anchor_mac[6];    /* v7.0 Dynamic anchor config (ANCHOR:<MAC>|<room>|<x_cm>|<y_cm>) */
+    char     anchor_room[20];
+    int32_t  anchor_x_cm;
+    int32_t  anchor_y_cm;
+    bool     anchor_updated;
 } on_gw_config_t;
 
 /* Lock-free SPSC ring buffer for cross-core/cross-task decoupling (ON_GW_RING_DEPTH must be power of 2) */

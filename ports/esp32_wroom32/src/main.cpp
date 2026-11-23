@@ -98,7 +98,7 @@ static void opennear_rt_task(void *arg) {
             last_log_ns = now_ns;
             uint32_t tx_accepted, tx_failed;
             on_esp32_hal_tx_counts(&tx_accepted, &tx_failed);
-            Serial.printf("[OpenNear v6.9] SF=%u role=%d id=0x%03X hop=%d slot=%u nco=%.2fppm rtt=%lldns harq=%u acts=%u\n",
+            Serial.printf("[OpenNear v7.0] SF=%u role=%d id=0x%03X hop=%d slot=%u nco=%.2fppm rtt=%lldns harq=%u acts=%u\n",
                           (unsigned)log_s.sf_seq,
                           log_s.role,
                           (unsigned)log_s.short_id,
@@ -186,6 +186,8 @@ void setup() {
                  is_master ? 0u : 0xFFu,
                  ON_SHORT_ID_UNASSIGNED);
     on_node_attach_mesh(&g_node, &g_mesh);
+    /* v7.0: Enable zero-collision overheard RSSI reporting so any ESP32 can act as an indoor positioning Anchor */
+    on_node_enable_rssi_anchor_report(&g_node, true);
 #ifdef OPENNEAR_ENABLE_OTA
     on_ota_storage_ops_t ota_ops;
     on_esp32_ota_storage_init(&ota_ops);

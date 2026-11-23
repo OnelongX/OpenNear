@@ -31,6 +31,7 @@ $core = @(
     "$Root\core\src\on_gateway.c",
     "$Root\core\src\on_mesh.c",
     "$Root\core\src\on_mqtt.c",
+    "$Root\core\src\on_locate.c",
     "$Root\core\src\on_node.c"
 )
 
@@ -164,6 +165,7 @@ if ((Test-Path $xbin) -and (Test-Path $sdk)) {
         "$Root\core\src\on_gateway.c",
         "$Root\core\src\on_mesh.c",
         "$Root\core\src\on_mqtt.c",
+        "$Root\core\src\on_locate.c",
         "$Root\core\src\on_node.c",
         "$Root\ports\esp32_wroom32\src\hal_esp32_raw80211.c"
     )
@@ -195,7 +197,7 @@ if ((Test-Path $xbin) -and (Test-Path $sdk)) {
         -DOPENNEAR_ENABLE_OTA=1 -DOPENNEAR_ENABLE_WIFI_GW=1 -DOPENNEAR_ENABLE_BLE_GW=1 -DOPENNEAR_LEADERLESS_BOOT=1 -DOPENNEAR_ENABLE_TLS=1 -DOPENNEAR_ENABLE_DEMO_APP=1 `
         -c "$Root\ports\esp32_wroom32\src\esp32_tls_transport.cpp" @espInc -o "$BuildDir\esp32_obj\esp32_tls_transport_tls.o"
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    Write-Host "  OK: Route C ESP32-WROOM-32 Xtensa cross-compilation passed (22/22 objs + BLE/Demo HAL + optional MQTTS/TLS)." -ForegroundColor Green
+    Write-Host "  OK: Route C ESP32-WROOM-32 Xtensa cross-compilation passed (23/23 objs + BLE/Demo HAL + optional MQTTS/TLS)." -ForegroundColor Green
 } else {
     Write-Host "  SKIP: ESP32 Xtensa toolchain not found in default PlatformIO path." -ForegroundColor Yellow
 }

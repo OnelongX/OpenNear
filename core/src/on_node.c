@@ -824,11 +824,48 @@ static void rejoin_primary(on_node_t *node, bool reset_clock) {
 }
 
 void on_node_on_rx_raw(on_node_t *node, const uint8_t *frame, size_t len, int64_t rx_local_ns) {
-    on_node_on_rx_raw_timed(node, frame, len, rx_local_ns, rx_local_ns);
+    on_node_on_rx_raw_timed_rssi(node, frame, len, rx_local_ns, rx_local_ns, 0);
 }
 
 void on_node_on_rx_raw_timed(on_node_t *node, const uint8_t *frame, size_t len,
                              int64_t rx_local_ns, int64_t act_rx_local_ns) {
+    on_node_on_rx_raw_timed_rssi(node, frame, len, rx_local_ns, act_rx_local_ns, 0);
+}
+
+void on_node_on_rx_raw_rssi(on_node_t *node, const uint8_t *frame, size_t len,
+                            int64_t rx_local_ns, int8_t rssi_dbm) {
+    on_node_on_rx_raw_timed_rssi(node, frame, len, rx_local_ns, rx_local_ns, rssi_dbm);
+}
+
+static void record_overheard_rssi(on_node_t *node, uint16_t src_id, int8_t rssi_dbm) {
+    if (!node || src_id == ON_SHORT_ID_UNASSIGNED || rssi_dbm >= 0 || rssi_dbm < -120) return;
+    if (node->role == ON_ROLE_G) {
+        if (node->on_rssi_observed) {
+            node->on_rssi_observed(node->rssi_obs_ctx, node->short_id, src_id, rssi_dbm);
+        }
+        return;
+    }
+    if (!node->rssi_report_enabled) return;
+    for (uint8_t i = 0u; i < node->rssi_obs_count; ++i) {
+        if (node->rssi_obs[i].short_id == src_id) {
+            node->rssi_obs[i].rssi_dbm = rssi_dbm;
+            return;
+        }
+    }
+    if (node->rssi_obs_count < 6u) {
+        node->rssi_obs[node->rssi_obs_count].short_id = src_id;
+        node->rssi_obs[node->rssi_obs_count].rssi_dbm = rssi_dbm;
+        node->rssi_obs_count++;
+    } else {
+        /* Overwrite oldest slot round-robin */
+        uint8_t idx = (uint8_t)(node->current_sf_seq % 6u);
+        node->rssi_obs[idx].short_id = src_id;
+        node->rssi_obs[idx].rssi_dbm = rssi_dbm;
+    }
+}
+
+void on_node_on_rx_raw_timed_rssi(on_node_t *node, const uint8_t *frame, size_t len,
+                                  int64_t rx_local_ns, int64_t act_rx_local_ns, int8_t rssi_dbm) {
     if (!node || !frame) return;
 
     on_mac_hdr_t hdr;
@@ -851,6 +888,11 @@ void on_node_on_rx_raw_timed(on_node_t *node, const uint8_t *frame, size_t len,
     /* Ignore own loopback */
     if (node->short_id != ON_SHORT_ID_UNASSIGNED && hdr.src_id == node->short_id) {
         return;
+    }
+
+    /* v7.0 Promiscuous RSSI capture BEFORE unicast destination filter (enables multi-anchor indoor positioning) */
+    if (rssi_dbm < 0 && hdr.src_id != ON_SHORT_ID_UNASSIGNED) {
+        record_overheard_rssi(node, hdr.src_id, rssi_dbm);
     }
 
     /* Fast L2 destination filter: skip unicast frames not addressed to us (except Backup_ID passive mirror) */
@@ -1318,12 +1360,25 @@ void on_node_on_rx_raw_timed(on_node_t *node, const uint8_t *frame, size_t len,
             bool is_uplink = (msg.bridge_type == ON_GW_MSG_TELEMETRY_UP ||
                               msg.bridge_type == ON_GW_MSG_BLE_NOTIFY_UP ||
                               msg.bridge_type == ON_GW_MSG_TOPO_REQ ||
-                              msg.bridge_type == ON_GW_MSG_MAC_REPORT);
+                              msg.bridge_type == ON_GW_MSG_MAC_REPORT ||
+                              msg.bridge_type == ON_GW_MSG_RSSI_REPORT);
             if (is_uplink) {
                 if (node->role == ON_ROLE_G) {
                     if (msg.bridge_type == ON_GW_MSG_TOPO_REQ) {
                         topo_queue_resp_pages(node, msg.origin_id);
                         emit_event(node, "TOPO_REQ_RX", msg.origin_id, (int64_t)node->current_sf_seq);
+                    } else if (msg.bridge_type == ON_GW_MSG_RSSI_REPORT && msg.payload_len >= 3u) {
+                        node->rx_slot_mask_this_sf |= (uint16_t)(1u << (hdr.slot_idx & 0x0Fu));
+                        on_peer_entry_t *pe_an = find_peer_by_id(node, hdr.src_id);
+                        if (pe_an) pe_an->last_seen_sf = node->current_sf_seq;
+                        if (node->on_rssi_observed) {
+                            for (uint8_t k = 0u; (uint8_t)(k + 3u) <= msg.payload_len; k = (uint8_t)(k + 3u)) {
+                                uint16_t tid = (uint16_t)(((uint16_t)msg.payload[k] |
+                                                          ((uint16_t)msg.payload[k + 1u] << 8)) & ON_SHORT_ID_MASK);
+                                int8_t rdbm = (int8_t)msg.payload[k + 2u];
+                                node->on_rssi_observed(node->rssi_obs_ctx, hdr.src_id, tid, rdbm);
+                            }
+                        }
                     } else if (msg.bridge_type == ON_GW_MSG_MAC_REPORT && msg.payload_len >= 6u) {
                         node->rx_slot_mask_this_sf |= (uint16_t)(1u << (hdr.slot_idx & 0x0Fu));
                         on_peer_entry_t *pe_sg = find_peer_by_id(node, hdr.src_id);
@@ -1920,6 +1975,41 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
                             goto tdma_slot_done;
                         }
                     }
+                }
+            }
+            /* v7.0: Anchor periodically flushes overheard peer RSSI batch in its own private D-TDMA slot (0 collisions!) */
+            if (node->rssi_report_enabled && !node->harq_retry_pending &&
+                node->tdma_tx_total > 0u && node->rssi_obs_count > 0u &&
+                (node->current_sf_seq - node->last_rssi_rep_sf) >= 64u) {
+                on_gw_bridge_msg_t rrep;
+                memset(&rrep, 0, sizeof(rrep));
+                rrep.bridge_type = (uint8_t)ON_GW_MSG_RSSI_REPORT;
+                rrep.origin_id   = node->short_id;
+                rrep.seq         = ++node->data_tx_seq;
+                uint8_t out_n = 0u;
+                for (uint8_t ri = 0u; ri < node->rssi_obs_count && out_n + 3u <= ON_GW_MAX_PAYLOAD_LEN; ++ri) {
+                    rrep.payload[out_n++] = (uint8_t)(node->rssi_obs[ri].short_id & 0xFFu);
+                    rrep.payload[out_n++] = (uint8_t)((node->rssi_obs[ri].short_id >> 8) & 0x0Fu);
+                    rrep.payload[out_n++] = (uint8_t)node->rssi_obs[ri].rssi_dbm;
+                }
+                rrep.payload_len = out_n;
+                uint8_t rbuf[ON_GW_BRIDGE_HDR_LEN + 24u];
+                size_t rlen = 0u;
+                if (out_n >= 3u && on_gw_bridge_pack(&rrep, rbuf, sizeof(rbuf), &rlen) == ON_OK) {
+                    on_mac_hdr_t hdr;
+                    memset(&hdr, 0, sizeof(hdr));
+                    hdr.version    = ON_PROTO_VERSION;
+                    hdr.type       = (uint8_t)ON_FRAME_GW_BRIDGE;
+                    hdr.is_sub_g   = false;
+                    hdr.src_id     = node->short_id;
+                    hdr.dst_id     = node->parent_id;
+                    hdr.sf_seq_low = (uint8_t)(node->current_sf_seq & 0x0Fu);
+                    hdr.slot_idx   = node->my_slot;
+                    send_frame(node, &hdr, rbuf, rlen, now_local_ns);
+                    node->last_rssi_rep_sf = node->current_sf_seq;
+                    node->rssi_obs_count   = 0u;
+                    node->gw_tx_total++;
+                    goto tdma_slot_done;
                 }
             }
             on_data_payload_t dp;
@@ -2769,6 +2859,47 @@ uint16_t on_node_find_short_id_by_mac(const on_node_t *node, const uint8_t mac48
         }
     }
     return ON_SHORT_ID_UNASSIGNED;
+}
+
+bool on_node_find_mac_by_short_id(const on_node_t *node, uint16_t short_id, uint8_t mac_out[6]) {
+    if (!node || !mac_out || short_id == ON_SHORT_ID_UNASSIGNED) return false;
+    uint16_t sid = short_id & ON_SHORT_ID_MASK;
+    if ((node->short_id & ON_SHORT_ID_MASK) == sid && mac48_nonzero(node->mac48)) {
+        memcpy(mac_out, node->mac48, 6u);
+        return true;
+    }
+    for (uint32_t i = 0u; i < ON_MAX_CLUSTER_NODES; ++i) {
+        if (node->cluster_tbl[i].active &&
+            (node->cluster_tbl[i].short_id & ON_SHORT_ID_MASK) == sid &&
+            mac48_nonzero(node->cluster_tbl[i].mac48)) {
+            memcpy(mac_out, node->cluster_tbl[i].mac48, 6u);
+            return true;
+        }
+    }
+    for (uint32_t i = 0u; i < ON_MAX_NODES_TABLE; ++i) {
+        if (node->peers[i].active &&
+            (node->peers[i].short_id & ON_SHORT_ID_MASK) == sid &&
+            mac48_nonzero(node->peers[i].mac48)) {
+            memcpy(mac_out, node->peers[i].mac48, 6u);
+            return true;
+        }
+    }
+    return false;
+}
+
+void on_node_enable_rssi_anchor_report(on_node_t *node, bool enable) {
+    if (!node) return;
+    node->rssi_report_enabled = enable;
+    if (!enable) node->rssi_obs_count = 0u;
+}
+
+void on_node_set_rssi_observer(on_node_t *node,
+                               void (*cb)(void *ctx, uint16_t anchor_id,
+                                          uint16_t target_id, int8_t rssi_dbm),
+                               void *user_ctx) {
+    if (!node) return;
+    node->on_rssi_observed = cb;
+    node->rssi_obs_ctx     = user_ctx;
 }
 
 /* ========================================================================== */

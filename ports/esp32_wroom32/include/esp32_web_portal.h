@@ -58,7 +58,7 @@ th{color:var(--mut);font-weight:600;font-size:12px}
     <div class="brand">
       <h1>OpenNear</h1>
       <span class="badge" id="b-role">加载中...</span>
-      <span class="badge" id="b-fw">v6.9</span>
+      <span class="badge" id="b-fw">v7.0</span>
     </div>
     <div class="row">
       <input id="g-token" type="password" placeholder="Admin Token (如已设置)" style="width:185px" onchange="saveLocalToken()">
@@ -70,6 +70,7 @@ th{color:var(--mut);font-weight:600;font-size:12px}
 
   <div class="tabs">
     <button class="tab active" data-t="topo" onclick="switchTab('topo')">集群拓扑与数据</button>
+    <button class="tab" data-t="loc" onclick="switchTab('loc')">室内定位 / Tag 分组</button>
     <button class="tab" data-t="wifi" onclick="switchTab('wifi')">Wi-Fi / 云端配网</button>
     <button class="tab" data-t="mqtt" onclick="switchTab('mqtt')">MQTT / Home Assistant</button>
     <button class="tab" data-t="ctrl" onclick="switchTab('ctrl')">节点控制 / OTA / 安全</button>
@@ -86,9 +87,54 @@ th{color:var(--mut);font-weight:600;font-size:12px}
       </div>
       <div class="tbl-wrap">
         <table>
-          <thead><tr><th>Short-ID</th><th>节点名称 / MAC 地址</th><th>角色</th><th>跳数</th><th>父节点</th><th>时隙</th><th>同步偏差</th><th>收包</th><th>OTA</th><th>实时载荷 (Hex / ASCII)</th><th>操作</th></tr></thead>
+          <thead><tr><th>Short-ID</th><th>节点名称 / MAC / 标签</th><th>角色</th><th>跳数</th><th>父节点</th><th>时隙</th><th>同步偏差</th><th>收包</th><th>OTA</th><th>实时载荷 (Hex / ASCII)</th><th>操作</th></tr></thead>
           <tbody id="node-rows"><tr><td colspan="11" class="muted">正在拉取集群快照...</td></tr></tbody>
         </table>
+      </div>
+    </div>
+  </section>
+
+  <section id="p-loc" class="hide">
+    <div class="card">
+      <div class="row" style="justify-content:space-between;margin-bottom:8px">
+        <h2 style="margin:0">2D 室内定位平面图（多锚点 RSSI 三边解算 + 房间防抖）</h2>
+        <span class="muted mono" id="loc-meta">锚点=0 | 定位目标=0</span>
+      </div>
+      <div style="overflow-x:auto;background:#030712;border:1px solid var(--bd);border-radius:10px;padding:6px;margin-bottom:12px">
+        <svg id="loc-svg" width="100%" height="260" viewBox="0 0 880 260" style="display:block;min-width:520px"></svg>
+      </div>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>目标节点</th><th>MAC 地址</th><th>所在房间</th><th>估算坐标 (m)</th><th>最强 RSSI</th><th>参与锚点</th><th>估计误差</th></tr></thead>
+          <tbody id="loc-rows"><tr><td colspan="7" class="muted">先在下方添加 1~4 个固定锚点基站坐标，即可实时解算房间与坐标</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>动态配置固定定位锚点（Anchor，无需改代码，存 NVS 永久生效）</h2>
+      <div class="grid">
+        <div><label>锚点设备 MAC（可直接点选上方在线节点）</label><input id="a-mac" class="mono" placeholder="AA:BB:CC:DD:EE:FF"></div>
+        <div><label>所在房间名（留空并保存=移除锚点）</label><input id="a-room" placeholder="例如 客厅 / 卧室 / 书房"></div>
+        <div><label>X 坐标（米）</label><input id="a-x" type="number" step="0.1" value="0.0"></div>
+        <div><label>Y 坐标（米）</label><input id="a-y" type="number" step="0.1" value="0.0"></div>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button class="btn ok" onclick="saveAnchor()">保存 / 更新锚点</button>
+        <span class="muted">任意插电的 ESP32（网关或从机）都可作为锚点，自动通过私有时隙上报监听到的 RSSI</span>
+      </div>
+      <div id="anchor-pills" class="pills" style="margin-top:10px"></div>
+    </div>
+
+    <div class="card">
+      <h2>按分组 Tag 批量群控（无需记 Short-ID）</h2>
+      <div class="grid">
+        <div><label>目标分组 Tag（例如 客厅 或 照明）</label><input id="tg-name" placeholder="客厅"></div>
+        <div><label>下发指令载荷</label><input id="tg-pay" placeholder="例如 RELAY:1 或 MODE:STROBE"></div>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button class="btn" onclick="sendTagCmd()">按 Tag 群发指令</button>
+        <span class="muted">可在「集群拓扑」页点击任意节点的「标签」按钮随时动态贴标（逗号分隔多个 Tag）</span>
       </div>
     </div>
   </section>
@@ -216,7 +262,7 @@ function loadLocalToken(){
 }
 function switchTab(name){
   document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.t===name));
-  ['topo','wifi','mqtt','ctrl'].forEach(k=>$('p-'+k).classList.toggle('hide',k!==name));
+  ['topo','loc','wifi','mqtt','ctrl'].forEach(k=>$('p-'+k).classList.toggle('hide',k!==name));
 }
 function hexToAscii(h){
   if(!h||h.length<2)return '';
@@ -288,8 +334,13 @@ async function fetchStatus(){
   }catch(e){}
 }
 let gAliases={};
+let gTags={};
 async function fetchAliases(){
-  try{const r=await fetch('/api/aliases');gAliases=await r.json()||{};}catch(e){}
+  try{
+    const [r1,r2]=await Promise.all([fetch('/api/aliases'),fetch('/api/tags')]);
+    gAliases=await r1.json()||{};
+    gTags=await r2.json()||{};
+  }catch(e){}
 }
 async function renameNode(mac){
   if(!mac||mac==='--'||mac==='00:00:00:00:00:00'){toast('该节点暂未上报硬件 MAC',true);return;}
@@ -301,6 +352,110 @@ async function renameNode(mac){
     await fetchAliases();
     fetchData();
   }
+}
+async function editTags(mac){
+  if(!mac||mac==='--'||mac==='00:00:00:00:00:00'){toast('该节点暂未上报硬件 MAC',true);return;}
+  const cur=gTags[mac]||'';
+  const tags=prompt('为设备 '+mac+' 设置分组标签（多个用英文逗号分隔，如 客厅,照明；留空清除）：',cur);
+  if(tags===null)return;
+  if(await postCmd('TAG:'+mac+'|'+tags.trim())){
+    toast(tags.trim()?'已保存节点标签':'已清除节点标签');
+    await fetchAliases();
+    fetchData();
+  }
+}
+function fillAnchorForm(mac,room,xCm,yCm){
+  $('a-mac').value=mac||'';
+  if(room!==undefined)$('a-room').value=room;
+  if(xCm!==undefined)$('a-x').value=(xCm/100).toFixed(2);
+  if(yCm!==undefined)$('a-y').value=(yCm/100).toFixed(2);
+  switchTab('loc');
+  $('a-room').focus();
+}
+async function saveAnchor(){
+  const mac=$('a-mac').value.trim();
+  const room=$('a-room').value.trim();
+  const xCm=Math.round((parseFloat($('a-x').value)||0)*100);
+  const yCm=Math.round((parseFloat($('a-y').value)||0)*100);
+  if(!mac){toast('请填写锚点 MAC 地址',true);return;}
+  if(await postCmd('ANCHOR:'+mac+'|'+room+'|'+xCm+'|'+yCm)){
+    toast(room?('已保存锚点 '+room+' ('+(xCm/100).toFixed(1)+'m, '+(yCm/100).toFixed(1)+'m)'):'已移除该锚点');
+    setTimeout(fetchLocate,300);
+  }
+}
+async function sendTagCmd(){
+  const tg=$('tg-name').value.trim();
+  const pay=$('tg-pay').value.trim();
+  if(!tg||!pay){toast('请填写目标 Tag 与指令载荷',true);return;}
+  if(await postCmd('CMD_TAG:'+tg+'|'+pay)){
+    toast('已向标签 ['+tg+'] 下发群控指令: '+pay);
+  }
+}
+function renderLocateSvg(d){
+  const svg=$('loc-svg');
+  if(!svg)return;
+  const ancs=(d&&Array.isArray(d.anchors))?d.anchors:[];
+  const tgts=(d&&Array.isArray(d.targets))?d.targets:[];
+  $('loc-meta').textContent='锚点='+ancs.length+' | 定位目标='+tgts.length;
+  const ap=$('anchor-pills');
+  if(ap){
+    ap.innerHTML=ancs.length?ancs.map(a=>
+      '<span class="badge ok" style="cursor:pointer" onclick="fillAnchorForm(\''+esc(a.mac)+'\',\''+esc(a.room)+'\','+a.x_cm+','+a.y_cm+')">'
+      +'⚓ '+esc(a.room)+' ('+(a.x_cm/100).toFixed(1)+'m,'+(a.y_cm/100).toFixed(1)+'m)</span>'
+    ).join(''):'<span class="muted">暂未配置固定锚点（可在拓扑表中点击节点「设锚点」快速填入 MAC）</span>';
+  }
+  const tb=$('loc-rows');
+  if(tb){
+    tb.innerHTML=tgts.length?tgts.map(t=>{
+      const nm=(t.mac&&gAliases[t.mac])?gAliases[t.mac]:t.id;
+      return '<tr><td><b>'+esc(nm)+'</b></td><td class="mono muted">'+esc(t.mac)+'</td>'
+        +'<td><span class="badge ok">'+esc(t.room)+'</span></td>'
+        +'<td class="mono">('+(t.x_cm/100).toFixed(2)+', '+(t.y_cm/100).toFixed(2)+')</td>'
+        +'<td class="mono">'+t.rssi+' dBm</td><td>'+t.anchors+'</td>'
+        +'<td class="mono">±'+(t.err_cm/100).toFixed(2)+' m</td></tr>';
+    }).join(''):'<tr><td colspan="7" class="muted">暂无实时定位数据（添加至少 1 个在线节点为锚点后自动开始解算）</td></tr>';
+  }
+  if(!ancs.length&&!tgts.length){
+    svg.innerHTML='<text x="440" y="135" text-anchor="middle" fill="#64748b" font-size="13">配置 1~4 个固定锚点后，此处实时显示 2D 室内平面定位雷达</text>';
+    return;
+  }
+  const pts=ancs.concat(tgts);
+  let minX=0,maxX=600,minY=0,maxY=400;
+  pts.forEach(p=>{
+    if(p.x_cm-100<minX)minX=p.x_cm-100;
+    if(p.x_cm+100>maxX)maxX=p.x_cm+100;
+    if(p.y_cm-100<minY)minY=p.y_cm-100;
+    if(p.y_cm+100>maxY)maxY=p.y_cm+100;
+  });
+  const spanX=Math.max(200,maxX-minX),spanY=Math.max(200,maxY-minY);
+  const pad=42,W=880,H=260;
+  const sx=x=>Math.round(pad+((x-minX)/spanX)*(W-pad*2));
+  const sy=y=>Math.round(H-pad-((y-minY)/spanY)*(H-pad*2));
+  const out=[];
+  for(let gx=0;gx<=4;++gx){
+    const x=Math.round(pad+(gx/4)*(W-pad*2));
+    out.push('<line x1="'+x+'" y1="16" x2="'+x+'" y2="'+(H-22)+'" stroke="#1e293b" stroke-width="1"/>');
+  }
+  for(let gy=0;gy<=3;++gy){
+    const y=Math.round(16+(gy/3)*(H-38));
+    out.push('<line x1="'+pad+'" y1="'+y+'" x2="'+(W-pad)+'" y2="'+y+'" stroke="#1e293b" stroke-width="1"/>');
+  }
+  ancs.forEach(a=>{
+    const x=sx(a.x_cm),y=sy(a.y_cm);
+    out.push('<polygon points="'+x+','+(y-10)+' '+(x+9)+','+(y+8)+' '+(x-9)+','+(y+8)+'" fill="#0284c7" stroke="#38bdf8" stroke-width="1.5"/>');
+    out.push('<text x="'+x+'" y="'+(y+22)+'" text-anchor="middle" fill="#7dd3fc" font-size="11" font-weight="600">'+esc(a.room)+'</text>');
+  });
+  tgts.forEach(t=>{
+    const x=sx(t.x_cm),y=sy(t.y_cm);
+    const nm=(t.mac&&gAliases[t.mac])?gAliases[t.mac]:t.id;
+    out.push('<circle cx="'+x+'" cy="'+y+'" r="16" fill="#22c55e" fill-opacity="0.16" stroke="#22c55e" stroke-opacity="0.5" stroke-dasharray="3,2"/>');
+    out.push('<circle cx="'+x+'" cy="'+y+'" r="6" fill="#22c55e" stroke="#fff" stroke-width="1.5"/>');
+    out.push('<text x="'+x+'" y="'+(y-11)+'" text-anchor="middle" fill="#f8fafc" font-size="11" font-weight="600">'+esc(nm)+' ['+esc(t.room)+']</text>');
+  });
+  svg.innerHTML=out.join('');
+}
+async function fetchLocate(){
+  try{const r=await fetch('/api/locate');renderLocateSvg(await r.json());}catch(e){}
 }
 function renderTopoSvg(d){
   const svg=$('topo-svg');
@@ -366,10 +521,14 @@ async function fetchData(){
     tb.innerHTML=d.nodes.map(n=>{
       const asc=hexToAscii(n.data);
       const rCls=n.role==='G'?'ok':(n.role==='SUB_G'?'warn':'');
-      const al=n.mac&&gAliases[n.mac]?('<b>'+esc(gAliases[n.mac])+'</b><br>'):'';
+      const al=n.mac&&gAliases[n.mac]?('<b>'+esc(gAliases[n.mac])+'</b> '):'';
+      const tg=n.mac&&gTags[n.mac]?('<br><span class="badge" style="font-size:10.5px">'+esc(gTags[n.mac])+'</span>'):'';
       return '<tr>'
         +'<td class="mono"><b>'+esc(n.id)+'</b></td>'
-        +'<td class="mono">'+al+'<span class="muted">'+esc(n.mac||'--')+'</span> <button class="btn sec sm" style="padding:1px 6px" onclick="renameNode(\''+esc(n.mac||'')+'\')">改名</button></td>'
+        +'<td class="mono">'+al+'<span class="muted">'+esc(n.mac||'--')+'</span>'+tg+'<br>'
+          +'<button class="btn sec sm" style="padding:1px 6px;margin-top:3px" onclick="renameNode(\''+esc(n.mac||'')+'\')">改名</button> '
+          +'<button class="btn sec sm" style="padding:1px 6px;margin-top:3px" onclick="editTags(\''+esc(n.mac||'')+'\')">标签</button> '
+          +'<button class="btn sec sm" style="padding:1px 6px;margin-top:3px" onclick="fillAnchorForm(\''+esc(n.mac||'')+'\')">设锚点</button></td>'
         +'<td><span class="badge '+rCls+'">'+esc(n.role)+'</span></td>'
         +'<td>Hop '+n.hop+'</td>'
         +'<td class="mono">'+esc(n.parent)+'</td>'
@@ -519,7 +678,7 @@ async function rebootGw(){
     toast('网关正在重启，约 3 秒后自动恢复...');
   }
 }
-function refreshAll(){fetchStatus();fetchAliases().then(fetchData);}
+function refreshAll(){fetchStatus();fetchAliases().then(()=>{fetchData();fetchLocate();});}
 loadLocalToken();
 refreshAll();
 setInterval(refreshAll,3000);

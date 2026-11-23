@@ -25,6 +25,7 @@ static const uint8_t kOpenNearVendorTag[ON_VENDOR_TAG_LEN] = { 0x7Fu, 0x4Fu, 0x4
 
 typedef struct {
     uint16_t len;
+    int8_t   rssi_dbm;
     int64_t  rx_local_ns;
 #if defined(OPENNEAR_ACT_TRACE) || defined(OPENNEAR_ACT_CLOCK_BIAS_US)
     int64_t rx_callback_us;
@@ -155,6 +156,7 @@ static void IRAM_ATTR promiscuous_rx_cb(void *buf, wifi_promiscuous_pkt_type_t t
     }
 
     s_rx_ring[s_rx_head].len = (uint16_t)on_len;
+    s_rx_ring[s_rx_head].rssi_dbm = (int8_t)pkt->rx_ctrl.rssi;
 #if defined(OPENNEAR_ACT_TRACE) || defined(OPENNEAR_ACT_CLOCK_BIAS_US)
     s_rx_ring[s_rx_head].rx_callback_us = esp_timer_get_time();
 #endif
@@ -375,10 +377,10 @@ void on_esp32_hal_poll_rx(on_node_t *node) {
 #ifdef OPENNEAR_ACT_CLOCK_BIAS_US
         /* Same esp_timer domain as GPIO deadlines, without the baseband/callback
          * re-anchoring used by TDMA. The ACT filter absorbs variable RX delay. */
-        on_node_on_rx_raw_timed(node, slot->data, slot->len, slot->rx_local_ns,
-                                 slot->rx_callback_us * 1000LL);
+        on_node_on_rx_raw_timed_rssi(node, slot->data, slot->len, slot->rx_local_ns,
+                                      slot->rx_callback_us * 1000LL, slot->rssi_dbm);
 #else
-        on_node_on_rx_raw(node, slot->data, slot->len, slot->rx_local_ns);
+        on_node_on_rx_raw_rssi(node, slot->data, slot->len, slot->rx_local_ns, slot->rssi_dbm);
 #endif
 #ifdef OPENNEAR_ACT_TRACE
         if (node->sync_rx_total != sync_before) {

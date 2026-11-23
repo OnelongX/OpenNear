@@ -252,6 +252,17 @@ typedef struct {
     uint32_t          mesh_rx_total;
     uint32_t          mesh_tx_total;
     bool              self_mac_reported_to_g; /* v6.8: false after parent failover -> 1-shot MAC_REPORT */
+
+    /* v7.0: Real-time Anchor RSSI overhearing & zero-collision reporting to Primary G */
+    bool              rssi_report_enabled;
+    uint32_t          last_rssi_rep_sf;
+    uint8_t           rssi_obs_count;
+    struct {
+        uint16_t short_id;
+        int8_t   rssi_dbm;
+    } rssi_obs[6];
+    void (*on_rssi_observed)(void *ctx, uint16_t anchor_id, uint16_t target_id, int8_t rssi_dbm);
+    void             *rssi_obs_ctx;
 } on_node_t;
 
 /* Initialize node as Primary G coordinator or Unjoined Terminal */
@@ -291,6 +302,12 @@ void     on_node_on_rx_raw(on_node_t *node, const uint8_t *frame, size_t len, in
 void     on_node_on_rx_raw_timed(on_node_t *node, const uint8_t *frame, size_t len,
                                 int64_t rx_local_ns, int64_t act_rx_local_ns);
 
+/* v7.0: RSSI-aware RX entry points (rssi_dbm < 0 enables real-time multi-anchor indoor positioning) */
+void     on_node_on_rx_raw_rssi(on_node_t *node, const uint8_t *frame, size_t len,
+                                int64_t rx_local_ns, int8_t rssi_dbm);
+void     on_node_on_rx_raw_timed_rssi(on_node_t *node, const uint8_t *frame, size_t len,
+                                      int64_t rx_local_ns, int64_t act_rx_local_ns, int8_t rssi_dbm);
+
 /* Advance node state machine to current local_ns (called by timer interrupt or simulator) */
 void     on_node_step(on_node_t *node, int64_t now_local_ns);
 
@@ -328,6 +345,14 @@ size_t   on_node_format_cluster_json(const on_node_t *node, bool include_data,
                                      char *out_buf, size_t out_cap);
 /* v6.8: Resolve permanent hardware MAC48 -> current dynamic 12-bit Short-ID (0x000 if unknown) */
 uint16_t on_node_find_short_id_by_mac(const on_node_t *node, const uint8_t mac48[6]);
+
+/* v7.0: Reverse lookup Short-ID -> permanent MAC48 & Anchor RSSI reporting hooks */
+bool     on_node_find_mac_by_short_id(const on_node_t *node, uint16_t short_id, uint8_t mac_out[6]);
+void     on_node_enable_rssi_anchor_report(on_node_t *node, bool enable);
+void     on_node_set_rssi_observer(on_node_t *node,
+                                   void (*cb)(void *ctx, uint16_t anchor_id,
+                                              uint16_t target_id, int8_t rssi_dbm),
+                                   void *user_ctx);
 
 /* v6.0: Leaderless Auto-Boot, 256-Node Epoch-TDMA & 3~6-Hop Hybrid Mesh */
 void     on_node_enable_leaderless_boot(on_node_t *node, uint32_t base_timeout_ms);

@@ -3,6 +3,7 @@
 #include "esp32_ota_flash.h"
 #include "esp32_demo_app.h"
 #include "on_mqtt.h"
+#include "on_locate.h"
 #include <Arduino.h>
 #include <string.h>
 
@@ -77,6 +78,14 @@ void on_esp32_net_gw_factory_reset(void) {
         s_prefs.end();
     }
     if (s_prefs.begin("opennear_alias", false)) {
+        s_prefs.clear();
+        s_prefs.end();
+    }
+    if (s_prefs.begin("opennear_tag", false)) {
+        s_prefs.clear();
+        s_prefs.end();
+    }
+    if (s_prefs.begin("opennear_anch", false)) {
         s_prefs.clear();
         s_prefs.end();
     }
@@ -199,6 +208,155 @@ static void save_mac_alias(const uint8_t mac[6], const char *name) {
         strncpy(s_aliases[free_idx].name, name, sizeof(s_aliases[free_idx].name) - 1u);
         s_aliases[free_idx].name[sizeof(s_aliases[free_idx].name) - 1u] = '\0';
     }
+}
+
+/* v7.0 Dynamic MAC-anchored Node Tags (persisted in NVS "opennear_tag") & Indoor Positioning */
+#define ON_MAX_TAG_ENTRIES 24u
+typedef struct {
+    bool    used;
+    uint8_t mac48[6];
+    char    tags[32];
+} on_tag_entry_t;
+static on_tag_entry_t s_node_tags[ON_MAX_TAG_ENTRIES];
+static on_loc_ctx_t   s_loc;
+static bool           s_loc_inited = false;
+
+static const char *lookup_mac_tags(const uint8_t mac[6]) {
+    if (!mac || (mac[0] | mac[1] | mac[2] | mac[3] | mac[4] | mac[5]) == 0u) return nullptr;
+    for (uint32_t i = 0u; i < ON_MAX_TAG_ENTRIES; ++i) {
+        if (s_node_tags[i].used && memcmp(s_node_tags[i].mac48, mac, 6u) == 0) {
+            return s_node_tags[i].tags;
+        }
+    }
+    char key[13];
+    format_mac_key(mac, key);
+    if (s_prefs.begin("opennear_tag", true)) {
+        String val = s_prefs.getString(key, "");
+        s_prefs.end();
+        if (val.length() > 0) {
+            for (uint32_t i = 0u; i < ON_MAX_TAG_ENTRIES; ++i) {
+                if (!s_node_tags[i].used) {
+                    s_node_tags[i].used = true;
+                    memcpy(s_node_tags[i].mac48, mac, 6u);
+                    strncpy(s_node_tags[i].tags, val.c_str(), sizeof(s_node_tags[i].tags) - 1u);
+                    s_node_tags[i].tags[sizeof(s_node_tags[i].tags) - 1u] = '\0';
+                    return s_node_tags[i].tags;
+                }
+            }
+        }
+    }
+    return nullptr;
+}
+
+static void save_mac_tags(const uint8_t mac[6], const char *tags) {
+    if (!mac) return;
+    char key[13];
+    format_mac_key(mac, key);
+    bool clearing = (!tags || tags[0] == '\0');
+    if (s_prefs.begin("opennear_tag", false)) {
+        if (clearing) s_prefs.remove(key);
+        else s_prefs.putString(key, tags);
+        s_prefs.end();
+    }
+    int free_idx = -1;
+    for (uint32_t i = 0u; i < ON_MAX_TAG_ENTRIES; ++i) {
+        if (s_node_tags[i].used && memcmp(s_node_tags[i].mac48, mac, 6u) == 0) {
+            if (clearing) {
+                s_node_tags[i].used = false;
+                s_node_tags[i].tags[0] = '\0';
+            } else {
+                strncpy(s_node_tags[i].tags, tags, sizeof(s_node_tags[i].tags) - 1u);
+                s_node_tags[i].tags[sizeof(s_node_tags[i].tags) - 1u] = '\0';
+            }
+            return;
+        }
+        if (!s_node_tags[i].used && free_idx < 0) free_idx = (int)i;
+    }
+    if (!clearing && free_idx >= 0) {
+        s_node_tags[free_idx].used = true;
+        memcpy(s_node_tags[free_idx].mac48, mac, 6u);
+        strncpy(s_node_tags[free_idx].tags, tags, sizeof(s_node_tags[free_idx].tags) - 1u);
+        s_node_tags[free_idx].tags[sizeof(s_node_tags[free_idx].tags) - 1u] = '\0';
+    }
+}
+
+static bool mac_has_tag(const uint8_t mac[6], const char *needle) {
+    if (!needle || needle[0] == '\0') return false;
+    const char *csv = lookup_mac_tags(mac);
+    if (!csv || csv[0] == '\0') return false;
+    size_t nlen = strlen(needle);
+    const char *p = csv;
+    while (*p) {
+        while (*p == ',' || *p == ' ') ++p;
+        const char *start = p;
+        while (*p && *p != ',') ++p;
+        const char *end = p;
+        while (end > start && end[-1] == ' ') --end;
+        if ((size_t)(end - start) == nlen && memcmp(start, needle, nlen) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void save_anchors_to_nvs(void) {
+    if (!s_prefs.begin("opennear_anch", false)) return;
+    s_prefs.clear();
+    uint32_t slot = 0u;
+    for (uint32_t i = 0u; i < ON_LOC_MAX_ANCHORS; ++i) {
+        if (!s_loc.anchors[i].active) continue;
+        char k[8], v[64], mhex[13];
+        format_mac_key(s_loc.anchors[i].mac48, mhex);
+        snprintf(k, sizeof(k), "a%u", (unsigned)slot++);
+        snprintf(v, sizeof(v), "%s|%s|%ld|%ld", mhex, s_loc.anchors[i].room,
+                 (long)s_loc.anchors[i].x_cm, (long)s_loc.anchors[i].y_cm);
+        s_prefs.putString(k, v);
+    }
+    s_prefs.end();
+}
+
+static void load_anchors_from_nvs(void) {
+    if (!s_loc_inited) {
+        on_loc_init(&s_loc);
+        s_loc_inited = true;
+    }
+    if (!s_prefs.begin("opennear_anch", true)) return;
+    for (uint32_t i = 0u; i < ON_LOC_MAX_ANCHORS; ++i) {
+        char k[8];
+        snprintf(k, sizeof(k), "a%u", (unsigned)i);
+        String v = s_prefs.getString(k, "");
+        if (v.length() < 14) continue;
+        int b1 = v.indexOf('|');
+        int b2 = (b1 > 0) ? v.indexOf('|', b1 + 1) : -1;
+        int b3 = (b2 > 0) ? v.indexOf('|', b2 + 1) : -1;
+        if (b1 != 12 || b2 <= b1 || b3 <= b2) continue;
+        uint8_t mac[6];
+        bool ok = true;
+        for (int b = 0; b < 6; ++b) {
+            char hs[3] = { v[b * 2], v[b * 2 + 1], '\0' };
+            char *ep = nullptr;
+            unsigned long val = strtoul(hs, &ep, 16);
+            if (!ep || *ep != '\0') { ok = false; break; }
+            mac[b] = static_cast<uint8_t>(val & 0xFFu);
+        }
+        if (!ok) continue;
+        String room = v.substring(b1 + 1, b2);
+        int32_t x_cm = static_cast<int32_t>(v.substring(b2 + 1, b3).toInt());
+        int32_t y_cm = static_cast<int32_t>(v.substring(b3 + 1).toInt());
+        on_loc_set_anchor(&s_loc, mac, ON_SHORT_ID_UNASSIGNED, room.c_str(), x_cm, y_cm);
+    }
+    s_prefs.end();
+}
+
+/* Invoked on Core 1 under on_esp32_node_lock() whenever G hears or receives an Anchor RSSI report */
+static void esp32_on_rssi_observed_cb(void *ctx, uint16_t anchor_id,
+                                      uint16_t target_id, int8_t rssi_dbm) {
+    auto *node = static_cast<on_node_t *>(ctx);
+    if (!node || !s_loc_inited) return;
+    uint8_t amac[6] = {0}, tmac[6] = {0};
+    if (!on_node_find_mac_by_short_id(node, anchor_id, amac)) return;
+    if (!on_node_find_mac_by_short_id(node, target_id, tmac)) return;
+    on_loc_observe_rssi(&s_loc, amac, tmac, target_id, rssi_dbm, millis());
 }
 
 static void ensure_gateway_mac_ids(const on_node_t *node) {
@@ -376,6 +534,27 @@ static void esp32_mqtt_poll(on_node_t *node, on_gw_ctx_t *gw) {
                                               topic, sizeof(topic), payload, sizeof(payload))) {
                 esp32_mqtt_publish_cb(gw, topic, payload, false);
             }
+            /* v7.0: Publish Home Assistant device_tracker room presence when indoor position solved */
+            if (s_loc_inited && (cn->mac48[0] | cn->mac48[1] | cn->mac48[2] |
+                                 cn->mac48[3] | cn->mac48[4] | cn->mac48[5]) != 0u) {
+                on_loc_estimate_t est;
+                on_esp32_node_lock();
+                bool solved = on_loc_solve(&s_loc, cn->mac48, now_ms, &est);
+                on_esp32_node_unlock();
+                if (solved && est.room[0] != '\0') {
+                    char mhex[13];
+                    format_mac_key(cn->mac48, mhex);
+                    snprintf(topic, sizeof(topic), "homeassistant/device_tracker/opennear_loc_%s/config", mhex);
+                    snprintf(payload, sizeof(payload),
+                             "{\"name\":\"%s Location\",\"uniq_id\":\"opennear_loc_%s\","
+                             "\"stat_t\":\"opennear/loc/%s/room\",\"source_type\":\"router\","
+                             "\"dev\":{\"ids\":[\"opennear_%s\"]}}",
+                             alias ? alias : mhex, mhex, mhex, mhex);
+                    esp32_mqtt_publish_cb(gw, topic, payload, true);
+                    snprintf(topic, sizeof(topic), "opennear/loc/%s/room", mhex);
+                    esp32_mqtt_publish_cb(gw, topic, est.room, false);
+                }
+            }
         }
     }
 
@@ -538,7 +717,7 @@ static void start_local_http_api(void) {
 
         append_cstr(json, sizeof(json), &pos, "{\"role\":\"");
         append_cstr(json, sizeof(json), &pos, role_s);
-        snprintf(num, sizeof(num), "\",\"id\":\"0x%03X\",\"mac\":\"%s\",\"ble_mac\":\"%s\",\"sf\":%u,\"fw_ver\":\"v6.9\",\"uptime_s\":%u",
+        snprintf(num, sizeof(num), "\",\"id\":\"0x%03X\",\"mac\":\"%s\",\"ble_mac\":\"%s\",\"sf\":%u,\"fw_ver\":\"v7.0\",\"uptime_s\":%u",
                  (unsigned)short_id, mac_s, bmac_s, (unsigned)sf_seq, (unsigned)(millis() / 1000u));
         append_cstr(json, sizeof(json), &pos, num);
 
@@ -687,6 +866,51 @@ static void start_local_http_api(void) {
         }
         append_cstr(json, sizeof(json), &pos, "}");
         s_http_srv.send(200, "application/json", json);
+    });
+
+    s_http_srv.on("/api/tags", HTTP_GET, []() {
+        static char json[1024];
+        size_t pos = 0u;
+        json[0] = '\0';
+        append_cstr(json, sizeof(json), &pos, "{");
+        if (s_node_ref) {
+            on_cluster_snapshot_t snap;
+            on_esp32_node_lock();
+            on_node_get_cluster_snapshot(s_node_ref, &snap);
+            on_esp32_node_unlock();
+            for (uint8_t i = 0u; i < snap.active_count; ++i) {
+                lookup_mac_tags(snap.nodes[i].mac48);
+            }
+        }
+        bool first = true;
+        for (uint32_t i = 0u; i < ON_MAX_TAG_ENTRIES; ++i) {
+            if (!s_node_tags[i].used || s_node_tags[i].tags[0] == '\0') continue;
+            if (pos + 64u >= sizeof(json)) break;
+            if (!first) append_cstr(json, sizeof(json), &pos, ",");
+            first = false;
+            char mcol[28];
+            snprintf(mcol, sizeof(mcol), "\"%02X:%02X:%02X:%02X:%02X:%02X\":\"",
+                     (unsigned)s_node_tags[i].mac48[0], (unsigned)s_node_tags[i].mac48[1],
+                     (unsigned)s_node_tags[i].mac48[2], (unsigned)s_node_tags[i].mac48[3],
+                     (unsigned)s_node_tags[i].mac48[4], (unsigned)s_node_tags[i].mac48[5]);
+            append_cstr(json, sizeof(json), &pos, mcol);
+            append_json_escaped(json, sizeof(json), &pos, s_node_tags[i].tags);
+            append_cstr(json, sizeof(json), &pos, "\"");
+        }
+        append_cstr(json, sizeof(json), &pos, "}");
+        s_http_srv.send(200, "application/json", json);
+    });
+
+    s_http_srv.on("/api/locate", HTTP_GET, []() {
+        static char json[2048];
+        if (!s_loc_inited) {
+            s_http_srv.send(200, "application/json", "{\"anchors\":[],\"targets\":[]}");
+            return;
+        }
+        on_esp32_node_lock();
+        size_t n = on_loc_format_json(&s_loc, millis(), json, sizeof(json));
+        on_esp32_node_unlock();
+        s_http_srv.send(200, "application/json", (n > 0u) ? json : "{\"anchors\":[],\"targets\":[]}");
     });
 
     s_http_srv.on("/api/topology", HTTP_GET, []() {
@@ -1109,6 +1333,12 @@ void on_esp32_net_gw_start(on_node_t *node, on_gw_ctx_t *gw, const char *ble_nam
     if (node && gw) {
         on_node_attach_gateway(node, gw);
     }
+#ifdef OPENNEAR_ENABLE_WIFI_GW
+    load_anchors_from_nvs();
+    if (node) {
+        on_node_set_rssi_observer(node, esp32_on_rssi_observed_cb, node);
+    }
+#endif
 #ifdef OPENNEAR_ENABLE_BLE_GW
     /* Guarantee Wi-Fi modem sleep is enabled before starting BT controller under ESP-IDF SW coexist */
 #ifdef OPENNEAR_ENABLE_WIFI_GW
@@ -1287,6 +1517,63 @@ void on_esp32_net_gw_poll(on_node_t *node, on_gw_ctx_t *gw) {
                       (unsigned)gw->cfg.alias_mac[2], (unsigned)gw->cfg.alias_mac[3],
                       (unsigned)gw->cfg.alias_mac[4], (unsigned)gw->cfg.alias_mac[5],
                       gw->cfg.alias_name);
+    }
+
+    if (gw->cfg.tag_updated) {
+        gw->cfg.tag_updated = false;
+        save_mac_tags(gw->cfg.tag_mac, gw->cfg.tag_list);
+        Serial.printf("[OpenNear Tag] Tags updated for %02X:%02X:%02X:%02X:%02X:%02X -> '%s'\n",
+                      (unsigned)gw->cfg.tag_mac[0], (unsigned)gw->cfg.tag_mac[1],
+                      (unsigned)gw->cfg.tag_mac[2], (unsigned)gw->cfg.tag_mac[3],
+                      (unsigned)gw->cfg.tag_mac[4], (unsigned)gw->cfg.tag_mac[5],
+                      gw->cfg.tag_list);
+    }
+
+    if (gw->cfg.anchor_updated) {
+        gw->cfg.anchor_updated = false;
+        on_esp32_node_lock();
+        if (!s_loc_inited) { on_loc_init(&s_loc); s_loc_inited = true; }
+        uint16_t sid = node ? on_node_find_short_id_by_mac(node, gw->cfg.anchor_mac) : ON_SHORT_ID_UNASSIGNED;
+        on_loc_set_anchor(&s_loc, gw->cfg.anchor_mac, sid,
+                          gw->cfg.anchor_room, gw->cfg.anchor_x_cm, gw->cfg.anchor_y_cm);
+        on_esp32_node_unlock();
+        save_anchors_to_nvs();
+        Serial.printf("[OpenNear Locate] Anchor %02X:%02X:%02X:%02X:%02X:%02X -> room='%s' (%ld,%ld cm)\n",
+                      (unsigned)gw->cfg.anchor_mac[0], (unsigned)gw->cfg.anchor_mac[1],
+                      (unsigned)gw->cfg.anchor_mac[2], (unsigned)gw->cfg.anchor_mac[3],
+                      (unsigned)gw->cfg.anchor_mac[4], (unsigned)gw->cfg.anchor_mac[5],
+                      gw->cfg.anchor_room, (long)gw->cfg.anchor_x_cm, (long)gw->cfg.anchor_y_cm);
+    }
+
+    if (gw->cfg.cmd_tag_requested && node) {
+        gw->cfg.cmd_tag_requested = false;
+        on_cluster_snapshot_t snap;
+        on_esp32_node_lock();
+        on_node_get_cluster_snapshot(node, &snap);
+        on_esp32_node_unlock();
+        uint32_t sent_cnt = 0u;
+        for (uint8_t i = 0u; i < snap.active_count; ++i) {
+            const on_cluster_node_t *cn = &snap.nodes[i];
+            if (!mac_has_tag(cn->mac48, gw->cfg.cmd_tag)) continue;
+            if (cn->short_id == node->short_id) {
+                on_esp32_demo_on_cmd(gw->cfg.cmd_tag_payload, gw->cfg.cmd_tag_payload_len);
+                sent_cnt++;
+            } else {
+                on_esp32_node_lock();
+                if (node->mesh &&
+                    on_mesh_lookup_next_hop(node->mesh, cn->short_id) != ON_SHORT_ID_UNASSIGNED) {
+                    on_node_send_mesh_downlink(node, cn->short_id,
+                                               gw->cfg.cmd_tag_payload, gw->cfg.cmd_tag_payload_len);
+                } else {
+                    on_node_send_gw_downlink(node, cn->short_id, ON_GW_MSG_CLOUD_CMD_DOWN,
+                                             gw->cfg.cmd_tag_payload, gw->cfg.cmd_tag_payload_len);
+                }
+                on_esp32_node_unlock();
+                sent_cnt++;
+            }
+        }
+        Serial.printf("[OpenNear Tag] Group CMD tag='%s' -> dispatched to %u node(s)\n",
+                      gw->cfg.cmd_tag, (unsigned)sent_cnt);
     }
 
     if (connected && gw->cfg.ota_pull_requested) {

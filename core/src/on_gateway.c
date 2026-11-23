@@ -176,6 +176,23 @@ static const char *find_sep(const char *s, const char *end, char sep) {
     return NULL;
 }
 
+static bool parse_mac_span(const char *p, const char *end, uint8_t out_mac[6]) {
+    size_t nibs = 0u;
+    uint8_t cur = 0u;
+    for (const char *q = p; q < end; ++q) {
+        if (*q == ':' || *q == '-') continue;
+        int v = -1;
+        if (*q >= '0' && *q <= '9') v = *q - '0';
+        else if (*q >= 'A' && *q <= 'F') v = 10 + (*q - 'A');
+        else if (*q >= 'a' && *q <= 'f') v = 10 + (*q - 'a');
+        if (v < 0 || nibs >= 12u) return false;
+        if ((nibs & 1u) == 0u) cur = (uint8_t)(v << 4);
+        else out_mac[nibs >> 1] = (uint8_t)(cur | (uint8_t)v);
+        nibs++;
+    }
+    return nibs == 12u;
+}
+
 static bool consttime_eq(const char *a, const char *b, size_t n) {
     unsigned char diff = 0u;
     for (size_t i = 0u; i < n; ++i) {
@@ -393,23 +410,68 @@ on_err_t on_gw_handle_control_text(on_gw_ctx_t *gw, const char *text, size_t len
         const char *bar1 = find_sep(p1, end, '|');
         if (!bar1 || bar1 == p1) return ON_ERR_INVALID_ARG;
         uint8_t mac[6];
-        size_t nibs = 0u;
-        uint8_t cur = 0u;
-        for (const char *q = p1; q < bar1; ++q) {
-            if (*q == ':' || *q == '-') continue;
-            int v = -1;
-            if (*q >= '0' && *q <= '9') v = *q - '0';
-            else if (*q >= 'A' && *q <= 'F') v = 10 + (*q - 'A');
-            else if (*q >= 'a' && *q <= 'f') v = 10 + (*q - 'a');
-            if (v < 0 || nibs >= 12u) return ON_ERR_INVALID_ARG;
-            if ((nibs & 1u) == 0u) cur = (uint8_t)(v << 4);
-            else mac[nibs >> 1] = (uint8_t)(cur | (uint8_t)v);
-            nibs++;
-        }
-        if (nibs != 12u) return ON_ERR_INVALID_ARG;
+        if (!parse_mac_span(p1, bar1, mac)) return ON_ERR_INVALID_ARG;
         memcpy(gw->cfg.alias_mac, mac, 6u);
         copy_cstr(gw->cfg.alias_name, sizeof(gw->cfg.alias_name), bar1 + 1, (size_t)(end - (bar1 + 1)));
         gw->cfg.alias_updated = true;
+        return ON_OK;
+    }
+
+    /* Format 11: TAG:<MAC>|<tag1,tag2> -> Assign/clear dynamic metadata tags for a node */
+    if (clean_len > 4u && memcmp(text, "TAG:", 4u) == 0) {
+        const char *p1 = text + 4;
+        const char *bar1 = find_sep(p1, end, '|');
+        if (!bar1 || bar1 == p1) return ON_ERR_INVALID_ARG;
+        uint8_t mac[6];
+        if (!parse_mac_span(p1, bar1, mac)) return ON_ERR_INVALID_ARG;
+        memcpy(gw->cfg.tag_mac, mac, 6u);
+        copy_cstr(gw->cfg.tag_list, sizeof(gw->cfg.tag_list), bar1 + 1, (size_t)(end - (bar1 + 1)));
+        gw->cfg.tag_updated = true;
+        return ON_OK;
+    }
+
+    /* Format 12: CMD_TAG:<tag>|<payload> -> Group command to all nodes carrying <tag> */
+    if (clean_len > 8u && memcmp(text, "CMD_TAG:", 8u) == 0) {
+        const char *p1 = text + 8;
+        const char *bar1 = find_sep(p1, end, '|');
+        if (!bar1 || bar1 == p1) return ON_ERR_INVALID_ARG;
+        copy_cstr(gw->cfg.cmd_tag, sizeof(gw->cfg.cmd_tag), p1, (size_t)(bar1 - p1));
+        const char *p2 = bar1 + 1;
+        size_t plen = (size_t)(end - p2);
+        if (plen == 0u) return ON_ERR_INVALID_ARG;
+        if (plen > ON_GW_MAX_PAYLOAD_LEN) plen = ON_GW_MAX_PAYLOAD_LEN;
+        memcpy(gw->cfg.cmd_tag_payload, p2, plen);
+        gw->cfg.cmd_tag_payload_len = (uint8_t)plen;
+        gw->cfg.cmd_tag_requested   = true;
+        return ON_OK;
+    }
+
+    /* Format 13: ANCHOR:<MAC>|<room>|<x_cm>|<y_cm> (empty room removes anchor) */
+    if (clean_len > 7u && memcmp(text, "ANCHOR:", 7u) == 0) {
+        const char *p1 = text + 7;
+        const char *bar1 = find_sep(p1, end, '|');
+        if (!bar1 || bar1 == p1) return ON_ERR_INVALID_ARG;
+        uint8_t mac[6];
+        if (!parse_mac_span(p1, bar1, mac)) return ON_ERR_INVALID_ARG;
+        memcpy(gw->cfg.anchor_mac, mac, 6u);
+        const char *p2 = bar1 + 1;
+        const char *bar2 = find_sep(p2, end, '|');
+        copy_cstr(gw->cfg.anchor_room, sizeof(gw->cfg.anchor_room), p2,
+                  (size_t)((bar2 ? bar2 : end) - p2));
+        gw->cfg.anchor_x_cm = 0;
+        gw->cfg.anchor_y_cm = 0;
+        if (bar2) {
+            const char *p3 = bar2 + 1;
+            const char *bar3 = find_sep(p3, end, '|');
+            char nbuf[16];
+            copy_cstr(nbuf, sizeof(nbuf), p3, (size_t)((bar3 ? bar3 : end) - p3));
+            gw->cfg.anchor_x_cm = (int32_t)strtol(nbuf, NULL, 10);
+            if (bar3) {
+                copy_cstr(nbuf, sizeof(nbuf), bar3 + 1, (size_t)(end - (bar3 + 1)));
+                gw->cfg.anchor_y_cm = (int32_t)strtol(nbuf, NULL, 10);
+            }
+        }
+        gw->cfg.anchor_updated = true;
         return ON_OK;
     }
 
