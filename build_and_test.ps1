@@ -172,6 +172,7 @@ if ((Test-Path $xbin) -and (Test-Path $sdk)) {
     $espCpp = @(
         "$Root\ports\esp32_wroom32\src\act_capture.cpp",
         "$Root\ports\esp32_wroom32\src\esp32_ota_flash.cpp",
+        "$Root\ports\esp32_wroom32\src\esp32_tls_transport.cpp",
         "$Root\ports\esp32_wroom32\src\esp32_net_gateway.cpp",
         "$Root\ports\esp32_wroom32\src\main.cpp"
     )
@@ -182,7 +183,12 @@ if ((Test-Path $xbin) -and (Test-Path $sdk)) {
             -c $f @espInc -o $obj
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     }
-    Write-Host "  OK: Route C ESP32-WROOM-32 Xtensa cross-compilation passed (20/20 object files, incl. Mesh + MQTT/HA + OTA + Wi-Fi + BLE)." -ForegroundColor Green
+    # Verify optional MQTTS/HTTPS TLS module (-DOPENNEAR_ENABLE_TLS=1)
+    & xtensa-esp32-elf-g++ -std=gnu++11 -Os -Wall -Wextra -Werror -mlongcalls -fno-rtti -fno-exceptions `
+        -DOPENNEAR_ENABLE_OTA=1 -DOPENNEAR_ENABLE_WIFI_GW=1 -DOPENNEAR_ENABLE_BLE_GW=1 -DOPENNEAR_LEADERLESS_BOOT=1 -DOPENNEAR_ENABLE_TLS=1 `
+        -c "$Root\ports\esp32_wroom32\src\esp32_tls_transport.cpp" @espInc -o "$BuildDir\esp32_obj\esp32_tls_transport_tls.o"
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    Write-Host "  OK: Route C ESP32-WROOM-32 Xtensa cross-compilation passed (21/21 objs + optional MQTTS/TLS module)." -ForegroundColor Green
 } else {
     Write-Host "  SKIP: ESP32 Xtensa toolchain not found in default PlatformIO path." -ForegroundColor Yellow
 }

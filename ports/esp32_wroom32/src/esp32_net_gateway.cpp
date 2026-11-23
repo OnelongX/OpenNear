@@ -13,6 +13,7 @@
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
 #include "esp_wifi.h"
+#include "esp32_tls_transport.h"
 #include "esp32_web_portal.h"
 #endif
 
@@ -45,7 +46,7 @@ void on_esp32_node_unlock(void) {
 #ifdef OPENNEAR_ENABLE_WIFI_GW
 static Preferences s_prefs;
 static WebServer   s_http_srv(80);
-static WiFiClient  s_mqtt_tcp;
+static Client     *s_active_mqtt_cli    = nullptr;
 static bool        s_http_srv_started   = false;
 static bool        s_wifi_was_connected = false;
 static bool        s_ap_active          = false;
@@ -85,12 +86,14 @@ static void append_cstr(char *dst, size_t cap, size_t *pos, const char *s) {
 static on_err_t esp32_mqtt_publish_cb(void *ctx, const char *topic,
                                       const char *payload, bool retain) {
     (void)ctx;
-    if (!s_mqtt_tcp.connected() || !topic || !payload) return ON_ERR_NOT_READY;
+    if (!s_active_mqtt_cli || !s_active_mqtt_cli->connected() || !topic || !payload) {
+        return ON_ERR_NOT_READY;
+    }
     static uint8_t pkt[640];
     size_t n = on_mqtt_encode_publish(topic, reinterpret_cast<const uint8_t *>(payload),
                                       strlen(payload), retain, pkt, sizeof(pkt));
     if (n == 0u) return ON_ERR_TOO_LONG;
-    return (s_mqtt_tcp.write(pkt, n) == n) ? ON_OK : ON_ERR_NOT_READY;
+    return (s_active_mqtt_cli->write(pkt, n) == n) ? ON_OK : ON_ERR_NOT_READY;
 }
 
 static void esp32_mqtt_poll(on_node_t *node, on_gw_ctx_t *gw) {
@@ -100,38 +103,49 @@ static void esp32_mqtt_poll(on_node_t *node, on_gw_ctx_t *gw) {
     }
     if (gw->cfg.mqtt_creds_updated) {
         gw->cfg.mqtt_creds_updated = false;
-        if (s_mqtt_tcp.connected()) s_mqtt_tcp.stop();
+        on_esp32_tls_stop_mqtt_clients();
+        s_active_mqtt_cli = nullptr;
         s_mqtt_rxlen = 0u;
         if (s_prefs.begin("opennear_gw", false)) {
             s_prefs.putString("mhost", gw->cfg.mqtt_host);
             s_prefs.putUShort("mport", gw->cfg.mqtt_port);
             s_prefs.putString("muser", gw->cfg.mqtt_user);
             s_prefs.putString("mpass", gw->cfg.mqtt_pass);
+            s_prefs.putBool("mtls", gw->cfg.mqtt_use_tls);
             s_prefs.end();
         }
     }
 
+    Client *cli = on_esp32_tls_get_mqtt_client(gw->cfg.mqtt_use_tls);
+    if (!cli) {
+        gw->mqtt_connected = false;
+        s_active_mqtt_cli  = nullptr;
+        return; /* MQTTS requested, but firmware built without OPENNEAR_ENABLE_TLS=1 */
+    }
+    s_active_mqtt_cli = cli;
+
     uint32_t now_ms = millis();
-    if (!s_mqtt_tcp.connected()) {
+    if (!cli->connected()) {
         gw->mqtt_connected = false;
         s_mqtt_rxlen = 0u;
         if ((now_ms - s_last_mqtt_retry_ms) < 5000u) return;
         s_last_mqtt_retry_ms = now_ms;
-        uint16_t port = gw->cfg.mqtt_port ? gw->cfg.mqtt_port : 1883u;
-        if (s_mqtt_tcp.connect(gw->cfg.mqtt_host, port)) {
+        uint16_t port = gw->cfg.mqtt_port ? gw->cfg.mqtt_port : (gw->cfg.mqtt_use_tls ? 8883u : 1883u);
+        if (cli->connect(gw->cfg.mqtt_host, port)) {
             uint8_t cbuf[192];
             size_t clen = on_mqtt_encode_connect("opennear_gw", gw->cfg.mqtt_user,
                                                  gw->cfg.mqtt_pass, 30u, cbuf, sizeof(cbuf));
-            if (clen > 0u && s_mqtt_tcp.write(cbuf, clen) == clen) {
+            if (clen > 0u && cli->write(cbuf, clen) == clen) {
                 uint8_t sbuf[64];
                 size_t s1 = on_mqtt_encode_subscribe(1u, "opennear/cmd/#", sbuf, sizeof(sbuf));
-                if (s1 > 0u) s_mqtt_tcp.write(sbuf, s1);
+                if (s1 > 0u) cli->write(sbuf, s1);
                 size_t s2 = on_mqtt_encode_subscribe(2u, "opennear/ota/trigger", sbuf, sizeof(sbuf));
-                if (s2 > 0u) s_mqtt_tcp.write(sbuf, s2);
+                if (s2 > 0u) cli->write(sbuf, s2);
                 gw->mqtt_connected  = true;
                 s_last_mqtt_ping_ms = now_ms;
                 s_last_ha_pub_ms    = 0u;
-                Serial.printf("[OpenNear MQTT] Connected to %s:%u (HA Discovery + cmd/# armed)\n",
+                Serial.printf("[OpenNear MQTT] Connected to %s://%s:%u (HA Discovery + cmd/# armed)\n",
+                              gw->cfg.mqtt_use_tls ? "mqtts" : "mqtt",
                               gw->cfg.mqtt_host, (unsigned)port);
             }
         }
@@ -143,7 +157,7 @@ static void esp32_mqtt_poll(on_node_t *node, on_gw_ctx_t *gw) {
         s_last_mqtt_ping_ms = now_ms;
         uint8_t ping[2];
         on_mqtt_encode_pingreq(ping);
-        s_mqtt_tcp.write(ping, 2u);
+        cli->write(ping, 2u);
     }
 
     /* Periodically publish Home Assistant MQTT Auto-Discovery + full cluster topology every 15 s */
@@ -171,12 +185,12 @@ static void esp32_mqtt_poll(on_node_t *node, on_gw_ctx_t *gw) {
         }
     }
 
-    /* Drain inbound MQTT TCP stream cleanly across coalesced CONNACK/SUBACK/PINGRESP/PUBLISH packets */
-    while (s_mqtt_tcp.available() > 0 && s_mqtt_rxlen < sizeof(s_mqtt_rxbuf)) {
-        int avail = s_mqtt_tcp.available();
+    /* Drain inbound MQTT TCP/TLS stream cleanly across coalesced CONNACK/SUBACK/PINGRESP/PUBLISH packets */
+    while (cli->available() > 0 && s_mqtt_rxlen < sizeof(s_mqtt_rxbuf)) {
+        int avail = cli->available();
         size_t space = sizeof(s_mqtt_rxbuf) - s_mqtt_rxlen;
         size_t to_read = (static_cast<size_t>(avail) < space) ? static_cast<size_t>(avail) : space;
-        int n = s_mqtt_tcp.read(s_mqtt_rxbuf + s_mqtt_rxlen, to_read);
+        int n = cli->read(s_mqtt_rxbuf + s_mqtt_rxlen, to_read);
         if (n <= 0) break;
         s_mqtt_rxlen += static_cast<size_t>(n);
     }
@@ -283,7 +297,7 @@ static void start_local_http_api(void) {
 
         append_cstr(json, sizeof(json), &pos, "{\"role\":\"");
         append_cstr(json, sizeof(json), &pos, role_s);
-        snprintf(num, sizeof(num), "\",\"id\":\"0x%03X\",\"sf\":%u,\"fw_ver\":\"v6.3\",\"uptime_s\":%u",
+        snprintf(num, sizeof(num), "\",\"id\":\"0x%03X\",\"sf\":%u,\"fw_ver\":\"v6.4\",\"uptime_s\":%u",
                  (unsigned)short_id, (unsigned)sf_seq, (unsigned)(millis() / 1000u));
         append_cstr(json, sizeof(json), &pos, num);
 
@@ -309,9 +323,12 @@ static void start_local_http_api(void) {
         append_cstr(json, sizeof(json), &pos, num);
         append_json_escaped(json, sizeof(json), &pos, s_gw_ref ? s_gw_ref->cfg.mqtt_host : "");
 
-        snprintf(num, sizeof(num), "\",\"ble_ok\":%s,\"token_set\":%s}",
+        snprintf(num, sizeof(num), "\",\"ble_ok\":%s,\"token_set\":%s,\"tls_compiled\":%s,\"mqtt_tls\":%s,\"tls_ca_set\":%s}",
                  (s_gw_ref && s_gw_ref->ble_connected) ? "true" : "false",
-                 (s_gw_ref && s_gw_ref->cfg.admin_token[0] != '\0') ? "true" : "false");
+                 (s_gw_ref && s_gw_ref->cfg.admin_token[0] != '\0') ? "true" : "false",
+                 on_esp32_tls_is_compiled() ? "true" : "false",
+                 (s_gw_ref && s_gw_ref->cfg.mqtt_use_tls) ? "true" : "false",
+                 on_esp32_tls_has_ca() ? "true" : "false");
         append_cstr(json, sizeof(json), &pos, num);
 
         s_http_srv.send(200, "application/json", json);
@@ -385,6 +402,25 @@ static void start_local_http_api(void) {
         s_http_srv.send((rc == ON_OK) ? 200 : 400, "application/json",
                         (rc == ON_OK) ? "{\"ok\":true}" : "{\"ok\":false}");
     });
+    s_http_srv.on("/api/tls_ca", HTTP_POST, []() {
+        if (!s_gw_ref) { s_http_srv.send(503, "application/json", "{\"ok\":false}"); return; }
+        if (s_gw_ref->cfg.admin_token[0] != '\0') {
+            if (!s_http_srv.hasHeader("X-OpenNear-Token") ||
+                s_http_srv.header("X-OpenNear-Token") != String(s_gw_ref->cfg.admin_token)) {
+                s_http_srv.send(401, "application/json", "{\"ok\":false,\"error\":\"unauthorized\"}");
+                return;
+            }
+        }
+        if (!on_esp32_tls_is_compiled()) {
+            s_http_srv.send(501, "application/json", "{\"ok\":false,\"error\":\"tls_not_compiled\"}");
+            return;
+        }
+        String pem = s_http_srv.hasArg("plain") ? s_http_srv.arg("plain") : String("");
+        pem.trim();
+        on_err_t rc = on_esp32_tls_set_ca_pem(pem.c_str(), pem.length());
+        s_http_srv.send((rc == ON_OK) ? 200 : 400, "application/json",
+                        (rc == ON_OK) ? "{\"ok\":true}" : "{\"ok\":false}");
+    });
     s_http_srv.onNotFound([]() {
         if (s_ap_active) {
             s_http_srv.sendHeader("Location", "http://192.168.4.1/", true);
@@ -445,7 +481,7 @@ static on_err_t esp32_cloud_post_cb(void *ctx, const char *url, const char *json
     HTTPClient http;
     http.setConnectTimeout(1500);
     http.setTimeout(2000);
-    if (!http.begin(url)) return ON_ERR_NOT_READY;
+    if (!on_esp32_tls_http_begin(http, url)) return ON_ERR_NOT_READY;
     http.addHeader("Content-Type", "application/json");
     int code = http.POST(const_cast<uint8_t *>(reinterpret_cast<const uint8_t *>(json_body)),
                          strlen(json_body));
@@ -471,8 +507,8 @@ static void esp32_pull_http_ota(on_node_t *node, on_gw_ctx_t *gw) {
     HTTPClient http;
     http.setConnectTimeout(3000);
     http.setTimeout(5000);
-    if (!http.begin(gw->cfg.ota_url)) {
-        Serial.println("[OpenNear OTA] HTTP begin failed");
+    if (!on_esp32_tls_http_begin(http, gw->cfg.ota_url)) {
+        Serial.println("[OpenNear OTA] HTTP/HTTPS begin failed");
         return;
     }
     int code = http.GET();
@@ -677,6 +713,7 @@ void on_esp32_net_gw_preinit_wifi(on_gw_ctx_t *gw, const char *default_ssid,
         uint16_t mport   = s_prefs.getUShort("mport", 1883u);
         String nvs_muser = s_prefs.getString("muser", "");
         String nvs_mpass = s_prefs.getString("mpass", "");
+        bool nvs_mtls    = s_prefs.getBool("mtls", mport == 8883u);
         String nvs_tok   = s_prefs.getString("atoken", "");
         s_prefs.end();
         if (nvs_ssid.length() > 0)  ssid = nvs_ssid;
@@ -684,7 +721,8 @@ void on_esp32_net_gw_preinit_wifi(on_gw_ctx_t *gw, const char *default_ssid,
         if (nvs_url.length() > 0)   url  = nvs_url;
         if (nvs_mhost.length() > 0) {
             strncpy(gw->cfg.mqtt_host, nvs_mhost.c_str(), sizeof(gw->cfg.mqtt_host) - 1u);
-            gw->cfg.mqtt_port = mport;
+            gw->cfg.mqtt_port    = mport;
+            gw->cfg.mqtt_use_tls = nvs_mtls;
             strncpy(gw->cfg.mqtt_user, nvs_muser.c_str(), sizeof(gw->cfg.mqtt_user) - 1u);
             strncpy(gw->cfg.mqtt_pass, nvs_mpass.c_str(), sizeof(gw->cfg.mqtt_pass) - 1u);
         }
@@ -692,6 +730,7 @@ void on_esp32_net_gw_preinit_wifi(on_gw_ctx_t *gw, const char *default_ssid,
             on_gw_set_admin_token(gw, nvs_tok.c_str());
         }
     }
+    on_esp32_tls_init_from_nvs();
 #ifdef OPENNEAR_ADMIN_TOKEN
     if (gw->cfg.admin_token[0] == '\0') {
         on_gw_set_admin_token(gw, OPENNEAR_ADMIN_TOKEN);

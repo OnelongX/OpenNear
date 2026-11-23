@@ -287,9 +287,11 @@ on_err_t on_gw_handle_control_text(on_gw_ctx_t *gw, const char *text, size_t len
         return ON_OK;
     }
 
-    /* Format 5: MQTT:<host>|<port>[|<user>|<pass>] -> Configure MQTT / Home Assistant Broker */
-    if (clean_len > 5u && memcmp(text, "MQTT:", 5u) == 0) {
-        const char *p1 = text + 5;
+    /* Format 5: MQTT:<host>|<port>[|<user>|<pass>[|<tls:0|1>]] or MQTTS:<host>|<port>[|<user>|<pass>] */
+    if ((clean_len > 5u && memcmp(text, "MQTT:", 5u) == 0) ||
+        (clean_len > 6u && memcmp(text, "MQTTS:", 6u) == 0)) {
+        bool explicit_tls = (text[4] == 'S');
+        const char *p1 = text + (explicit_tls ? 6 : 5);
         const char *bar1 = find_sep(p1, end, '|');
         if (!bar1 || bar1 == p1) return ON_ERR_INVALID_ARG;
         copy_cstr(gw->cfg.mqtt_host, sizeof(gw->cfg.mqtt_host), p1, (size_t)(bar1 - p1));
@@ -298,7 +300,9 @@ on_err_t on_gw_handle_control_text(on_gw_ctx_t *gw, const char *text, size_t len
         char pbuf[16];
         copy_cstr(pbuf, sizeof(pbuf), p2, (size_t)((bar2 ? bar2 : end) - p2));
         unsigned long port = strtoul(pbuf, NULL, 10);
-        gw->cfg.mqtt_port = (port > 0u && port <= 65535u) ? (uint16_t)port : 1883u;
+        uint16_t def_port = explicit_tls ? 8883u : 1883u;
+        gw->cfg.mqtt_port    = (port > 0u && port <= 65535u) ? (uint16_t)port : def_port;
+        gw->cfg.mqtt_use_tls = explicit_tls || (gw->cfg.mqtt_port == 8883u);
         gw->cfg.mqtt_user[0] = '\0';
         gw->cfg.mqtt_pass[0] = '\0';
         if (bar2) {
@@ -307,7 +311,14 @@ on_err_t on_gw_handle_control_text(on_gw_ctx_t *gw, const char *text, size_t len
             copy_cstr(gw->cfg.mqtt_user, sizeof(gw->cfg.mqtt_user), p3, (size_t)((bar3 ? bar3 : end) - p3));
             if (bar3) {
                 const char *p4 = bar3 + 1;
-                copy_cstr(gw->cfg.mqtt_pass, sizeof(gw->cfg.mqtt_pass), p4, (size_t)(end - p4));
+                const char *bar4 = find_sep(p4, end, '|');
+                copy_cstr(gw->cfg.mqtt_pass, sizeof(gw->cfg.mqtt_pass), p4, (size_t)((bar4 ? bar4 : end) - p4));
+                if (bar4) {
+                    const char *p5 = bar4 + 1;
+                    if (p5 < end) {
+                        gw->cfg.mqtt_use_tls = (*p5 == '1' || *p5 == 't' || *p5 == 'T');
+                    }
+                }
             }
         }
         gw->cfg.mqtt_creds_updated = true;

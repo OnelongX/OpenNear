@@ -69,6 +69,7 @@ typedef struct {
     uint16_t mqtt_port;
     char     mqtt_user[32];
     char     mqtt_pass[32];
+    bool     mqtt_use_tls;     /* true = MQTTS over TLS (default port 8883), requires OPENNEAR_ENABLE_TLS=1 */
     char     admin_token[32];  /* Optional auth PIN/token for HTTP /api/cmd & BLE 0xFFE2 */
     uint16_t ota_target_id;
     uint32_t ota_target_ver;

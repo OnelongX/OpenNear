@@ -32,8 +32,8 @@ body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.5 -apple-system,B
 .card h2{margin:0 0 10px;font-size:15px;color:#fff}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}
 label{display:block;font-size:12px;color:var(--mut);margin:6px 0 4px}
-input,select{width:100%;padding:8px 10px;border-radius:8px;border:1px solid #374151;background:#030712;color:var(--tx);font-size:13px}
-input:focus,select:focus{outline:none;border-color:var(--acc)}
+input,select,textarea{width:100%;padding:8px 10px;border-radius:8px;border:1px solid #374151;background:#030712;color:var(--tx);font-size:13px}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--acc)}
 .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
 .btn{background:#0284c7;color:#fff;border:0;border-radius:8px;padding:8px 14px;font-weight:600;cursor:pointer;font-size:13px}
 .btn:hover{background:#0369a1}.btn.sec{background:#374151}.btn.sec:hover{background:#4b5563}.btn.ok{background:#15803d}.btn.danger{background:#b91c1c}
@@ -58,7 +58,7 @@ th{color:var(--mut);font-weight:600;font-size:12px}
     <div class="brand">
       <h1>OpenNear</h1>
       <span class="badge" id="b-role">加载中...</span>
-      <span class="badge" id="b-fw">v6.3</span>
+      <span class="badge" id="b-fw">v6.4</span>
     </div>
     <div class="row">
       <input id="g-token" type="password" placeholder="Admin Token (如已设置)" style="width:185px" onchange="saveLocalToken()">
@@ -112,15 +112,29 @@ th{color:var(--mut);font-weight:600;font-size:12px}
 
   <section id="p-mqtt" class="hide">
     <div class="card">
-      <h2>MQTT 3.1.1 与 Home Assistant 自动发现</h2>
+      <h2>MQTT 3.1.1 / MQTTS (TLS) 与 Home Assistant 自动发现</h2>
       <div class="grid">
         <div><label>Broker 主机 / IP</label><input id="m-host" placeholder="192.168.1.100 或 broker.emqx.io"></div>
-        <div><label>端口</label><input id="m-port" type="number" value="1883" min="1" max="65535"></div>
+        <div><label>端口（明文 1883 / TLS 8883）</label><input id="m-port" type="number" value="1883" min="1" max="65535"></div>
         <div><label>用户名（可选）</label><input id="m-user" placeholder="mqtt_user"></div>
         <div><label>密码（可选）</label><input id="m-pass" type="password" placeholder="mqtt_pass"></div>
       </div>
+      <div class="row" style="margin-top:10px">
+        <label style="display:flex;align-items:center;gap:6px;margin:0;color:var(--tx);cursor:pointer">
+          <input id="m-tls" type="checkbox" style="width:auto" onchange="onTlsToggle()"> 启用 MQTTS / TLS 加密（需烧录 esp32_iot_mesh_gw_tls）
+        </label>
+        <span class="badge" id="tls-state-badge">TLS 检查中...</span>
+      </div>
       <div class="row" style="margin-top:12px">
         <button class="btn ok" onclick="saveMqtt()">保存并连接 MQTT</button>
+      </div>
+      <div id="tls-ca-box" style="margin-top:14px;border-top:1px solid var(--bd);padding-top:10px">
+        <label>可选 Root CA 证书 PEM（用于 EMQX Cloud / AWS IoT / 阿里云 IoT 严格验签；留空回退开发模式）</label>
+        <textarea id="m-ca" rows="4" class="mono" placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----"></textarea>
+        <div class="row" style="margin-top:8px">
+          <button class="btn sec sm" onclick="saveTlsCa(false)">保存 Root CA 至 NVS</button>
+          <button class="btn sec sm" onclick="saveTlsCa(true)">清除 Root CA</button>
+        </div>
       </div>
       <div class="muted mono" style="margin-top:12px;line-height:1.7">
         HA 自动发现: homeassistant/sensor/opennear_&lt;ID&gt;/config<br>
@@ -228,16 +242,27 @@ async function fetchStatus(){
       :'<span class="badge warn">Wi-Fi 未连接</span>');
     if(s.ap_active)pills.push('<span class="badge">配网热点: '+esc(s.ap_ssid)+' (192.168.4.1)</span>');
     pills.push(s.mqtt_ok
-      ?'<span class="badge ok">MQTT 在线: '+esc(s.mqtt_host)+':'+s.mqtt_port+'</span>'
-      :'<span class="badge">MQTT: '+(s.mqtt_host?esc(s.mqtt_host)+' (重连中)':'未配置')+'</span>');
+      ?'<span class="badge ok">'+(s.mqtt_tls?'MQTTS':'MQTT')+' 在线: '+esc(s.mqtt_host)+':'+s.mqtt_port+'</span>'
+      :'<span class="badge">'+(s.mqtt_tls?'MQTTS':'MQTT')+': '+(s.mqtt_host?esc(s.mqtt_host)+' (重连中)':'未配置')+'</span>');
+    pills.push(s.tls_compiled
+      ?'<span class="badge ok">TLS 模块已启用'+(s.tls_ca_set?' (CA验签)':' (开发模式)')+'</span>'
+      :'<span class="badge">TLS 未编译(精简)</span>');
     pills.push(s.ble_ok?'<span class="badge ok">BLE 已连接</span>':'<span class="badge">BLE 待机</span>');
     pills.push(s.token_set?'<span class="badge ok">Token 保护已启用</span>':'<span class="badge warn">未设 Token</span>');
     pills.push('<span class="badge">运行 '+s.uptime_s+'s</span>');
     $('status-pills').innerHTML=pills.join('');
+    const tb=$('tls-state-badge');
+    if(tb){
+      tb.className='badge '+(s.tls_compiled?'ok':'warn');
+      tb.textContent=s.tls_compiled?(s.tls_ca_set?'TLS已编译 · Root CA 严格验签':'TLS已编译 · 无CA开发模式'):'当前固件未编译 TLS 模块';
+    }
     if(!$('w-ssid').value&&s.wifi_ssid)$('w-ssid').value=s.wifi_ssid;
     if(!$('w-url').value&&s.cloud_url)$('w-url').value=s.cloud_url;
-    if(!$('m-host').value&&s.mqtt_host)$('m-host').value=s.mqtt_host;
-    if(s.mqtt_port&&$('m-port').value==='1883')$('m-port').value=String(s.mqtt_port);
+    if(!$('m-host').value&&s.mqtt_host){
+      $('m-host').value=s.mqtt_host;
+      $('m-tls').checked=!!s.mqtt_tls;
+      if(s.mqtt_port)$('m-port').value=String(s.mqtt_port);
+    }
   }catch(e){}
 }
 async function fetchData(){
@@ -309,18 +334,39 @@ async function saveWifi(){
     setTimeout(fetchStatus,2500);
   }
 }
+function onTlsToggle(){
+  const tls=$('m-tls').checked;
+  const p=$('m-port').value.trim();
+  if(tls&&(p===''||p==='1883'))$('m-port').value='8883';
+  if(!tls&&p==='8883')$('m-port').value='1883';
+}
 async function saveMqtt(){
   const host=$('m-host').value.trim();
-  const port=$('m-port').value.trim()||'1883';
+  const tls=$('m-tls').checked;
+  const port=$('m-port').value.trim()||(tls?'8883':'1883');
   const user=$('m-user').value.trim();
   const pass=$('m-pass').value;
   if(!host){toast('请填写 MQTT Broker 地址',true);return;}
-  let cmd='MQTT:'+host+'|'+port;
-  if(user)cmd+='|'+user+'|'+pass;
+  let cmd=(tls?'MQTTS:':'MQTT:')+host+'|'+port;
+  if(user||!tls)cmd+='|'+user+'|'+pass+'|'+(tls?'1':'0');
   if(await postCmd(cmd)){
-    toast('MQTT 配置已保存，正在连接 Broker...');
+    toast((tls?'MQTTS (TLS)':'MQTT')+' 配置已保存，正在连接 Broker...');
     setTimeout(fetchStatus,2500);
   }
+}
+async function saveTlsCa(clearOnly){
+  const pem=clearOnly?'':$('m-ca').value.trim();
+  const hdr={'Content-Type':'text/plain'};
+  const tok=$('g-token').value.trim();
+  if(tok)hdr['X-OpenNear-Token']=tok;
+  const r=await fetch('/api/tls_ca',{method:'POST',headers:hdr,body:pem});
+  const j=await r.json().catch(()=>({ok:false}));
+  if(r.status===401){toast('鉴权失败：请在右上角填写 Admin Token',true);return;}
+  if(r.status===501){toast('当前固件未启用 OPENNEAR_ENABLE_TLS=1，请烧录 esp32_iot_mesh_gw_tls',true);return;}
+  if(!r.ok||!j.ok){toast('Root CA 格式无效（需包含 BEGIN CERTIFICATE）',true);return;}
+  if(clearOnly)$('m-ca').value='';
+  toast(clearOnly?'Root CA 已清除':'Root CA 证书已保存至 NVS，TLS 严格验签已启用');
+  fetchStatus();
 }
 async function sendNodeCmd(){
   const id=$('c-id').value.trim().replace(/^0x/i,'')||'FFF';

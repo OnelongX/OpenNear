@@ -2217,9 +2217,44 @@ static void test_independent_act_clock(void) {
            !filtered.act_lookahead.pending, "Primary reboot invalidates prior ACT clock and plan");
 }
 
+/* ========================================================================== */
+/* Test 34: v6.4 Optional MQTTS / TLS Cloud Configuration & Switching         */
+/* ========================================================================== */
+static void test_v64_optional_mqtts_tls_config(void) {
+    printf("[TEST 34] v6.4 Optional MQTTS/TLS Config (MQTTS: shorthand + port 8883 auto-TLS + explicit flag)...\n");
+    on_gw_ctx_t gw;
+    on_gw_init(&gw, ON_GW_MODE_WIFI_AND_BLE, NULL);
+
+    /* 1. Plain MQTT on 1883 */
+    EXPECT(on_gw_handle_control_text(&gw, "MQTT:192.168.1.10|1883|ha|sec", 29u, false) == ON_OK &&
+           !gw.cfg.mqtt_use_tls && gw.cfg.mqtt_port == 1883u &&
+           strcmp(gw.cfg.mqtt_host, "192.168.1.10") == 0,
+           "Plain MQTT on port 1883 keeps mqtt_use_tls=false");
+
+    /* 2. Auto-TLS when port 8883 is selected */
+    EXPECT(on_gw_handle_control_text(&gw, "MQTT:broker.emqx.io|8883|u1|p1", 30u, true) == ON_OK &&
+           gw.cfg.mqtt_use_tls && gw.cfg.mqtt_port == 8883u,
+           "MQTT on standard TLS port 8883 automatically enables mqtt_use_tls=true");
+
+    /* 3. Explicit MQTTS: shorthand (defaults to 8883 when port=0) */
+    EXPECT(on_gw_handle_control_text(&gw, "MQTTS:a1.iot.aws.com|0|dev|tok", 30u, false) == ON_OK &&
+           gw.cfg.mqtt_use_tls && gw.cfg.mqtt_port == 8883u &&
+           strcmp(gw.cfg.mqtt_host, "a1.iot.aws.com") == 0,
+           "MQTTS: shorthand forces TLS and defaults port to 8883");
+
+    /* 4. Explicit TLS override on custom port (|1 and |0) */
+    EXPECT(on_gw_handle_control_text(&gw, "MQTT:cloud.example.com|443|u|p|1", 32u, false) == ON_OK &&
+           gw.cfg.mqtt_use_tls && gw.cfg.mqtt_port == 443u,
+           "Explicit trailing |1 enables MQTTS on custom port 443");
+    EXPECT(on_gw_handle_control_text(&gw, "MQTT:10.0.0.5|8883|||0", 22u, false) == ON_OK &&
+           !gw.cfg.mqtt_use_tls && gw.cfg.mqtt_port == 8883u,
+           "Explicit trailing |0 allows disabling TLS even on port 8883");
+    printf("    -> MQTT plain(1883) / auto-TLS(8883) / MQTTS shorthand / custom port TLS(443) all verified\n");
+}
+
 int main(void) {
     printf("============================================================\n");
-    printf("       OpenNear v6.2 Core Protocol Automated Test Suite     \n");
+    printf("       OpenNear v6.4 Core Protocol Automated Test Suite     \n");
     printf("============================================================\n");
 
     test_6byte_header_and_frame();
@@ -2256,6 +2291,7 @@ int main(void) {
     test_v61_audit_regressions();
     test_v62_deep_hardening_regressions();
     test_independent_act_clock();
+    test_v64_optional_mqtts_tls_config();
 
     printf("\n------------------------------------------------------------\n");
     printf("SUMMARY: %d passed, %d failed\n", g_tests_passed, g_tests_failed);
