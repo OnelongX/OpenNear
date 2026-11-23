@@ -64,9 +64,12 @@ powershell -ExecutionPolicy Bypass -File d:\AIOS\opennear\build_and_test.ps1
 进入 `ports/esp32_wroom32/`，使用 PlatformIO 分别烧录主控与从机（或全部烧录 `esp32_node_t`，将其中一块的 `GPIO4` 接地即可自动作为 Primary `G` 启动）：
 - 主控 G 节点：`pio run -e esp32_node_g -t upload`
 - 从机 T / Sub-G / Backup 节点：`pio run -e esp32_node_t -t upload`
-- **v6.0 万物互联全功能网关**（公网 Wi-Fi STA + HTTP `/api/topology` & `/api/data` + BLE GATT `0xFFE0` + MQTT/Home Assistant 自动发现 + A/B 分区 OTA + 无主冷启动）：
+- **v6.3 万物互联全功能网关**（公网 Wi-Fi STA + **内置免配网 Web 管理页** + HTTP `/api/status` & `/api/scan` & `/api/topology` & `/api/data` + BLE GATT `0xFFE0` + MQTT/Home Assistant 自动发现 + A/B 分区 OTA + 无主冷启动）：
   - 网关/主控：`pio run -d .\ports\esp32_wroom32 -e esp32_iot_mesh_gw -t upload`
   - OTA/BLE 终端：`pio run -d .\ports\esp32_wroom32 -e esp32_node_t_ota -t upload`
+  - **零配置内置 Web 配网与管理台**（存放在 Flash `PROGMEM`，零静态 RAM 占用）：
+    - 首次上电无 Wi-Fi 凭据（或 20 秒连不上路由器）时自动开启兜底热点 **`OpenNear-Setup-XXXX`**，手机/电脑连上后访问 **`http://192.168.4.1`** 即可扫描周边 Wi-Fi、填写密码并保存至 NVS；路由器连接成功后 5 秒自动关闭兜底热点，同一管理台继续在局域网 IP（`http://<ESP32_IP>/`）长期在线。
+    - 面板内置 4 大标签页：**集群拓扑与实时数据**（0~6 跳节点表 + Hex/ASCII 载荷解码 + 一键控制）、**Wi-Fi / 云端配网**（周边热点扫描）、**MQTT / Home Assistant 配置**、**节点下行控制 / 集群 OTA / Admin Token 安全管理**。
   - 蓝牙 `0xFFE2` / HTTP `POST /api/cmd` 支持指令：`WIFI:<ssid>|<pass>|<cloud_url>`、`MQTT:<host>|<port>|<user>|<pass>`、`TOKEN:<new_token>`、`OTA:<target_hex>|<ver>|<http_url>`、`CMD:<target_hex>|<payload>`、`TOPO?`、`DATA?`（开启 `OPENNEAR_ADMIN_TOKEN` 或 `TOKEN:` 后自动要求 `AUTH:<token>|...` 或 HTTP Header `X-OpenNear-Token`）。
 - 节点使用 `GPIO2` 输出超帧中的 ACT 动作；串口 `115200` 下可查看角色、同步帧接收量、上行收发计数和接管次数。
 - ESP32 的原始 Wi-Fi 发送由驱动排队，提交成功不代表已经发射，且没有可用于此端口 RTT 校准的实际发射时间戳。因此这个端口不启用空口 RTT 校准或基于提交时间的 PTP 跟进修正，备用节点须同时满足连续漏收至少 12 帧和本地时钟计时至少 150 ms 未收到有效同步帧才接管；仿真和其他端口默认仍为 3 帧，无额外时长门槛。GPIO 对齐精度需用示波器或逻辑分析仪独立测量。
