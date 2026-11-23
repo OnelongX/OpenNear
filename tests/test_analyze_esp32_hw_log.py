@@ -70,10 +70,21 @@ class AnalyzeEsp32HwLogTests(unittest.TestCase):
     def test_failover_hw_regex_matches_v3_and_v62(self):
         pat = failover_hw.PATTERNS[0]
         m3 = pat.search("[OpenNear v3.0] SF=100 role=1 id=0x001 hop=0 slot=0")
-        m6 = pat.search("[OpenNear v6.2] SF=200 role=2 id=0x004 hop=1 slot=2")
+        m6 = pat.search("[OpenNear v6.5] SF=200 role=2 id=0x004 hop=1 slot=2")
         self.assertIsNotNone(m3)
         self.assertIsNotNone(m6)
         self.assertEqual(m6.groups(), ("200", "2", "0x004"))
+
+    def test_coex_modem_sleep_abort_detected(self):
+        lines = [
+            "0000.100 [OpenNear Portal] SoftAP 'OpenNear-Setup-1234' active -> connect & open http://192.168.4.1",
+            "0000.250 Error! Should enable WiFi modem sleep when both WiFi and Bluetooth are enabled!!!!!!",
+            "0000.255 abort() was called at PC 0x40123456 on core 0",
+        ]
+        s = hwlog.parse_log_lines(lines, "coex_crash.log").summarize()
+        codes = {f["code"] for f in s["findings"]}
+        self.assertIn("FATAL_CRASH", codes)
+        self.assertGreaterEqual(s["fatal_count"], 2)
 
 
 if __name__ == "__main__":

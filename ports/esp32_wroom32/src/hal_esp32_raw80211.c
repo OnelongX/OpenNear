@@ -311,7 +311,14 @@ on_err_t on_esp32_hal_init(const on_esp32_cfg_t *cfg, on_hal_ops_t *hal_out) {
         /* Even when sharing public Wi-Fi STA, lock raw 802.11 TX frames to 54 Mbps OFDM */
         esp_wifi_config_80211_tx_rate(WIFI_IF_STA, WIFI_PHY_RATE_54M);
     }
+#ifdef OPENNEAR_ENABLE_BLE_GW
+    /* ESP-IDF SW Wi-Fi/BLE coexistence (CONFIG_SW_COEXIST_ENABLE=1) strictly requires
+     * Wi-Fi modem sleep enabled (WIFI_PS_MIN_MODEM); setting WIFI_PS_NONE triggers an
+     * immediate abort() in libcoexist/libpp once BLE starts. */
+    if (esp_wifi_set_ps(WIFI_PS_MIN_MODEM) != ESP_OK) return ON_ERR_NOT_READY;
+#else
     if (esp_wifi_set_ps(WIFI_PS_NONE) != ESP_OK) return ON_ERR_NOT_READY;
+#endif
     esp_wifi_get_mac(WIFI_IF_STA, s_mac48);
 
     wifi_promiscuous_filter_t filt;

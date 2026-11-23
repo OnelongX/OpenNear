@@ -23,6 +23,8 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include "esp_bt.h"
+#include "esp_bt_main.h"
 #endif
 
 static on_gw_ctx_t      *s_gw_ref     = nullptr;
@@ -60,6 +62,15 @@ static uint32_t    s_last_mqtt_ping_ms  = 0u;
 static uint32_t    s_last_ha_pub_ms     = 0u;
 static uint8_t     s_mqtt_rxbuf[512];
 static size_t      s_mqtt_rxlen         = 0u;
+
+static void apply_wifi_coex_ps(void) {
+#ifdef OPENNEAR_ENABLE_BLE_GW
+    /* ESP-IDF SW Wi-Fi/BLE coexistence requires WIFI_PS_MIN_MODEM; WIFI_PS_NONE aborts! */
+    WiFi.setSleep(WIFI_PS_MIN_MODEM);
+#else
+    WiFi.setSleep(WIFI_PS_NONE);
+#endif
+}
 
 static void append_json_escaped(char *dst, size_t cap, size_t *pos, const char *src) {
     if (!dst || !pos || !src || *pos >= cap) return;
@@ -346,33 +357,48 @@ static void start_local_http_api(void) {
 
     s_http_srv.on("/api/scan", HTTP_GET, []() {
         static char json[1536];
+        static wifi_ap_record_t recs[20];
         size_t pos = 0u;
         json[0] = '\0';
         append_cstr(json, sizeof(json), &pos, "[");
 
-        int n = WiFi.scanNetworks(false, false, false, 150);
-        int emitted = 0;
-        for (int i = 0; i < n && emitted < 15; ++i) {
-            String ssid = WiFi.SSID(i);
-            if (ssid.length() == 0) continue;
-            /* Deduplicate repeated BSSIDs with same SSID (keep strongest RSSI returned first) */
-            bool dup = false;
-            for (int j = 0; j < i; ++j) {
-                if (WiFi.SSID(j) == ssid) { dup = true; break; }
+        /* Use ESP-IDF default active scan timing (min=0, max=0) so Wi-Fi/BLE coexistence
+         * in libnet80211 never rejects the scan when Bluetooth is active. */
+        WiFi.enableSTA(true);
+        wifi_scan_config_t scfg;
+        memset(&scfg, 0, sizeof(scfg));
+        scfg.scan_type = WIFI_SCAN_TYPE_ACTIVE;
+        if (esp_wifi_scan_start(&scfg, true) == ESP_OK) {
+            uint16_t count = static_cast<uint16_t>(sizeof(recs) / sizeof(recs[0]));
+            if (esp_wifi_scan_get_ap_records(&count, recs) == ESP_OK) {
+                int emitted = 0;
+                for (uint16_t i = 0u; i < count && emitted < 15; ++i) {
+                    char ssid_buf[33];
+                    memcpy(ssid_buf, recs[i].ssid, 32u);
+                    ssid_buf[32] = '\0';
+                    if (ssid_buf[0] == '\0') continue;
+                    /* Deduplicate repeated BSSIDs with same SSID (keep strongest RSSI first) */
+                    bool dup = false;
+                    for (uint16_t j = 0u; j < i; ++j) {
+                        if (strncmp(reinterpret_cast<const char *>(recs[j].ssid), ssid_buf, 32u) == 0) {
+                            dup = true;
+                            break;
+                        }
+                    }
+                    if (dup) continue;
+                    if (pos + 96u >= sizeof(json)) break;
+                    if (emitted > 0) append_cstr(json, sizeof(json), &pos, ",");
+                    append_cstr(json, sizeof(json), &pos, "{\"ssid\":\"");
+                    append_json_escaped(json, sizeof(json), &pos, ssid_buf);
+                    char tail[64];
+                    snprintf(tail, sizeof(tail), "\",\"rssi\":%d,\"ch\":%u,\"enc\":%d}",
+                             (int)recs[i].rssi, (unsigned)recs[i].primary,
+                             (recs[i].authmode == WIFI_AUTH_OPEN) ? 0 : 1);
+                    append_cstr(json, sizeof(json), &pos, tail);
+                    emitted++;
+                }
             }
-            if (dup) continue;
-            if (pos + 96u >= sizeof(json)) break;
-            if (emitted > 0) append_cstr(json, sizeof(json), &pos, ",");
-            append_cstr(json, sizeof(json), &pos, "{\"ssid\":\"");
-            append_json_escaped(json, sizeof(json), &pos, ssid.c_str());
-            char tail[64];
-            snprintf(tail, sizeof(tail), "\",\"rssi\":%d,\"ch\":%d,\"enc\":%d}",
-                     (int)WiFi.RSSI(i), (int)WiFi.channel(i),
-                     (WiFi.encryptionType(i) == WIFI_AUTH_OPEN) ? 0 : 1);
-            append_cstr(json, sizeof(json), &pos, tail);
-            emitted++;
         }
-        WiFi.scanDelete();
         append_cstr(json, sizeof(json), &pos, "]");
         s_http_srv.send(200, "application/json", json);
     });
@@ -450,7 +476,7 @@ static void start_softap_portal(void) {
     if (s_ap_active) return;
     /* Initialize Wi-Fi driver BEFORE reading factory MAC so SSID suffix is never 0000 */
     WiFi.mode(WIFI_AP_STA);
-    WiFi.setSleep(false);
+    apply_wifi_coex_ps();
     uint8_t mac[6] = {0};
     WiFi.macAddress(mac);
     snprintf(s_ap_ssid, sizeof(s_ap_ssid), "OpenNear-Setup-%02X%02X",
@@ -477,7 +503,7 @@ static on_err_t esp32_wifi_connect_cb(void *ctx, const char *ssid, const char *p
     save_wifi_nvs(ssid, pass ? pass : "", gw ? gw->cfg.cloud_url : "");
     /* Keep SoftAP alive while connecting so the phone portal receives HTTP 200 & live STA status */
     WiFi.mode(s_ap_active ? WIFI_AP_STA : WIFI_STA);
-    WiFi.setSleep(false);
+    apply_wifi_coex_ps();
     WiFi.begin(ssid, pass ? pass : "");
     s_sta_start_ms = millis();
     Serial.printf("[OpenNear GW] Connecting to public Wi-Fi SSID='%s'...\n", ssid);
@@ -759,7 +785,7 @@ void on_esp32_net_gw_preinit_wifi(on_gw_ctx_t *gw, const char *default_ssid,
     s_sta_start_ms = millis();
     if (ssid.length() > 0) {
         WiFi.mode(WIFI_STA);
-        WiFi.setSleep(false);
+        apply_wifi_coex_ps();
         WiFi.begin(ssid.c_str(), pass.c_str());
         Serial.printf("[OpenNear GW] Wi-Fi STA starting (SSID='%s')\n", ssid.c_str());
     } else {
@@ -780,7 +806,30 @@ void on_esp32_net_gw_start(on_node_t *node, on_gw_ctx_t *gw, const char *ble_nam
         on_node_attach_gateway(node, gw);
     }
 #ifdef OPENNEAR_ENABLE_BLE_GW
+    /* Guarantee Wi-Fi modem sleep is enabled before starting BT controller under ESP-IDF SW coexist */
+#ifdef OPENNEAR_ENABLE_WIFI_GW
+    apply_wifi_coex_ps();
+#endif
+    /* Start BT controller in BLE-only mode & release unused Classic BT DRAM (~36 KB saved for TLS/Web) */
+    if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_IDLE) {
+        esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
+        esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+        bt_cfg.mode = ESP_BT_MODE_BLE;
+        esp_err_t brc = esp_bt_controller_init(&bt_cfg);
+        if (brc == ESP_OK) {
+            brc = esp_bt_controller_enable(ESP_BT_MODE_BLE);
+        }
+        if (brc != ESP_OK) {
+            Serial.printf("[OpenNear BLE] Controller BLE-only start failed (rc=0x%x); Wi-Fi/Web gateway continues\n",
+                          (unsigned)brc);
+            return;
+        }
+    }
     BLEDevice::init(ble_name && ble_name[0] ? ble_name : "OpenNear-GW");
+    if (esp_bluedroid_get_status() != ESP_BLUEDROID_STATUS_ENABLED) {
+        Serial.println("[OpenNear BLE] Bluedroid enable failed (low heap); Wi-Fi/Web gateway continues");
+        return;
+    }
     BLEServer *srv = BLEDevice::createServer();
     srv->setCallbacks(new OpenNearBleServerCb());
     BLEService *svc = srv->createService(kBleSvcUuid);
@@ -797,8 +846,9 @@ void on_esp32_net_gw_start(on_node_t *node, on_gw_ctx_t *gw, const char *ble_nam
     adv->addServiceUUID(kBleSvcUuid);
     adv->setScanResponse(true);
     adv->start();
-    Serial.printf("[OpenNear BLE] GATT Bridge advertising as '%s' (Svc 0xFFE0)\n",
-                  ble_name && ble_name[0] ? ble_name : "OpenNear-GW");
+    Serial.printf("[OpenNear BLE] GATT Bridge advertising as '%s' (Svc 0xFFE0, heap=%u B)\n",
+                  ble_name && ble_name[0] ? ble_name : "OpenNear-GW",
+                  (unsigned)ESP.getFreeHeap());
 #else
     (void)ble_name;
 #endif
@@ -845,6 +895,7 @@ void on_esp32_net_gw_poll(on_node_t *node, on_gw_ctx_t *gw) {
         if (connected) {
             WiFi.softAPdisconnect(true);
             WiFi.mode(WIFI_STA);
+            apply_wifi_coex_ps();
             esp_wifi_config_80211_tx_rate(WIFI_IF_STA, WIFI_PHY_RATE_54M);
             s_ap_active = false;
             Serial.println("[OpenNear Portal] Fallback SoftAP closed; Web Portal stays live on LAN STA IP");

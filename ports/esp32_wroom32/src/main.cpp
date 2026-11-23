@@ -97,7 +97,7 @@ static void opennear_rt_task(void *arg) {
             last_log_ns = now_ns;
             uint32_t tx_accepted, tx_failed;
             on_esp32_hal_tx_counts(&tx_accepted, &tx_failed);
-            Serial.printf("[OpenNear v6.2] SF=%u role=%d id=0x%03X hop=%d slot=%u nco=%.2fppm rtt=%lldns harq=%u acts=%u\n",
+            Serial.printf("[OpenNear v6.5] SF=%u role=%d id=0x%03X hop=%d slot=%u nco=%.2fppm rtt=%lldns harq=%u acts=%u\n",
                           (unsigned)log_s.sf_seq,
                           log_s.role,
                           (unsigned)log_s.short_id,

@@ -66,6 +66,8 @@ FATAL_MARKERS = (
     "Brownout detector was triggered",
     "abort() was called",
     "HAL init failed",
+    "Should enable WiFi modem sleep",
+    "default active scan time parameter",
     "Backtrace:",
     "stack overflow",
 )
