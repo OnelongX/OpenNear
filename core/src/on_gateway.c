@@ -176,6 +176,14 @@ static const char *find_sep(const char *s, const char *end, char sep) {
     return NULL;
 }
 
+static bool consttime_eq(const char *a, const char *b, size_t n) {
+    unsigned char diff = 0u;
+    for (size_t i = 0u; i < n; ++i) {
+        diff |= (unsigned char)(a[i] ^ b[i]);
+    }
+    return diff == 0u;
+}
+
 on_err_t on_gw_handle_control_text(on_gw_ctx_t *gw, const char *text, size_t len, bool from_ble) {
     if (!gw || !text || len < 5u) return ON_ERR_INVALID_ARG;
     const char *end = text + len;
@@ -197,7 +205,7 @@ on_err_t on_gw_handle_control_text(on_gw_ctx_t *gw, const char *text, size_t len
             const char *bar = find_sep(tok_start, end, '|');
             size_t expect_len = strlen(gw->cfg.admin_token);
             if (!bar || (size_t)(bar - tok_start) != expect_len ||
-                memcmp(tok_start, gw->cfg.admin_token, expect_len) != 0) {
+                !consttime_eq(tok_start, gw->cfg.admin_token, expect_len)) {
                 return ON_ERR_DECODE_FAIL;
             }
             text      = bar + 1;
@@ -332,6 +340,20 @@ on_err_t on_gw_handle_control_text(on_gw_ctx_t *gw, const char *text, size_t len
         copy_cstr(tbuf, sizeof(tbuf), p1, (size_t)(end - p1));
         on_gw_set_admin_token(gw, tbuf);
         gw->cfg.admin_token_updated = true;
+        return ON_OK;
+    }
+
+    /* Format 7: RESET_WIFI -> Clear saved Wi-Fi STA credentials & reopen SoftAP setup portal */
+    if (clean_len == 10u && memcmp(text, "RESET_WIFI", 10u) == 0) {
+        gw->cfg.wifi_ssid[0] = '\0';
+        gw->cfg.wifi_pass[0] = '\0';
+        gw->cfg.wifi_reset_requested = true;
+        return ON_OK;
+    }
+
+    /* Format 8: REBOOT -> Trigger graceful gateway restart */
+    if (clean_len == 6u && memcmp(text, "REBOOT", 6u) == 0) {
+        gw->cfg.reboot_requested = true;
         return ON_OK;
     }
 

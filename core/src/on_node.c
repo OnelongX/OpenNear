@@ -330,7 +330,10 @@ static void topo_queue_resp_pages(on_node_t *node, uint16_t requester_id) {
                                    ((cn->role & 0x03u) << 4) |
                                    (cn->slot_idx & 0x0Fu));
             uint8_t dlen = (cn->last_data_len <= 4u) ? cn->last_data_len : 4u;
-            b[off + 4] = (uint8_t)(((cn->ota_state & 0x0Fu) << 4) | (dlen & 0x0Fu));
+            /* Bit 3 carries hop_depth bit2 (supporting 0..7 hops without growing wire record) */
+            b[off + 4] = (uint8_t)(((cn->ota_state & 0x0Fu) << 4) |
+                                   ((cn->hop_depth & 0x04u) << 1) |
+                                   (dlen & 0x07u));
             topo_put_u16(b + off + 5, (uint16_t)cn->last_skew_ns);
             b[off + 7] = (uint8_t)(cn->last_seq & 0xFFu);
             memset(b + off + 8, 0, 4u);
@@ -372,11 +375,11 @@ static void topo_ingest_resp_page(on_node_t *node, const on_gw_bridge_msg_t *msg
         if (cn) {
             cn->parent_id     = pid & ON_SHORT_ID_MASK;
             uint8_t packed    = b[off + 3];
-            cn->hop_depth     = (uint8_t)((packed >> 6) & 0x03u);
+            cn->hop_depth     = (uint8_t)(((packed >> 6) & 0x03u) | ((b[off + 4] & 0x08u) >> 1));
             cn->role          = (uint8_t)((packed >> 4) & 0x03u);
             cn->slot_idx      = (uint8_t)(packed & 0x0Fu);
             cn->ota_state     = (uint8_t)((b[off + 4] >> 4) & 0x0Fu);
-            cn->last_data_len = (uint8_t)(b[off + 4] & 0x0Fu);
+            cn->last_data_len = (uint8_t)(b[off + 4] & 0x07u);
             if (cn->last_data_len > 4u) cn->last_data_len = 4u;
             cn->last_skew_ns  = (int16_t)topo_get_u16(b + off + 5);
             cn->last_seq      = b[off + 7];
@@ -1379,9 +1382,18 @@ void on_node_on_rx_raw_timed(on_node_t *node, const uint8_t *frame, size_t len,
                         cn->last_seen_sf  = node->current_sf_seq;
                         cn->rx_packets++;
                         cn->last_seq      = mpkt.msg_id;
-                        cn->last_data_len = (mpkt.payload_len <= 8u) ? mpkt.payload_len : 8u;
-                        if (cn->last_data_len > 0u) {
-                            memcpy(cn->last_data, mpkt.payload, cn->last_data_len);
+                        if (mpkt.mesh_type == ON_MESH_TOPO_REPORT && mpkt.payload_len >= 6u) {
+                            memcpy(cn->mac48, mpkt.payload, 6u);
+                            uint8_t rem = (uint8_t)(mpkt.payload_len - 6u);
+                            if (rem > 0u) {
+                                cn->last_data_len = (rem <= 8u) ? rem : 8u;
+                                memcpy(cn->last_data, mpkt.payload + 6u, cn->last_data_len);
+                            }
+                        } else {
+                            cn->last_data_len = (mpkt.payload_len <= 8u) ? mpkt.payload_len : 8u;
+                            if (cn->last_data_len > 0u) {
+                                memcpy(cn->last_data, mpkt.payload, cn->last_data_len);
+                            }
                         }
                     }
                     if (node->gw) {
@@ -1516,6 +1528,20 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
                             node->subg_failover_count++;
                             emit_event(node, "SUBG_REELECTED", node->sub_g_id, (int64_t)node->current_sf_seq);
                         }
+                    }
+                }
+
+                /* v6.6 Multi-hop (2~6 hop) cluster table lease expiry GC (prevents ghost nodes) */
+                uint32_t multi_hop_timeout = (node->peer_lease_timeout_sf >= 100u)
+                                             ? (node->peer_lease_timeout_sf * 2u) : 200u;
+                for (uint32_t ci = 0u; ci < ON_MAX_CLUSTER_NODES; ++ci) {
+                    on_cluster_node_t *cn = &node->cluster_tbl[ci];
+                    if (!cn->active || cn->hop_depth < 2u) continue;
+                    if (node->current_sf_seq > cn->last_seen_sf &&
+                        (node->current_sf_seq - cn->last_seen_sf) > multi_hop_timeout) {
+                        cn->active = false;
+                        node->lease_reclaim_count++;
+                        emit_event(node, "CLUSTER_NODE_EXPIRED", cn->short_id, (int64_t)cn->hop_depth);
                     }
                 }
             }
@@ -2704,6 +2730,15 @@ void on_node_attach_mesh(on_node_t *node, on_mesh_ctx_t *mesh) {
 on_err_t on_node_send_mesh_uplink(on_node_t *node, const uint8_t *payload, uint8_t len) {
     if (!node || !node->mesh) return ON_ERR_NOT_READY;
     on_err_t rc = on_mesh_build_uplink(node->mesh, ON_MESH_DATA_UP, payload, len, &node->mesh_tx_pkt);
+    if (rc == ON_OK) {
+        node->mesh_tx_pending = true;
+    }
+    return rc;
+}
+
+on_err_t on_node_send_mesh_topo_mac(on_node_t *node) {
+    if (!node || !node->mesh) return ON_ERR_NOT_READY;
+    on_err_t rc = on_mesh_build_uplink(node->mesh, ON_MESH_TOPO_REPORT, node->mac48, 6u, &node->mesh_tx_pkt);
     if (rc == ON_OK) {
         node->mesh_tx_pending = true;
     }

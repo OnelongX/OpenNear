@@ -38,8 +38,9 @@ uint8_t  on_esp32_hal_current_wifi_channel(void);
 /* Drain lock-free ISR RX ring buffer into the OpenNear node state machine */
 void     on_esp32_hal_poll_rx(on_node_t *node);
 
-/* Wi-Fi driver submissions; read from the same task as the protocol engine. */
+/* Wi-Fi driver submissions & RX ring overflow counter */
 void     on_esp32_hal_tx_counts(uint32_t *accepted, uint32_t *failed);
+uint32_t on_esp32_hal_rx_drops(void);
 
 #ifdef OPENNEAR_ACT_TRACE
 typedef struct {

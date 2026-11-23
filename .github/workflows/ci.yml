@@ -18,7 +18,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-arm-none-eabi binutils-arm-none-eabi libnewlib-arm-none-eabi
 
-      - name: Build & Run Core 33-Suite Automated Test Bench
+      - name: Build & Run Core 36-Suite Automated Test Bench
         run: |
           mkdir -p build
           gcc -std=c11 -O2 -Wall -Wextra -Werror \
@@ -60,3 +60,27 @@ jobs:
       - name: Run Python Real-Hardware Log Analyzer & GPIO Sync Unit Tests
         run: |
           python3 -m unittest -v tests/test_analyze_esp32_hw_log.py tests/test_measure_esp32_gpio_sync.py
+
+  build-esp32-firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python & PlatformIO
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache PlatformIO Packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: ${{ runner.os }}-pio-esp32-${{ hashFiles('ports/esp32_wroom32/platformio.ini') }}
+
+      - name: Install PlatformIO CLI
+        run: pip install -U platformio
+
+      - name: Link & Verify ESP32 Gateway (Plain + MQTTS/TLS) & OTA Terminal Firmwares
+        run: |
+          pio run -d ports/esp32_wroom32 -e esp32_iot_mesh_gw -e esp32_iot_mesh_gw_tls -e esp32_node_t_ota

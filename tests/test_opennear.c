@@ -2311,9 +2311,92 @@ static void test_v65_cluster_mac48_and_ha_identity(void) {
            g_mac, t4_mac, t8_mac);
 }
 
+/* ========================================================================== */
+/* Test 36: v6.6 Multi-Hop Ghost-Node GC, 3~6-Hop MAC48 & System Reset/Reboot */
+/* ========================================================================== */
+static void test_v66_multihop_gc_6hop_mac_and_system_cmds(void) {
+    printf("[TEST 36] v6.6 Multi-Hop Ghost-Node GC, 3~6-Hop MAC48 + 3-Bit Hop Depth & System Commands...\n");
+
+    /* 1. Verify 3~6-hop Mesh ON_MESH_TOPO_REPORT MAC48 ingestion & 3-bit hop_depth roundtrip */
+    sim_world_t w;
+    sim_world_init(&w, 0x66C12026ULL);
+    sim_world_setup_10node_demo(&w, true);
+    on_mesh_ctx_t g_mesh;
+    on_mesh_init(&g_mesh, ON_SHORT_ID_G_DEFAULT, 0u, ON_SHORT_ID_UNASSIGNED);
+    on_node_attach_mesh(&w.nodes[0], &g_mesh);
+    sim_world_run_us(&w, 120000, 10);
+
+    /* Inject a 5-hop Mesh TOPO_REPORT packet carrying permanent MAC48 into Primary G */
+    on_mesh_pkt_t mp;
+    memset(&mp, 0, sizeof(mp));
+    mp.mesh_type   = (uint8_t)ON_MESH_TOPO_REPORT;
+    mp.hop_count   = 5u;
+    mp.ttl         = 2u;
+    mp.src_id      = 0x305u;
+    mp.dst_id      = ON_SHORT_ID_G_DEFAULT;
+    mp.msg_id      = 77u;
+    mp.payload_len = 6u;
+    const uint8_t hop5_mac[6] = { 0xDEu, 0xADu, 0xBEu, 0xEFu, 0x05u, 0x06u };
+    memcpy(mp.payload, hop5_mac, 6u);
+    uint8_t mbuf[ON_MAX_PAYLOAD_LEN], frame[ON_MAX_FRAME_LEN];
+    size_t mlen = 0u, flen = 0u;
+    EXPECT(on_mesh_pkt_pack(&mp, mbuf, sizeof(mbuf), &mlen) == ON_OK, "Pack 5-hop Mesh TOPO_REPORT");
+    on_mac_hdr_t mhdr;
+    memset(&mhdr, 0, sizeof(mhdr));
+    mhdr.version    = ON_PROTO_VERSION;
+    mhdr.type       = (uint8_t)ON_FRAME_MESH;
+    mhdr.src_id     = 0x005u; /* 1-hop Sub-G relay */
+    mhdr.dst_id     = ON_SHORT_ID_G_DEFAULT;
+    mhdr.sf_seq_low = (uint8_t)(w.nodes[0].current_sf_seq & 0x0Fu);
+    mhdr.slot_idx   = 15u;
+    EXPECT(on_frame_pack(&mhdr, mbuf, mlen, frame, sizeof(frame), &flen) == ON_OK, "Pack ON_FRAME_MESH");
+    on_node_on_rx_raw(&w.nodes[0], frame, flen, sim_phys_to_local_ns(&w, 0u, w.phys_now_ns));
+
+    char json[3072];
+    on_node_format_cluster_json(&w.nodes[0], false, json, sizeof(json));
+    EXPECT(strstr(json, "\"id\":\"0x305\"") != NULL &&
+           strstr(json, "\"mac\":\"DE:AD:BE:EF:05:06\"") != NULL &&
+           strstr(json, "\"hop\":5") != NULL,
+           "Primary G records 5-hop Mesh node with full MAC48 & hop_depth=5");
+
+    /* Remote 1-hop node T5 queries paginated TOPO_RESP and preserves hop_depth=5 (3-bit) & MAC48 */
+    EXPECT(on_node_request_cluster_snapshot(&w.nodes[5]) == ON_OK, "T5 requests snapshot with 5-hop node");
+    sim_world_run_us(&w, 160000, 10);
+    on_node_format_cluster_json(&w.nodes[5], false, json, sizeof(json));
+    EXPECT(w.nodes[5].cluster_snapshot_valid &&
+           strstr(json, "\"id\":\"0x305\"") != NULL &&
+           strstr(json, "\"hop\":5") != NULL &&
+           strstr(json, "\"mac\":\"DE:AD:BE:EF:05:06\"") != NULL,
+           "Paginated TOPO_RESP preserves 3-bit hop_depth=5 (no 2-bit truncation) & MAC48");
+
+    /* 2. Verify multi-hop ghost-node lease expiry GC cleans up silent 5-hop node after timeout */
+    w.nodes[0].peer_lease_timeout_sf = 100u; /* multi_hop_timeout = 200 SFs (800 ms) */
+    sim_world_run_us(&w, 900000, 10); /* 225 SFs with no further packets from 0x305 */
+    on_node_format_cluster_json(&w.nodes[0], false, json, sizeof(json));
+    EXPECT(strstr(json, "\"id\":\"0x305\"") == NULL,
+           "Silent 5-hop ghost node automatically purged by multi-hop cluster GC");
+
+    /* 3. Verify constant-time admin token gating on RESET_WIFI & REBOOT commands */
+    on_gw_ctx_t gw;
+    on_gw_init(&gw, ON_GW_MODE_WIFI_AND_BLE, NULL);
+    on_gw_set_wifi_creds(&gw, "OfficeWiFi", "Secret123", "");
+    on_gw_set_admin_token(&gw, "Pin2026!");
+    EXPECT(on_gw_handle_control_text(&gw, "RESET_WIFI", 10u, false) == ON_ERR_DECODE_FAIL &&
+           on_gw_handle_control_text(&gw, "AUTH:WrongPin|RESET_WIFI", 24u, false) == ON_ERR_DECODE_FAIL &&
+           !gw.cfg.wifi_reset_requested && strcmp(gw.cfg.wifi_ssid, "OfficeWiFi") == 0,
+           "Unauthenticated or wrong-token RESET_WIFI rejected");
+    EXPECT(on_gw_handle_control_text(&gw, "AUTH:Pin2026!|RESET_WIFI", 24u, false) == ON_OK &&
+           gw.cfg.wifi_reset_requested && gw.cfg.wifi_ssid[0] == '\0',
+           "Authenticated RESET_WIFI clears SSID and flags SoftAP reopen");
+    EXPECT(on_gw_handle_control_text(&gw, "AUTH:Pin2026!|REBOOT", 20u, false) == ON_OK &&
+           gw.cfg.reboot_requested,
+           "Authenticated REBOOT sets graceful restart flag");
+    printf("    -> 5-hop MAC48 + 3-bit hop roundtrip OK | Ghost-node GC purged 0x305 | Auth RESET_WIFI/REBOOT OK\n");
+}
+
 int main(void) {
     printf("============================================================\n");
-    printf("       OpenNear v6.5 Core Protocol Automated Test Suite     \n");
+    printf("       OpenNear v6.6 Core Protocol Automated Test Suite     \n");
     printf("============================================================\n");
 
     test_6byte_header_and_frame();
@@ -2352,6 +2435,7 @@ int main(void) {
     test_independent_act_clock();
     test_v64_optional_mqtts_tls_config();
     test_v65_cluster_mac48_and_ha_identity();
+    test_v66_multihop_gc_6hop_mac_and_system_cmds();
 
     printf("\n------------------------------------------------------------\n");
     printf("SUMMARY: %d passed, %d failed\n", g_tests_passed, g_tests_failed);

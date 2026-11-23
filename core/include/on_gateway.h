@@ -80,6 +80,8 @@ typedef struct {
     bool     ota_pull_requested;
     bool     topo_query_requested;
     bool     topo_include_data;
+    bool     wifi_reset_requested;
+    bool     reboot_requested;
 } on_gw_config_t;
 
 /* Lock-free SPSC ring buffer for cross-core/cross-task decoupling (ON_GW_RING_DEPTH must be power of 2) */

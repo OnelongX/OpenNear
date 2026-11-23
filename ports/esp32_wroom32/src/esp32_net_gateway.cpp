@@ -7,6 +7,8 @@
 
 #ifdef OPENNEAR_ENABLE_WIFI_GW
 #include <WiFi.h>
+#include <DNSServer.h>
+#include <ESPmDNS.h>
 #include <HTTPClient.h>
 #include <WebServer.h>
 #include <Preferences.h>
@@ -49,19 +51,38 @@ void on_esp32_node_unlock(void) {
 #ifdef OPENNEAR_ENABLE_WIFI_GW
 static Preferences s_prefs;
 static WebServer   s_http_srv(80);
+static DNSServer   s_dns_srv;
 static Client     *s_active_mqtt_cli    = nullptr;
 static bool        s_http_srv_started   = false;
 static bool        s_wifi_was_connected = false;
 static bool        s_ap_active          = false;
+static bool        s_dns_active         = false;
+static bool        s_mdns_active        = false;
 static char        s_ap_ssid[32]        = {0};
+static char        s_mdns_host[32]      = {0};
 static uint32_t    s_ap_off_at_ms       = 0u;
 static uint32_t    s_sta_start_ms       = 0u;
 static uint32_t    s_last_wifi_retry_ms = 0u;
 static uint32_t    s_last_mqtt_retry_ms = 0u;
+static uint32_t    s_mqtt_backoff_ms    = 5000u;
 static uint32_t    s_last_mqtt_ping_ms  = 0u;
 static uint32_t    s_last_ha_pub_ms     = 0u;
 static uint8_t     s_mqtt_rxbuf[512];
 static size_t      s_mqtt_rxlen         = 0u;
+
+static bool http_token_matches(const char *expected) {
+    if (!expected || expected[0] == '\0') return true;
+    if (!s_http_srv.hasHeader("X-OpenNear-Token")) return false;
+    String got = s_http_srv.header("X-OpenNear-Token");
+    size_t elen = strlen(expected);
+    if (got.length() != elen) return false;
+    unsigned char diff = 0u;
+    const char *gp = got.c_str();
+    for (size_t i = 0u; i < elen; ++i) {
+        diff |= static_cast<unsigned char>(gp[i] ^ expected[i]);
+    }
+    return diff == 0u;
+}
 
 static void apply_wifi_coex_ps(void) {
 #ifdef OPENNEAR_ENABLE_BLE_GW
@@ -118,6 +139,8 @@ static void esp32_mqtt_poll(on_node_t *node, on_gw_ctx_t *gw) {
         on_esp32_tls_stop_mqtt_clients();
         s_active_mqtt_cli = nullptr;
         s_mqtt_rxlen = 0u;
+        s_mqtt_backoff_ms = 5000u;
+        s_last_mqtt_retry_ms = 0u;
         if (s_prefs.begin("opennear_gw", false)) {
             s_prefs.putString("mhost", gw->cfg.mqtt_host);
             s_prefs.putUShort("mport", gw->cfg.mqtt_port);
@@ -140,7 +163,7 @@ static void esp32_mqtt_poll(on_node_t *node, on_gw_ctx_t *gw) {
     if (!cli->connected()) {
         gw->mqtt_connected = false;
         s_mqtt_rxlen = 0u;
-        if ((now_ms - s_last_mqtt_retry_ms) < 5000u) return;
+        if (s_last_mqtt_retry_ms != 0u && (now_ms - s_last_mqtt_retry_ms) < s_mqtt_backoff_ms) return;
         s_last_mqtt_retry_ms = now_ms;
         uint16_t port = gw->cfg.mqtt_port ? gw->cfg.mqtt_port : (gw->cfg.mqtt_use_tls ? 8883u : 1883u);
         if (cli->connect(gw->cfg.mqtt_host, port)) {
@@ -154,12 +177,16 @@ static void esp32_mqtt_poll(on_node_t *node, on_gw_ctx_t *gw) {
                 size_t s2 = on_mqtt_encode_subscribe(2u, "opennear/ota/trigger", sbuf, sizeof(sbuf));
                 if (s2 > 0u) cli->write(sbuf, s2);
                 gw->mqtt_connected  = true;
+                s_mqtt_backoff_ms   = 5000u;
                 s_last_mqtt_ping_ms = now_ms;
                 s_last_ha_pub_ms    = 0u;
                 Serial.printf("[OpenNear MQTT] Connected to %s://%s:%u (HA Discovery + cmd/# armed)\n",
                               gw->cfg.mqtt_use_tls ? "mqtts" : "mqtt",
                               gw->cfg.mqtt_host, (unsigned)port);
             }
+        } else {
+            /* Exponential backoff (5s -> 10s -> 20s -> 30s) so unreachable broker never stalls Web Portal */
+            s_mqtt_backoff_ms = (s_mqtt_backoff_ms < 15000u) ? (s_mqtt_backoff_ms * 2u) : 30000u;
         }
         return;
     }
@@ -281,7 +308,7 @@ static void start_local_http_api(void) {
     });
 
     s_http_srv.on("/api/status", HTTP_GET, []() {
-        static char json[1024];
+        static char json[1280];
         size_t pos = 0u;
         json[0] = '\0';
 
@@ -314,15 +341,23 @@ static void start_local_http_api(void) {
         IPAddress ip = wifi_ok ? WiFi.localIP() : IPAddress(0, 0, 0, 0);
         char ip_s[24];
         snprintf(ip_s, sizeof(ip_s), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
-        char num[160];
+        uint32_t tx_ok = 0u, tx_fail = 0u;
+        on_esp32_hal_tx_counts(&tx_ok, &tx_fail);
+        char num[192];
 
         append_cstr(json, sizeof(json), &pos, "{\"role\":\"");
         append_cstr(json, sizeof(json), &pos, role_s);
-        snprintf(num, sizeof(num), "\",\"id\":\"0x%03X\",\"mac\":\"%s\",\"ble_mac\":\"%s\",\"sf\":%u,\"fw_ver\":\"v6.5\",\"uptime_s\":%u",
+        snprintf(num, sizeof(num), "\",\"id\":\"0x%03X\",\"mac\":\"%s\",\"ble_mac\":\"%s\",\"sf\":%u,\"fw_ver\":\"v6.6\",\"uptime_s\":%u",
                  (unsigned)short_id, mac_s, bmac_s, (unsigned)sf_seq, (unsigned)(millis() / 1000u));
         append_cstr(json, sizeof(json), &pos, num);
 
-        snprintf(num, sizeof(num), ",\"wifi_ok\":%s,\"wifi_ch\":%u,\"wifi_rssi\":%d,\"wifi_ip\":\"%s\",\"wifi_ssid\":\"",
+        snprintf(num, sizeof(num), ",\"free_heap\":%u,\"min_heap\":%u,\"tx_ok\":%u,\"tx_fail\":%u,\"rx_drops\":%u,\"mdns\":\"",
+                 (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(),
+                 (unsigned)tx_ok, (unsigned)tx_fail, (unsigned)on_esp32_hal_rx_drops());
+        append_cstr(json, sizeof(json), &pos, num);
+        append_json_escaped(json, sizeof(json), &pos, s_mdns_active ? s_mdns_host : "");
+
+        snprintf(num, sizeof(num), "\",\"wifi_ok\":%s,\"wifi_ch\":%u,\"wifi_rssi\":%d,\"wifi_ip\":\"%s\",\"wifi_ssid\":\"",
                  wifi_ok ? "true" : "false",
                  (unsigned)(wifi_ok ? WiFi.channel() : 0),
                  (int)(wifi_ok ? WiFi.RSSI() : 0),
@@ -425,10 +460,9 @@ static void start_local_http_api(void) {
             return;
         }
         String body = s_http_srv.arg("plain");
-        /* Support X-OpenNear-Token header for HTTP /api/cmd when admin_token is configured */
+        /* Support X-OpenNear-Token header (constant-time verify) when admin_token is configured */
         if (s_gw_ref->cfg.admin_token[0] != '\0' && !body.startsWith("AUTH:")) {
-            if (!s_http_srv.hasHeader("X-OpenNear-Token") ||
-                s_http_srv.header("X-OpenNear-Token") != String(s_gw_ref->cfg.admin_token)) {
+            if (!http_token_matches(s_gw_ref->cfg.admin_token)) {
                 s_http_srv.send(401, "application/json", "{\"ok\":false,\"error\":\"unauthorized\"}");
                 return;
             }
@@ -441,8 +475,7 @@ static void start_local_http_api(void) {
     s_http_srv.on("/api/tls_ca", HTTP_POST, []() {
         if (!s_gw_ref) { s_http_srv.send(503, "application/json", "{\"ok\":false}"); return; }
         if (s_gw_ref->cfg.admin_token[0] != '\0') {
-            if (!s_http_srv.hasHeader("X-OpenNear-Token") ||
-                s_http_srv.header("X-OpenNear-Token") != String(s_gw_ref->cfg.admin_token)) {
+            if (!http_token_matches(s_gw_ref->cfg.admin_token)) {
                 s_http_srv.send(401, "application/json", "{\"ok\":false,\"error\":\"unauthorized\"}");
                 return;
             }
@@ -484,8 +517,12 @@ static void start_softap_portal(void) {
     WiFi.softAP(s_ap_ssid, nullptr, ON_ESP32_DEFAULT_CHANNEL);
     s_ap_active    = true;
     s_ap_off_at_ms = 0u;
+    if (!s_dns_active) {
+        s_dns_srv.start(53, "*", WiFi.softAPIP());
+        s_dns_active = true;
+    }
     start_local_http_api();
-    Serial.printf("[OpenNear Portal] SoftAP '%s' active -> connect & open http://192.168.4.1\n", s_ap_ssid);
+    Serial.printf("[OpenNear Portal] SoftAP '%s' active (Captive Portal DNS) -> http://192.168.4.1\n", s_ap_ssid);
 }
 
 static void save_wifi_nvs(const char *ssid, const char *pass, const char *url) {
@@ -865,15 +902,31 @@ void on_esp32_net_gw_poll(on_node_t *node, on_gw_ctx_t *gw) {
         uint8_t ch = static_cast<uint8_t>(WiFi.channel());
         on_gw_on_wifi_connected(gw, ch, static_cast<int8_t>(WiFi.RSSI()), ip4);
         start_local_http_api();
+        s_mqtt_backoff_ms    = 5000u;
+        s_last_mqtt_retry_ms = 0u;
+        if (!s_mdns_active) {
+            if (MDNS.begin("opennear")) {
+                MDNS.addService("http", "tcp", 80);
+                snprintf(s_mdns_host, sizeof(s_mdns_host), "opennear.local");
+                s_mdns_active = true;
+            }
+        }
         if (s_ap_active) {
             /* Give phone browser 5 s to display the new LAN IP before closing fallback SoftAP */
             s_ap_off_at_ms = millis() + 5000u;
         }
-        Serial.printf("[OpenNear GW] Wi-Fi ONLINE http://%u.%u.%u.%u/ ch=%u rssi=%d\n",
-                      ip4[0], ip4[1], ip4[2], ip4[3], (unsigned)ch, (int)WiFi.RSSI());
+        Serial.printf("[OpenNear GW] Wi-Fi ONLINE http://%u.%u.%u.%u/ (%s) ch=%u rssi=%d\n",
+                      ip4[0], ip4[1], ip4[2], ip4[3],
+                      s_mdns_active ? "http://opennear.local/" : "mDNS off",
+                      (unsigned)ch, (int)WiFi.RSSI());
     } else if (!connected && s_wifi_was_connected) {
         s_wifi_was_connected = false;
         s_sta_start_ms = millis();
+        if (s_mdns_active) {
+            MDNS.end();
+            s_mdns_active = false;
+            s_mdns_host[0] = '\0';
+        }
         on_gw_on_wifi_disconnected(gw);
         Serial.println("[OpenNear GW] Wi-Fi disconnected, retrying...");
     } else if (!connected && gw->cfg.wifi_ssid[0] != '\0' &&
@@ -893,6 +946,10 @@ void on_esp32_net_gw_poll(on_node_t *node, on_gw_ctx_t *gw) {
         static_cast<int32_t>(millis() - s_ap_off_at_ms) >= 0) {
         s_ap_off_at_ms = 0u;
         if (connected) {
+            if (s_dns_active) {
+                s_dns_srv.stop();
+                s_dns_active = false;
+            }
             WiFi.softAPdisconnect(true);
             WiFi.mode(WIFI_STA);
             apply_wifi_coex_ps();
@@ -901,10 +958,43 @@ void on_esp32_net_gw_poll(on_node_t *node, on_gw_ctx_t *gw) {
             Serial.println("[OpenNear Portal] Fallback SoftAP closed; Web Portal stays live on LAN STA IP");
         }
     }
+    if (s_dns_active) {
+        s_dns_srv.processNextRequest();
+    }
     if (s_http_srv_started) {
         s_http_srv.handleClient();
     }
     esp32_mqtt_poll(node, gw);
+
+    if (gw->cfg.wifi_reset_requested) {
+        gw->cfg.wifi_reset_requested = false;
+        if (s_prefs.begin("opennear_gw", false)) {
+            s_prefs.remove("ssid");
+            s_prefs.remove("pass");
+            s_prefs.end();
+        }
+        on_esp32_tls_stop_mqtt_clients();
+        s_active_mqtt_cli    = nullptr;
+        gw->mqtt_connected   = false;
+        s_wifi_was_connected = false;
+        if (s_mdns_active) {
+            MDNS.end();
+            s_mdns_active = false;
+            s_mdns_host[0] = '\0';
+        }
+        WiFi.disconnect(true, false);
+        on_gw_on_wifi_disconnected(gw);
+        start_softap_portal();
+        Serial.println("[OpenNear GW] Wi-Fi credentials cleared; SoftAP provisioning portal reopened");
+    }
+
+    if (gw->cfg.reboot_requested) {
+        gw->cfg.reboot_requested = false;
+        Serial.println("[OpenNear GW] Reboot requested -> restarting in 300 ms...");
+        Serial.flush();
+        delay(300);
+        esp_restart();
+    }
 
     if (gw->cfg.admin_token_updated) {
         gw->cfg.admin_token_updated = false;

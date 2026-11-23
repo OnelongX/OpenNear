@@ -331,6 +331,7 @@ void     on_node_enable_leaderless_boot(on_node_t *node, uint32_t base_timeout_m
 void     on_node_set_epoch_schedule(on_node_t *node, uint8_t epoch_phase, uint8_t epoch_period);
 void     on_node_attach_mesh(on_node_t *node, on_mesh_ctx_t *mesh);
 on_err_t on_node_send_mesh_uplink(on_node_t *node, const uint8_t *payload, uint8_t len);
+on_err_t on_node_send_mesh_topo_mac(on_node_t *node);
 on_err_t on_node_send_mesh_downlink(on_node_t *node, uint16_t target_id,
                                     const uint8_t *payload, uint8_t len);
 

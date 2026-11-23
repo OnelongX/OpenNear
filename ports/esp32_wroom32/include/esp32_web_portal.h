@@ -58,7 +58,7 @@ th{color:var(--mut);font-weight:600;font-size:12px}
     <div class="brand">
       <h1>OpenNear</h1>
       <span class="badge" id="b-role">加载中...</span>
-      <span class="badge" id="b-fw">v6.5</span>
+      <span class="badge" id="b-fw">v6.6</span>
     </div>
     <div class="row">
       <input id="g-token" type="password" placeholder="Admin Token (如已设置)" style="width:185px" onchange="saveLocalToken()">
@@ -137,7 +137,7 @@ th{color:var(--mut);font-weight:600;font-size:12px}
         </div>
       </div>
       <div class="muted mono" style="margin-top:12px;line-height:1.7">
-        HA 自动发现: homeassistant/sensor/opennear_&lt;ID&gt;/config<br>
+        HA 自动发现: homeassistant/sensor/opennear_&lt;MACHEX&gt;/config（按硬件 MAC 永久锚定）<br>
         节点状态上报: opennear/node/0x&lt;ID&gt;/state<br>
         云端下行控制: opennear/cmd/0x&lt;ID&gt;<br>
         集群 OTA 触发: opennear/ota/trigger
@@ -172,14 +172,16 @@ th{color:var(--mut);font-weight:600;font-size:12px}
     </div>
 
     <div class="card">
-      <h2>网关管理安全令牌（Admin Token）</h2>
+      <h2>网关管理安全令牌（Admin Token）与维护</h2>
       <div class="grid">
         <div><label>新 Admin Token（留空表示清除鉴权）</label><input id="t-new" type="password" placeholder="例如 OpenNear2026"></div>
       </div>
       <div class="row" style="margin-top:10px">
         <button class="btn sec" onclick="updateAdminToken()">保存 / 轮换 Token</button>
-        <span class="muted">设置后所有写接口需在顶部输入 Token 或携带 X-OpenNear-Token 请求头</span>
+        <button class="btn sec" onclick="resetWifi()">清除 Wi-Fi 并重开热点</button>
+        <button class="btn danger" onclick="rebootGw()">重启网关</button>
       </div>
+      <div class="muted" style="margin-top:8px">设置 Token 后所有写接口需在顶部输入 Token 或携带 X-OpenNear-Token 请求头</div>
     </div>
   </section>
 </div>
@@ -235,11 +237,11 @@ async function fetchStatus(){
     const r=await fetch('/api/status');
     const s=await r.json();
     $('b-role').textContent=(s.role||'NODE')+' '+s.id;
-    $('b-fw').textContent=s.fw_ver||'v6.3';
+    $('b-fw').textContent=s.fw_ver||'v6.6';
     const pills=[];
     if(s.mac)pills.push('<span class="badge mono">MAC: '+esc(s.mac)+(s.ble_mac?' (BLE '+esc(s.ble_mac)+')':'')+'</span>');
     pills.push(s.wifi_ok
-      ?'<span class="badge ok">Wi-Fi 已连: '+esc(s.wifi_ssid)+' ('+esc(s.wifi_ip)+' CH'+s.wifi_ch+' '+s.wifi_rssi+'dBm)</span>'
+      ?'<span class="badge ok">Wi-Fi 已连: '+esc(s.wifi_ssid)+' ('+esc(s.wifi_ip)+(s.mdns?' / '+esc(s.mdns):'')+' CH'+s.wifi_ch+' '+s.wifi_rssi+'dBm)</span>'
       :'<span class="badge warn">Wi-Fi 未连接</span>');
     if(s.ap_active)pills.push('<span class="badge">配网热点: '+esc(s.ap_ssid)+' (192.168.4.1)</span>');
     pills.push(s.mqtt_ok
@@ -249,6 +251,13 @@ async function fetchStatus(){
       ?'<span class="badge ok">TLS 模块已启用'+(s.tls_ca_set?' (CA验签)':' (开发模式)')+'</span>'
       :'<span class="badge">TLS 未编译(精简)</span>');
     pills.push(s.ble_ok?'<span class="badge ok">BLE 已连接</span>':'<span class="badge">BLE 待机</span>');
+    if(typeof s.free_heap==='number'){
+      const fh=(s.free_heap/1024).toFixed(1),mh=((s.min_heap||0)/1024).toFixed(1);
+      pills.push('<span class="badge mono '+(s.free_heap<28000?'warn':'')+'">Heap '+fh+'K (min '+mh+'K)</span>');
+    }
+    if(typeof s.tx_ok==='number'){
+      pills.push('<span class="badge mono '+(s.rx_drops>0?'warn':'')+'">TX '+s.tx_ok+'/'+(s.tx_fail||0)+' · RX丢 '+((s.rx_drops)||0)+'</span>');
+    }
     pills.push(s.token_set?'<span class="badge ok">Token 保护已启用</span>':'<span class="badge warn">未设 Token</span>');
     pills.push('<span class="badge">运行 '+s.uptime_s+'s</span>');
     $('status-pills').innerHTML=pills.join('');
@@ -395,6 +404,19 @@ async function updateAdminToken(){
     $('t-new').value='';
     toast(nt?'Admin Token 已更新并保存至 NVS':'Admin Token 已清除');
     fetchStatus();
+  }
+}
+async function resetWifi(){
+  if(!confirm('确认清除已保存的 Wi-Fi 凭据并重新开启 OpenNear-Setup 配网热点？'))return;
+  if(await postCmd('RESET_WIFI')){
+    $('w-ssid').value='';$('w-pass').value='';
+    toast('已清除 Wi-Fi，请重连 OpenNear-Setup 热点打开 http://192.168.4.1');
+  }
+}
+async function rebootGw(){
+  if(!confirm('确认重启 OpenNear 网关？'))return;
+  if(await postCmd('REBOOT')){
+    toast('网关正在重启，约 3 秒后自动恢复...');
   }
 }
 function refreshAll(){fetchStatus();fetchData();}

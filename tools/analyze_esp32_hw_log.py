@@ -40,7 +40,7 @@ RE_LINK = re.compile(
 )
 RE_BOOT = re.compile(r"\[OpenNear\]\s+ESP32-WROOM-32 booted as (.+)")
 RE_WIFI_ON = re.compile(
-    r"\[OpenNear GW\]\s+Wi-Fi ONLINE\s+(?:http://|ip=)(\d+\.\d+\.\d+\.\d+)/?\s+ch=(\d+)\s+rssi=(-?\d+)"
+    r"\[OpenNear GW\]\s+Wi-Fi ONLINE\s+(?:http://|ip=)(\d+\.\d+\.\d+\.\d+)/?\s+(?:\([^)]*\)\s+)?ch=(\d+)\s+rssi=(-?\d+)"
 )
 RE_WIFI_OFF = re.compile(r"\[OpenNear GW\]\s+Wi-Fi disconnected")
 RE_SOFTAP_ON = re.compile(r"\[OpenNear Portal\]\s+SoftAP '([^']+)' active")

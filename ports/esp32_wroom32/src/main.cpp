@@ -97,7 +97,7 @@ static void opennear_rt_task(void *arg) {
             last_log_ns = now_ns;
             uint32_t tx_accepted, tx_failed;
             on_esp32_hal_tx_counts(&tx_accepted, &tx_failed);
-            Serial.printf("[OpenNear v6.5] SF=%u role=%d id=0x%03X hop=%d slot=%u nco=%.2fppm rtt=%lldns harq=%u acts=%u\n",
+            Serial.printf("[OpenNear v6.6] SF=%u role=%d id=0x%03X hop=%d slot=%u nco=%.2fppm rtt=%lldns harq=%u acts=%u\n",
                           (unsigned)log_s.sf_seq,
                           log_s.role,
                           (unsigned)log_s.short_id,
@@ -107,8 +107,9 @@ static void opennear_rt_task(void *arg) {
                           (long long)log_s.link_delay_ns,
                           (unsigned)log_s.harq_retx,
                           (unsigned)log_s.act_fire);
-            Serial.printf("[OpenNear TX] accepted=%u failed=%u\n",
-                          (unsigned)tx_accepted, (unsigned)tx_failed);
+            Serial.printf("[OpenNear TX] accepted=%u failed=%u rx_drops=%u\n",
+                          (unsigned)tx_accepted, (unsigned)tx_failed,
+                          (unsigned)on_esp32_hal_rx_drops());
             Serial.printf("[OpenNear Link] sync_rx=%u data_tx=%u data_rx=%u missed=%u takeovers=%u backup=0x%03X rejoins=%u leases=%u\n",
                           (unsigned)log_s.sync_rx, (unsigned)log_s.tdma_tx,
                           (unsigned)log_s.tdma_rx, (unsigned)log_s.missed,
@@ -263,7 +264,7 @@ void loop() {
         }
     }
 #endif
-    /* Interactive USB Serial query: type "TOPO?" or "DATA?" on ANY node to dump cluster JSON */
+    /* Interactive USB Serial console: TOPO?/DATA? on ANY node + gateway WIFI/MQTT/CMD/OTA/RESET/REBOOT */
     if (Serial.available() > 0) {
         String cmd = Serial.readStringUntil('\n');
         cmd.trim();
@@ -278,6 +279,12 @@ void loop() {
             on_esp32_node_unlock();
             if (n > 0u) Serial.println(s_json);
         }
+#if defined(OPENNEAR_ENABLE_WIFI_GW) || defined(OPENNEAR_ENABLE_BLE_GW)
+        else if (cmd.length() >= 5) {
+            on_err_t rc = on_gw_handle_control_text(&g_gw, cmd.c_str(), cmd.length(), false);
+            Serial.printf("[OpenNear Serial] cmd rc=%d (%s)\n", (int)rc, (rc == ON_OK) ? "OK" : "ERR");
+        }
+#endif
     }
 #ifdef OPENNEAR_ACT_CAPTURE
     on_esp32_act_capture_poll();

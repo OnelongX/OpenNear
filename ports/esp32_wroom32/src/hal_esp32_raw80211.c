@@ -16,7 +16,7 @@
 #define WIFI_ACTION_HDR_LEN   24u
 #define ON_VENDOR_TAG_LEN     4u
 #define ON_CARRIER_HDR_LEN    (WIFI_ACTION_HDR_LEN + ON_VENDOR_TAG_LEN)
-#define ON_RX_RING_SIZE       16u
+#define ON_RX_RING_SIZE       32u
 
 static const uint8_t kOpenNearVendorTag[ON_VENDOR_TAG_LEN] = { 0x7Fu, 0x4Fu, 0x4Eu, 0x01u };
 
@@ -35,6 +35,7 @@ typedef struct {
 static esp32_rx_slot_t  s_rx_ring[ON_RX_RING_SIZE];
 static volatile uint8_t s_rx_head = 0u;
 static volatile uint8_t s_rx_tail = 0u;
+static volatile uint32_t s_rx_drops = 0u;
 
 static uint8_t          s_mac48[6];
 static int              s_act_gpio = ON_ESP32_ACT_LED_GPIO;
@@ -144,8 +145,11 @@ static void IRAM_ATTR promiscuous_rx_cb(void *buf, wifi_promiscuous_pkt_type_t t
     uint32_t on_len = sig_len - ON_CARRIER_HDR_LEN - 4u;
     if (on_len < ON_MAC_HDR_LEN + ON_PAYLOAD_CRC_LEN || on_len > ON_MAX_FRAME_LEN) return;
 
-    uint8_t next_head = (uint8_t)((s_rx_head + 1u) % ON_RX_RING_SIZE);
-    if (next_head == s_rx_tail) return; /* ring full */
+    uint8_t next_head = (uint8_t)((s_rx_head + 1u) & (ON_RX_RING_SIZE - 1u));
+    if (next_head == s_rx_tail) {
+        s_rx_drops++;
+        return; /* ring full */
+    }
 
     s_rx_ring[s_rx_head].len = (uint16_t)on_len;
 #if defined(OPENNEAR_ACT_TRACE) || defined(OPENNEAR_ACT_CLOCK_BIAS_US)
@@ -156,6 +160,7 @@ static void IRAM_ATTR promiscuous_rx_cb(void *buf, wifi_promiscuous_pkt_type_t t
 #endif
     s_rx_ring[s_rx_head].rx_local_ns = unwrap_rx_timestamp_ns(pkt->rx_ctrl.timestamp);
     memcpy(s_rx_ring[s_rx_head].data, p + ON_CARRIER_HDR_LEN, on_len);
+    __sync_synchronize();
     s_rx_head = next_head;
 }
 
@@ -344,11 +349,16 @@ void on_esp32_hal_tx_counts(uint32_t *accepted, uint32_t *failed) {
     *failed   = s_tx_failed;
 }
 
+uint32_t on_esp32_hal_rx_drops(void) {
+    return s_rx_drops;
+}
+
 void on_esp32_hal_poll_rx(on_node_t *node) {
 #ifdef OPENNEAR_ACT_TRACE
     s_trace_node = node;
 #endif
     while (s_rx_tail != s_rx_head) {
+        __sync_synchronize();
         const esp32_rx_slot_t *slot = &s_rx_ring[s_rx_tail];
 #ifdef OPENNEAR_ACT_TRACE
         uint32_t sync_before = node->sync_rx_total;
@@ -372,6 +382,7 @@ void on_esp32_hal_poll_rx(on_node_t *node) {
             s_trace_last_beacon.rx_dequeue_us = dequeued_us;
         }
 #endif
-        s_rx_tail = (uint8_t)((s_rx_tail + 1u) % ON_RX_RING_SIZE);
+        __sync_synchronize();
+        s_rx_tail = (uint8_t)((s_rx_tail + 1u) & (ON_RX_RING_SIZE - 1u));
     }
 }
