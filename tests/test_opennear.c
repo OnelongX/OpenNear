@@ -808,6 +808,135 @@ static void test_v32_fpga_rtl_golden_vectors(void) {
     EXPECT(ones_count > 30u && ones_count < 98u, "Golden Polar codeword has balanced Hamming weight");
 }
 
+/* Best-effort TX still supports data and backup, but cannot calibrate on-air RTT. */
+static void test_best_effort_tx_timing(void) {
+    printf("[TEST 21] Best-Effort TX: No Air RTT + Configurable Backup Holdover...\n");
+    sim_world_t w;
+    sim_world_init(&w, 0xC4A11ULL);
+    w.verbose = false;
+    sim_world_setup_10node_demo(&w, false);
+    w.num_nodes = 2u;
+    on_node_t *g = &w.nodes[0];
+    on_node_t *t = &w.nodes[1];
+    g->hal.tx_timing_best_effort = true;
+    t->hal.tx_timing_best_effort = true;
+    t->backup_miss_threshold = 12u;
+    w.blackout_node_idx = 1;
+    w.drop_sync_start_sf = 30u;
+    w.drop_sync_end_sf = 35u;
+    sim_world_run_us(&w, 180000, 10);
+
+    EXPECT(t->role == ON_ROLE_T && t->short_id == 0x002u && t->sync_rx_total > 10u && g->tdma_rx_total > 0u,
+           "Best-effort terminal still joins the primary and sends data");
+    EXPECT(t->rtt_token == 0u && !t->sync.rtt_calibrated, "Best-effort TX skips on-air RTT calibration");
+    EXPECT(w.sync_drops_injected >= 5u && t->failover_count == 0u,
+           "Backup with extended holdover does not take over during a short beacon blackout");
+    w.kill_node_idx = 0;
+    w.kill_at_sf = 50u;
+    sim_world_run_us(&w, 100000, 10);
+    EXPECT(t->role == ON_ROLE_G && t->failover_count == 1u && w.failover_sf_seq == 63u,
+           "Backup still takes over after the configured 12 missed beacons");
+}
+
+/* Restart with an empty peer table after the terminal already took over. */
+static void test_rejoin_after_primary_reboot(void) {
+    printf("[TEST 22] Automatic Rejoin and Backup Re-election After Primary Reboot...\n");
+    sim_world_t w;
+    sim_world_init(&w, 0x0B007ULL);
+    w.verbose = false;
+    sim_world_setup_10node_demo(&w, false);
+    w.num_nodes = 2u;
+    on_node_t *g = &w.nodes[0];
+    on_node_t *t = &w.nodes[1];
+    const uint8_t key[ON_SEC_KEY_LEN] = {0x3Au, 0x91u};
+    on_node_enable_security(g, key);
+    on_node_enable_security(t, key);
+    on_node_set_session_salt(g, 0x42A738E1u);
+    g->hal.tx_timing_best_effort = true;
+    t->hal.tx_timing_best_effort = true;
+    t->backup_miss_threshold = 12u;
+    t->backup_min_sync_silence_ns = 150000000LL;
+    sim_world_run_us(&w, 160000, 10);
+    EXPECT(t->role == ON_ROLE_T && g->backup_id == t->short_id && t->short_id != ON_SHORT_ID_UNASSIGNED,
+           "Terminal initially joins and is selected as backup");
+
+    on_node_rotate_key_epoch(g);
+    sim_world_run_us(&w, 16000, 10);
+    EXPECT(t->sec.key_epoch == 1u && t->rejoin_count == 0u && t->role == ON_ROLE_T,
+           "A same-session key rotation does not invalidate the slot or role");
+
+    w.alive[0] = false;
+    sim_world_run_us(&w, 80000, 10);
+    EXPECT(t->role == ON_ROLE_T && t->failover_count == 0u && t->missed_sync_count >= 12u,
+           "Measured silence guard blocks takeover despite enough estimated missing frames");
+    sim_world_run_us(&w, 100000, 10);
+    EXPECT(t->role == ON_ROLE_G && t->failover_count == 1u, "Terminal takes over during a longer outage");
+
+    on_hal_ops_t g_hal = g->hal;
+    on_node_init(g, &g_hal, ON_ROLE_G, 0u);
+    on_node_enable_security(g, key);
+    on_node_set_session_salt(g, 0xC0B3ED26u);
+    w.alive[0] = true;
+    sim_world_run_us(&w, 160000, 10);
+    EXPECT(t->rejoin_count == 1u && t->failover_count == 1u && t->role == ON_ROLE_T,
+           "Terminal rejoins the restarted primary without losing its diagnostic counters");
+    EXPECT(g->backup_id != ON_SHORT_ID_UNASSIGNED && g->backup_id == t->short_id &&
+               t->backup_id == t->short_id && g->tdma_rx_total > 0u,
+           "Restarted primary allocates a slot, re-elects backup and receives uplink");
+
+    w.alive[0] = false;
+    sim_world_run_us(&w, 180000, 10);
+    EXPECT(t->role == ON_ROLE_G && t->failover_count == 2u && t->rejoin_count == 1u,
+           "Re-elected backup can take over a second outage");
+}
+
+/* A terminal can hear the coordinator throughout an uplink-only outage. */
+static void test_rejoin_after_primary_lease_expiry(void) {
+    printf("[TEST 23] Automatic Rejoin After Primary Slot Lease Expiry...\n");
+    sim_world_t w;
+    sim_world_init(&w, 0x1EA5EULL);
+    w.verbose = false;
+    sim_world_setup_10node_demo(&w, false);
+    w.num_nodes = 2u;
+    on_node_t *g = &w.nodes[0];
+    on_node_t *t = &w.nodes[1];
+    const uint8_t key[ON_SEC_KEY_LEN] = {0x3Au, 0x91u};
+    const uint32_t salt = 0xD1FFE2E1u;
+    on_node_enable_security(g, key);
+    on_node_enable_security(t, key);
+    on_node_set_session_salt(g, salt);
+    g->hal.tx_timing_best_effort = true;
+    t->hal.tx_timing_best_effort = true;
+    g->peer_lease_timeout_sf = 60u;
+    sim_world_run_us(&w, 160000, 10);
+    const uint16_t old_id = t->short_id;
+    EXPECT(t->role == ON_ROLE_T && old_id > ON_SHORT_ID_G_DEFAULT &&
+               g->backup_id == old_id && g->tdma_rx_total > 0u,
+           "Terminal initially joins, exchanges data and is selected as backup");
+
+    const on_hal_ops_t saved_hal = t->hal;
+    const uint32_t previous_syncs = t->sync_rx_total;
+    const uint32_t previous_rx = g->tdma_rx_total;
+    t->hal.tx_raw = NULL;
+    sim_world_run_us(&w, 160000, 10);
+    EXPECT(g->lease_reclaim_count == 0u && t->short_id == old_id && t->rejoin_count == 0u,
+           "Configured lease survives a short uplink outage beyond the default timeout");
+    sim_world_run_us(&w, 140000, 10);
+    EXPECT(g->lease_reclaim_count == 1u && g->backup_id == ON_SHORT_ID_UNASSIGNED &&
+               t->role == ON_ROLE_UNJOINED && t->rejoin_count == 1u,
+           "Terminal sees its expired slot in the authenticated primary map and restarts JOIN");
+    EXPECT(t->sync_rx_total > previous_syncs && t->sync.locked && t->failover_count == 0u &&
+               t->sec.session_salt == salt,
+           "Unchanged primary session preserves synchronization without triggering failover");
+
+    t->hal = saved_hal;
+    sim_world_run_us(&w, 160000, 10);
+    EXPECT(t->role == ON_ROLE_T && t->short_id != old_id && t->rejoin_count == 1u &&
+               g->backup_id == t->short_id && t->backup_id == t->short_id &&
+               g->tdma_rx_total > previous_rx,
+           "Restored uplink resumes data and automatically regains backup assignment");
+}
+
 /* 17. Test v4.0 Soft-Combining HARQ (Chase LLR Accumulation) + Multi-Rate Adaptive CA-Polar */
 static void test_v40_soft_combining_harq_and_multirate_polar(void) {
     printf("[TEST 17] v4.0 Soft-Combining HARQ (Chase LLR @ -4.5 dB) + Multi-Rate CA-Polar (K=40..96)...\n");
@@ -1004,6 +1133,99 @@ static void test_v40_second_order_thermal_accel_clock(void) {
            "2nd-order Alpha-Beta-Gamma tracker cuts thermal-ramp blackout drift by >3x (< 15 ns)");
 }
 
+/* Inject a beacon with an independent RX time (to model variable Wi-Fi queuing). */
+static void act_test_beacon(on_node_t *t, uint16_t src, uint32_t seq, uint32_t salt,
+                            uint8_t level, uint8_t lead, int64_t tx_ns, int64_t rx_ns,
+                            bool tamper) {
+    on_sync_payload_t sp = {0};
+    sp.sf_seq = seq;
+    sp.session_salt = salt;
+    sp.t_tx_net_ns = tx_ns;
+    sp.t_sf_us = ON_DEFAULT_TSF_US;
+    sp.act_fire_off_us = ON_DEFAULT_ACT_FIRE_US;
+    sp.act_cmd = level;
+    sp.act_flip_lead_sf = lead;
+    on_mac_hdr_t hdr = {ON_PROTO_VERSION, ON_FRAME_SYNC_MAP, false, false,
+        src, ON_SHORT_ID_BROADCAST, (uint8_t)(seq & 0x0Fu), 0u};
+    uint8_t pbuf[ON_SYNC_PAYLOAD_WIRE_LEN], frame[ON_MAX_FRAME_LEN], hbuf[ON_MAC_HDR_LEN];
+    size_t plen = 0u, flen = 0u;
+    if (on_sync_payload_pack(&sp, pbuf, sizeof(pbuf), &plen) != ON_OK) return;
+    if (t->sec.enabled) {
+        if (on_hdr_pack(&hdr, hbuf) != ON_OK) return;
+        on_sec_compute_beacon_mac(&t->sec, hbuf, pbuf, seq, salt, pbuf + 40);
+    }
+    if (tamper) pbuf[36] ^= 2u;
+    if (on_frame_pack(&hdr, pbuf, plen, frame, sizeof(frame), &flen) == ON_OK) {
+        on_node_on_rx_raw(t, frame, flen, rx_ns);
+    }
+}
+
+static void test_act_lookahead(void) {
+    printf("[TEST ACT] Authenticated lookahead GPIO scheduling...\n");
+    on_sync_payload_t sp = {0}, decoded;
+    sp.act_cmd = 1u;
+    sp.act_flip_lead_sf = 7u;
+    sp.sub_g_id_2 = 0xABCu;
+    sp.flags = 0xA2u;
+    sp.beacon_mac[0] = 0xBBu;
+    uint8_t pbuf[ON_SYNC_PAYLOAD_WIRE_LEN];
+    size_t plen = 0;
+    EXPECT(on_sync_payload_pack(&sp, pbuf, sizeof pbuf, &plen) == ON_OK && plen == 44u &&
+           pbuf[35] == 1u && pbuf[36] == 0xAEu && pbuf[37] == 0xA2u && pbuf[40] == 0xBBu &&
+           on_sync_payload_unpack(pbuf, plen, &decoded) == ON_OK && decoded.act_flip_lead_sf == 7u &&
+           decoded.hop_depth == 0u && decoded.sub_g_id_2 == 0xABCu,
+           "ACT lead leaves beacon length, command, Sub-G-2 ID, flags and MAC location intact");
+    sp.hop_depth = 1u;
+    EXPECT(on_sync_payload_pack(&sp, pbuf, sizeof pbuf, &plen) == ON_OK && pbuf[36] == 0xA1u &&
+           on_sync_payload_unpack(pbuf, plen, &decoded) == ON_OK && decoded.act_flip_lead_sf == 0u &&
+           decoded.hop_depth == 1u, "SUB_SYNC remains unchanged");
+
+    on_node_t t;
+    on_node_init(&t, NULL, ON_ROLE_UNJOINED, 0);
+    t.act_lookahead_enabled = true;
+    const uint8_t key[16] = {1, 2, 3, 4};
+    on_node_enable_security(&t, key);
+    act_test_beacon(&t, 1u, 7u, 20u, 0u, 3u, 28000000LL, 28100000LL, false);
+    const int64_t deadline = 43800000LL;
+    EXPECT(t.act_lookahead.pending && t.act_lookahead.target_sf == 10u &&
+           t.act_lookahead.deadline_local_ns == deadline && t.act_cmd == 0u,
+           "Early beacon arms future target without flipping immediately");
+    act_test_beacon(&t, 1u, 8u, 20u, 0u, 2u, 32000000LL, 40500000LL, false);
+    EXPECT(t.act_lookahead.deadline_local_ns == deadline, "Slower repeated announcement cannot postpone the deadline");
+    on_node_step(&t, deadline - 1LL);
+    EXPECT(t.act_cmd == 0u && t.act_lookahead.pending, "Does not flip before the local deadline");
+    EXPECT(on_node_next_wakeup_local_ns(&t, deadline - 1LL) == deadline, "Armed deadline is a wake-up candidate");
+    on_node_step(&t, deadline);
+    EXPECT(t.act_cmd == 1u && !t.act_lookahead.pending && t.last_act_was_scheduled &&
+           t.last_act_local_ns == deadline && t.current_sf_seq < 10u,
+           "Target beacon can be absent and TDMA can lag while the armed action still fires");
+    act_test_beacon(&t, 1u, 9u, 20u, 0u, 1u, 36000000LL, 45000000LL, false);
+    act_test_beacon(&t, 1u, 9u, 20u, 0u, 1u, 36000000LL, 46000000LL, false);
+    EXPECT(t.act_cmd == 1u && !t.act_lookahead.pending, "Late and duplicate beacons cannot roll back or re-arm a fired target");
+    act_test_beacon(&t, 1u, 10u, 20u, 1u, 0u, 40000000LL, 47000000LL, false);
+    act_test_beacon(&t, 1u, 13u, 20u, 1u, 7u, 52000000LL, 53000000LL, true);
+    EXPECT(!t.act_lookahead.pending && t.sec.beacon_auth_drops == 1u,
+           "Modified ACT lead is rejected by beacon authentication");
+    act_test_beacon(&t, 1u, 13u, 20u, 1u, 7u, 52000000LL, 53000000LL, false);
+    EXPECT(t.act_lookahead.pending, "Following transition can be armed normally");
+    act_test_beacon(&t, 1u, 0u, 21u, 0u, 0u, 1000000LL, 55000000LL, false);
+    EXPECT(!t.act_lookahead.pending && t.act_cmd == 0u && t.act_lookahead.beacon_sf == 0u,
+           "New boot session clears plan and accepts restarted sequence, even before JOIN");
+    act_test_beacon(&t, 1u, 4u, 21u, 0u, 6u, 17000000LL, 71000000LL, false);
+    act_test_beacon(&t, 2u, 1u, 21u, 1u, 0u, 18000000LL, 72000000LL, false);
+    EXPECT(!t.act_lookahead.pending && t.act_cmd == 1u, "New primary invalidates prior pending action");
+
+    on_node_init(&t, NULL, ON_ROLE_UNJOINED, 0);
+    act_test_beacon(&t, 1u, 9u, 0u, 0u, 1u, 36000000LL, 36000000LL, false);
+    on_node_step(&t, 43700000LL);
+    EXPECT(!t.act_lookahead.pending && t.act_cmd == 0u, "Default terminal ignores lead and retains legacy behavior");
+    t.act_lookahead_enabled = true;
+    act_test_beacon(&t, 1u, UINT32_MAX, 0u, 1u, 1u, 50000000LL, 50000000LL, false);
+    EXPECT(t.act_lookahead.pending && t.act_lookahead.target_sf == 0u, "Target frame zero is valid after sequence wrap");
+    on_node_step(&t, t.act_lookahead.deadline_local_ns);
+    EXPECT(t.act_cmd == 0u && t.last_act_was_scheduled, "Wrapped action is applied exactly like any other target");
+}
+
 int main(void) {
     printf("============================================================\n");
     printf("       OpenNear v4.0 Core Protocol Automated Test Suite     \n");
@@ -1029,6 +1251,10 @@ int main(void) {
     test_v40_isac_mcpd_tof_ranging_and_antirelay();
     test_v40_implicit_hdr_superslot_and_multigear();
     test_v40_second_order_thermal_accel_clock();
+    test_best_effort_tx_timing();
+    test_rejoin_after_primary_reboot();
+    test_rejoin_after_primary_lease_expiry();
+    test_act_lookahead();
 
     printf("\n------------------------------------------------------------\n");
     printf("SUMMARY: %d passed, %d failed\n", g_tests_passed, g_tests_failed);

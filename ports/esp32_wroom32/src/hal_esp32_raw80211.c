@@ -7,6 +7,9 @@
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/portmacro.h"
+#ifdef OPENNEAR_ACT_TRACE
+#include "freertos/queue.h"
+#endif
 
 /* 802.11 Vendor-Specific Action (0xD0) carrier header:
  * 24-byte 802.11 MAC header + 1-byte Category (0x7F) + 3-byte OpenNear OUI ("ON\x01") = 28 bytes */
@@ -20,6 +23,10 @@ static const uint8_t kOpenNearVendorTag[ON_VENDOR_TAG_LEN] = { 0x7Fu, 0x4Fu, 0x4
 typedef struct {
     uint16_t len;
     int64_t  rx_local_ns;
+#ifdef OPENNEAR_ACT_TRACE
+    int64_t rx_callback_us;
+    uint32_t rx_hw_us;
+#endif
     uint8_t  data[ON_MAX_FRAME_LEN];
 } esp32_rx_slot_t;
 
@@ -31,8 +38,46 @@ static uint8_t          s_mac48[6];
 static int              s_act_gpio = ON_ESP32_ACT_LED_GPIO;
 static esp_timer_handle_t s_act_timer = NULL;
 static volatile uint8_t s_pending_act_level = 0u;
-static volatile int64_t s_last_tx_queue_us  = 0;
-static volatile int16_t s_pending_followup_err_ns = 0;
+static uint32_t s_tx_accepted = 0u;
+static uint32_t s_tx_failed   = 0u;
+
+#ifdef OPENNEAR_ACT_TRACE
+/* Single producer: OpenNear RT task. Serial drains from the separate loop task. */
+static QueueHandle_t s_trace_queue;
+static on_node_t *s_trace_node;
+static on_esp32_act_trace_t s_trace_last_beacon;
+static uint32_t s_trace_seq;
+static uint8_t s_trace_level;
+
+bool on_esp32_hal_trace_init(void) {
+    s_trace_queue = xQueueCreate(96, sizeof(on_esp32_act_trace_t));
+    return s_trace_queue != NULL;
+}
+
+bool on_esp32_hal_trace_read(on_esp32_act_trace_t *trace) {
+    return s_trace_queue && xQueueReceive(s_trace_queue, trace, 0) == pdTRUE;
+}
+
+static void trace_act(uint32_t sf_seq, uint8_t level, int64_t step_us,
+                      int64_t pre_write_us, int64_t post_write_us) {
+    const on_node_t *node = s_trace_node;
+    on_esp32_act_trace_t trace = s_trace_last_beacon;
+    trace.seq = ++s_trace_seq;
+    trace.act_sf = sf_seq;
+    trace.level = level;
+    trace.role = (uint8_t)node->role;
+    trace.sf_us = node->sf_cfg.t_sf_us;
+    trace.act_offset_us = node->sf_cfg.act_fire_off_us;
+    int64_t target_net_ns = node->current_sf_start_net_ns + 1000LL * trace.act_offset_us;
+    trace.scheduled = node->last_act_was_scheduled;
+    trace.planned_us = (trace.scheduled ? node->last_act_deadline_local_ns
+                       : on_sync_net_to_local(&node->sync, target_net_ns)) / 1000LL;
+    trace.step_us = step_us;
+    trace.pre_write_us = pre_write_us;
+    trace.post_write_us = post_write_us;
+    xQueueSend(s_trace_queue, &trace, 0);
+}
+#endif
 
 static void IRAM_ATTR act_timer_cb(void *arg) {
     (void)arg;
@@ -95,6 +140,10 @@ static void IRAM_ATTR promiscuous_rx_cb(void *buf, wifi_promiscuous_pkt_type_t t
     if (next_head == s_rx_tail) return; /* ring full */
 
     s_rx_ring[s_rx_head].len = (uint16_t)on_len;
+#ifdef OPENNEAR_ACT_TRACE
+    s_rx_ring[s_rx_head].rx_callback_us = esp_timer_get_time();
+    s_rx_ring[s_rx_head].rx_hw_us = pkt->rx_ctrl.timestamp;
+#endif
     s_rx_ring[s_rx_head].rx_local_ns = unwrap_rx_timestamp_ns(pkt->rx_ctrl.timestamp);
     memcpy(s_rx_ring[s_rx_head].data, p + ON_CARRIER_HDR_LEN, on_len);
     s_rx_head = next_head;
@@ -132,19 +181,14 @@ static on_err_t esp32_tx_raw(void *ctx, const uint8_t *frame, size_t len, int64_
     memcpy(raw80211 + WIFI_ACTION_HDR_LEN, kOpenNearVendorTag, ON_VENDOR_TAG_LEN);
     memcpy(raw80211 + ON_CARRIER_HDR_LEN, frame, len);
 
-    int64_t t_pre = esp_timer_get_time();
     esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, raw80211,
                                       (int)(ON_CARRIER_HDR_LEN + len), false);
-    int64_t t_post = esp_timer_get_time();
-    /* Record Wi-Fi TX queue submission latency for IEEE 1588 PTP Two-Step Follow-Up calibration */
-    s_last_tx_queue_us = t_post - t_pre;
-    uint8_t ftype = (uint8_t)((frame[0] >> 2) & 0x0Fu);
-    if ((ftype == ON_FRAME_SYNC_MAP || ftype == ON_FRAME_SUB_SYNC) && tx_at_local_ns > 0) {
-        int64_t err_ns = (t_post * 1000LL) - tx_at_local_ns;
-        if (err_ns >  32000LL) err_ns =  32000LL;
-        if (err_ns < -32000LL) err_ns = -32000LL;
-        s_pending_followup_err_ns = (int16_t)err_ns;
+    if (err == ESP_OK) {
+        ++s_tx_accepted;
+    } else {
+        ++s_tx_failed;
     }
+    /* Driver acceptance does not reveal antenna departure time. */
     return (err == ESP_OK) ? ON_OK : ON_ERR_NOT_READY;
 }
 
@@ -175,6 +219,16 @@ static void esp32_on_act_trigger(void *ctx, uint32_t sf_seq, uint8_t act_cmd, in
         esp_timer_stop(s_act_timer);
         esp_timer_start_once(s_act_timer, (uint64_t)(target_us - now_us));
     } else {
+#ifdef OPENNEAR_ACT_TRACE
+        if (s_trace_queue && s_trace_node && s_pending_act_level != s_trace_level) {
+            int64_t pre_write_us = esp_timer_get_time();
+            gpio_set_level((gpio_num_t)s_act_gpio, s_pending_act_level ? 1 : 0);
+            int64_t post_write_us = esp_timer_get_time();
+            s_trace_level = s_pending_act_level;
+            trace_act(sf_seq, s_trace_level, target_us, pre_write_us, post_write_us);
+            return;
+        }
+#endif
         gpio_set_level((gpio_num_t)s_act_gpio, s_pending_act_level ? 1 : 0);
     }
 }
@@ -206,12 +260,12 @@ on_err_t on_esp32_hal_init(const on_esp32_cfg_t *cfg, on_hal_ops_t *hal_out) {
     if (esp_wifi_init(&wcfg) != ESP_OK) return ON_ERR_NOT_READY;
     esp_wifi_set_storage(WIFI_STORAGE_RAM);
     esp_wifi_set_mode(WIFI_MODE_STA);
-    esp_wifi_set_ps(WIFI_PS_NONE);
 
     /* Lock raw 802.11 TX PHY rate to 54 Mbps BEFORE esp_wifi_start() */
     esp_wifi_config_80211_tx_rate(WIFI_IF_STA, WIFI_PHY_RATE_54M);
 
     if (esp_wifi_start() != ESP_OK) return ON_ERR_NOT_READY;
+    if (esp_wifi_set_ps(WIFI_PS_NONE) != ESP_OK) return ON_ERR_NOT_READY;
     esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
     esp_wifi_get_mac(WIFI_IF_STA, s_mac48);
 
@@ -229,17 +283,36 @@ on_err_t on_esp32_hal_init(const on_esp32_cfg_t *cfg, on_hal_ops_t *hal_out) {
     hal_out->radio_set_channel = esp32_radio_set_channel;
     hal_out->on_act_trigger = esp32_on_act_trigger;
     hal_out->get_mac48      = esp32_get_mac48;
+    hal_out->tx_timing_best_effort = true;
     return ON_OK;
 }
 
+void on_esp32_hal_tx_counts(uint32_t *accepted, uint32_t *failed) {
+    *accepted = s_tx_accepted;
+    *failed   = s_tx_failed;
+}
+
 void on_esp32_hal_poll_rx(on_node_t *node) {
-    if (s_pending_followup_err_ns != 0) {
-        on_node_record_sync_tx_err_ns(node, s_pending_followup_err_ns);
-        s_pending_followup_err_ns = 0;
-    }
+#ifdef OPENNEAR_ACT_TRACE
+    s_trace_node = node;
+#endif
     while (s_rx_tail != s_rx_head) {
         const esp32_rx_slot_t *slot = &s_rx_ring[s_rx_tail];
+#ifdef OPENNEAR_ACT_TRACE
+        uint32_t sync_before = node->sync_rx_total;
+        int64_t dequeued_us = esp_timer_get_time();
+#endif
         on_node_on_rx_raw(node, slot->data, slot->len, slot->rx_local_ns);
+#ifdef OPENNEAR_ACT_TRACE
+        if (node->sync_rx_total != sync_before) {
+            s_trace_last_beacon.rx_accepted_us = esp_timer_get_time();
+            s_trace_last_beacon.beacon_sf = node->current_sf_seq;
+            s_trace_last_beacon.rx_hw_us = slot->rx_hw_us;
+            s_trace_last_beacon.rx_mapped_us = slot->rx_local_ns / 1000LL;
+            s_trace_last_beacon.rx_callback_us = slot->rx_callback_us;
+            s_trace_last_beacon.rx_dequeue_us = dequeued_us;
+        }
+#endif
         s_rx_tail = (uint8_t)((s_rx_tail + 1u) % ON_RX_RING_SIZE);
     }
 }

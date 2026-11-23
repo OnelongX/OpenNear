@@ -47,6 +47,7 @@ typedef struct {
     uint8_t  key_epoch;         /* v3.0: Active key rotation epoch (0..255) */
     uint8_t  act_cmd;           /* Synchronized action payload (e.g. LED blink pattern / epoch) */
     uint8_t  hop_depth;         /* 0 for primary G, 1 for Sub-G */
+    uint8_t  act_flip_lead_sf;  /* Optional direct GPIO flip in 1..7 SFs; 0 = no announcement */
     uint8_t  flags;             /* [7:4] afh_countdown | [3:0] L1 waveform indicator */
     uint8_t  beacon_mac[4];     /* v3.0: 32-bit AES-CBC-MAC anti-spoofing tag over beacon */
 } on_sync_payload_t;

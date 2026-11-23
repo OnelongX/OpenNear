@@ -60,7 +60,59 @@ powershell -ExecutionPolicy Bypass -File d:\AIOS\opennear\build_and_test.ps1
 进入 `ports/esp32_wroom32/`，使用 PlatformIO 分别烧录主控与从机（或全部烧录 `esp32_node_t`，将其中一块的 `GPIO4` 接地即可自动作为 Primary `G` 启动）：
 - 主控 G 节点：`pio run -e esp32_node_g -t upload`
 - 从机 T / Sub-G / Backup 节点：`pio run -e esp32_node_t -t upload`
-- 所有节点板载 `GPIO2` LED 将在每个超帧的 `ACT/QUIET` 静默区齐刷刷同步闪烁。
+- 节点使用 `GPIO2` 输出超帧中的 ACT 动作；串口 `115200` 下可查看角色、同步帧接收量、上行收发计数和接管次数。
+- ESP32 的原始 Wi-Fi 发送由驱动排队，提交成功不代表已经发射，且没有可用于此端口 RTT 校准的实际发射时间戳。因此这个端口不启用空口 RTT 校准或基于提交时间的 PTP 跟进修正，备用节点须同时满足连续漏收至少 12 帧和本地时钟计时至少 150 ms 未收到有效同步帧才接管；仿真和其他端口默认仍为 3 帧，无额外时长门槛。GPIO 对齐精度需用示波器或逻辑分析仪独立测量。
+
+- 主节点重启更换会话后，直连从节点收到认证的主同步帧即丢弃旧时隙并自动重新入网；若允许备用角色，主节点可以重新选它为备用。相同会话内的密钥轮换不触发重新入网。同一会话内，动态入网的直连从节点也会在主同步帧不再公布其时隙时重新入网。ESP32 将上行租约设为 250 个超帧（默认 4 ms 超帧下约 1 秒），避免短暂的 Wi-Fi 上行丢帧撤销时隙。串口的 `rejoins` 记录重新入网，`leases` 记录已回收的租约。
+
+#### 双板主备真机回归
+
+烧录主控和备用节点后，关闭占用两个串口的监视器，并在项目根目录运行：
+
+```powershell
+python -m pip install pyserial
+python .\tests\test_esp32_failover_hw.py --primary COM3 --backup COM4
+```
+
+将端口号替换成实际值。这个测试会通过 RTS 多次复位主控（要求主控板的 USB 串口支持 RTS 拉住 EN），不会擦除 Flash 或重新烧录。默认先观察 180 秒，再做 12 轮主备切换，最后观察 30 秒。每轮检查备用接管、原主恢复后备用无需重启即可重新入网并再次获得备用资格。短地址是动态分配的，脚本不会将备用地址固定为某个值。前后观察阶段检查两板角色和接管计数、意外重启，以及同步帧和上行数据计数是否持续增长。
+
+串口原始日志和 JSON 摘要写到 `build/hardware-esp32/`，失败时返回非零状态。串口状态约每秒输出一次，记录的时间是观测时间，不用于测量精确接管延迟或 GPIO 对齐精度。
+
+#### 双板 GPIO 同步测量（无外置逻辑分析仪）
+
+主控 ESP32 可通过两个 MCPWM 捕获通道，用同一个硬件计数器给两路 GPIO 边沿打时间戳。拔掉两板 USB 电源后接线（按 GPIO 编号，不是排针序号）：
+
+| 信号 | 接法 |
+| --- | --- |
+| 共地 | 主控 GND ↔ 从机 GND |
+| 主控 ACT | 主控 GPIO2 → 主控 GPIO32 |
+| 从机 ACT | 从机 GPIO2 → 主控 GPIO33 |
+
+不要把两块板的 GPIO2 并在一起，也不要互连 3V3 或 5V。两板接回原 USB 口后，只在主控上烧录测量环境，从机保留原固件。在项目根目录运行：
+
+```powershell
+pio run -d .\ports\esp32_wroom32 -e esp32_node_g_capture -t upload --upload-port COM3
+python .\tests\measure_esp32_gpio_sync.py --port COM3 --seconds 60
+```
+
+脚本默认在 ±10 ms 内一对一配对同极性边沿。`build/gpio-sync/` 保存原始串口记录、配对 CSV 和 JSON；正的时间差表示从机在后。看 P95、P99、最大偏差时也要检查漏配数量，窗口外的边沿不参与统计。硬件计数器分辨率不是整套测量的准确度；如需估计通道间偏差，先用同一个主控 GPIO2 驱动 GPIO32 和 GPIO33，再恢复表中的双板接线。测量结束可烧回 `esp32_node_g`。
+
+如需定位偏差来源，保持上述接线，分别烧录诊断环境 `esp32_node_g_trace`（主控）和 `esp32_node_t_trace`（从机）。待两板入网后，在项目根目录运行：
+
+```powershell
+python .\tests\capture_esp32_act_trace.py --primary COM3 --terminal COM4 --seconds 60
+python .\tests\analyze_esp32_act_trace.py <主板日志路径> <从板日志路径>
+```
+
+诊断将真实 GPIO 边沿与固件内部的动作超帧、计划时间、写入时间和最后收到的同步帧关联。USB 串口到达时间只用于初步对齐记录，不用于计算偏差。报告中的「主板计划发帧时刻 → 从板 Wi-Fi 回调」包含发送调度、驱动排队、空口和接收驱动延迟；它不是纯空口时延。诊断环境会增加少量记录开销，不替代无诊断固件的基线测量。
+
+#### 可选实验：提前广播 GPIO 翻转
+
+两块直连 ESP32 分别烧录 `esp32_node_g_lookahead`（主板）和 `esp32_node_t_lookahead`（从板）；沿用上述接线、trace 采集和分析命令。对照组用 `esp32_node_g_trace` / `esp32_node_t_trace`。普通 `esp32_node_g` / `esp32_node_t` 仍保持原行为。
+
+主板在翻转前 1–7 个超帧重复广播倒计时。从板将目标超帧的 ACT 时刻转换成本地截止时间，并取同一目标多次观测中最早的预测值；目标帧信标迟到或丢失时也可以执行。扩展占用主 `SYNC_MAP` 第 37 字节（从 0 编号为 36）的第 1–3 位，仍是 44 字节，保留当前电平字节、AFH/PHY 旗标和认证标签位置。此模式仅供直连二值 GPIO 演示，不扩展到二跳广播或任意动作负载，也不修改 TDMA 时钟。
+
+启用后 trace 所记超帧是计划目标，不等于从板实际写入时所处的主板超帧。比较精度以捕获器的真实时间差为准；`gpio_terminal_late_by_sf` 统计从板真实边沿至少晚一个超帧的已诊断配对。trace 中最后收到的同步帧不一定是提供计划时间的那一帧。提前执行不等同于校准驱动排队造成的绝对时钟偏差。
 
 ### 路线 A：Nordic nRF52840 裸射频 + PPI（量产微安级低功耗）
 进入 `ports/nrf52840_bare/`，使用 ARM GCC 工具链编译：

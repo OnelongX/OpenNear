@@ -248,7 +248,11 @@ on_err_t on_sync_payload_pack(const on_sync_payload_t *p, uint8_t *out, size_t c
     uint16_t sg2 = p->sub_g_id_2 & ON_SHORT_ID_MASK;
     uint16_t bk_packed  = (uint16_t)((p->backup_id & ON_SHORT_ID_MASK) | ((sg2 & 0x00Fu) << 12));
     uint16_t sg1_packed = (uint16_t)((p->sub_g_id  & ON_SHORT_ID_MASK) | (((sg2 >> 4) & 0x00Fu) << 12));
-    uint8_t  hop_packed = (uint8_t)((p->hop_depth & 0x0Fu) | (((sg2 >> 8) & 0x00Fu) << 4));
+    /* Byte 36: [7:4] Sub-G-2 ID, [3:1] optional ACT lead, [0] hop depth. */
+    uint8_t  hop_packed = (uint8_t)((p->hop_depth & 1u) | (((sg2 >> 8) & 0x00Fu) << 4));
+    if (p->hop_depth == 0u && p->act_flip_lead_sf <= 7u) {
+        hop_packed |= (uint8_t)(p->act_flip_lead_sf << 1);
+    }
 
     put_u32_le(out + 0,  p->sf_seq);
     put_i64_le(out + 4,  p->t_tx_net_ns);
@@ -297,7 +301,8 @@ on_err_t on_sync_payload_unpack(const uint8_t *in, size_t len, on_sync_payload_t
     p->session_salt       = get_u32_le(in + 30);
     p->key_epoch          = in[34];
     p->act_cmd            = in[35];
-    p->hop_depth          = hop_raw & 0x0Fu;
+    p->hop_depth          = hop_raw & 1u;
+    p->act_flip_lead_sf   = p->hop_depth == 0u ? (hop_raw >> 1) & 7u : 0u;
     p->flags              = in[37];
     p->prev_tx_err_ns     = (int16_t)get_u16_le(in + 38);
     memcpy(p->beacon_mac, in + 40, 4u);

@@ -33,6 +33,21 @@ on_err_t on_esp32_hal_init(const on_esp32_cfg_t *cfg, on_hal_ops_t *hal_out);
 /* Drain lock-free ISR RX ring buffer into the OpenNear node state machine */
 void     on_esp32_hal_poll_rx(on_node_t *node);
 
+/* Wi-Fi driver submissions; read from the same task as the protocol engine. */
+void     on_esp32_hal_tx_counts(uint32_t *accepted, uint32_t *failed);
+
+#ifdef OPENNEAR_ACT_TRACE
+typedef struct {
+    uint32_t seq, act_sf, beacon_sf, rx_hw_us;
+    uint16_t sf_us, act_offset_us;
+    uint8_t level, role, scheduled;
+    int64_t planned_us, step_us, pre_write_us, post_write_us;
+    int64_t rx_mapped_us, rx_callback_us, rx_dequeue_us, rx_accepted_us;
+} on_esp32_act_trace_t;
+bool on_esp32_hal_trace_init(void);
+bool on_esp32_hal_trace_read(on_esp32_act_trace_t *trace);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

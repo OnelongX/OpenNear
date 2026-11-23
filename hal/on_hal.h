@@ -38,6 +38,9 @@ typedef struct on_hal_ops {
 
     /* Optional structured event callback / logger */
     void     (*on_event)(void *ctx, const char *event_name, uint32_t arg1, int64_t arg2);
+
+    /* True when TX is queued and its requested time is not an on-air timestamp. */
+    bool     tx_timing_best_effort;
 } on_hal_ops_t;
 
 #ifdef __cplusplus

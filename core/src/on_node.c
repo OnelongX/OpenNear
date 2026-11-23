@@ -1,6 +1,66 @@
 #include "on_node.h"
 #include <string.h>
 
+#define ON_ACT_DEMO_PERIOD_SF 10u
+
+static uint8_t demo_act_level(uint32_t sf) {
+    return (uint8_t)((sf / ON_ACT_DEMO_PERIOD_SF) & 1u);
+}
+
+static uint8_t demo_act_flip_lead(uint32_t sf) {
+    uint32_t lead = ON_ACT_DEMO_PERIOD_SF - sf % ON_ACT_DEMO_PERIOD_SF;
+    /* This demo's last block before uint32 wrap is shorter. */
+    if (lead > UINT32_MAX - sf) lead = UINT32_MAX - sf + 1u;
+    return lead <= 7u ? (uint8_t)lead : 0u;
+}
+
+static bool sf_after(uint32_t a, uint32_t b) {
+    return a != b && a - b <= UINT32_MAX / 2u;
+}
+
+static void receive_act_lookahead(on_node_t *node, const on_sync_payload_t *sp) {
+    if (node->act_lookahead.has_beacon && !sf_after(sp->sf_seq, node->act_lookahead.beacon_sf)) return;
+    node->act_lookahead.beacon_sf = sp->sf_seq;
+    node->act_lookahead.session_salt = sp->session_salt;
+    if (!node->act_lookahead.has_beacon || !sf_after(node->act_lookahead.level_sf, sp->sf_seq)) {
+        const bool reached_target = node->act_lookahead.pending &&
+            !sf_after(node->act_lookahead.target_sf, sp->sf_seq);
+        /* Preserve the local deadline when the new level confirms the plan.
+         * A conflicting current level (e.g. after a long outage) supersedes it. */
+        if (!reached_target || node->act_lookahead.next_level != sp->act_cmd) {
+            if (reached_target) node->act_lookahead.pending = false;
+            node->act_cmd = sp->act_cmd;
+            node->act_lookahead.level_sf = sp->sf_seq;
+        }
+    }
+    node->act_lookahead.has_beacon = true;
+    if (!sp->act_flip_lead_sf || sp->act_cmd > 1u || !sp->t_sf_us || sp->act_fire_off_us >= sp->t_sf_us) return;
+    uint32_t target = sp->sf_seq + sp->act_flip_lead_sf;
+    if (!sf_after(target, node->act_lookahead.level_sf)) return;
+    int64_t target_net_ns = sp->t_tx_net_ns +
+        ((int64_t)sp->act_flip_lead_sf * sp->t_sf_us + sp->act_fire_off_us) * 1000LL;
+    int64_t deadline = on_sync_net_to_local(&node->sync, target_net_ns);
+    /* Pick the earliest projection across repeated announcements. A delayed
+     * beacon cannot postpone an armed deadline; the TDMA clock is unchanged. */
+    if (!node->act_lookahead.pending || target != node->act_lookahead.target_sf ||
+        deadline < node->act_lookahead.deadline_local_ns) {
+        node->act_lookahead.pending = true;
+        node->act_lookahead.target_sf = target;
+        node->act_lookahead.deadline_local_ns = deadline;
+        node->act_lookahead.next_level = sp->act_cmd ^ 1u;
+    }
+}
+
+static void fire_act(on_node_t *node, uint32_t sf, int64_t now_local_ns, bool scheduled) {
+    node->act_fire_total++;
+    node->last_act_local_ns = now_local_ns;
+    node->last_act_was_scheduled = scheduled;
+    if (scheduled) node->last_act_deadline_local_ns = node->act_lookahead.deadline_local_ns;
+    if (node->hal.on_act_trigger) {
+        node->hal.on_act_trigger(node->hal.user_ctx, sf, node->act_cmd, now_local_ns);
+    }
+}
+
 static void emit_event(on_node_t *node, const char *name, uint32_t a1, int64_t a2) {
     if (node && node->hal.on_event) {
         node->hal.on_event(node->hal.user_ctx, name, a1, a2);
@@ -159,6 +219,9 @@ static void send_sync_map(on_node_t *node, bool is_sub_sync) {
     sp.key_epoch          = node->sec.key_epoch;
     sp.act_cmd            = node->act_cmd;
     sp.hop_depth          = is_sub_sync ? 1u : 0u;
+    if (!is_sub_sync && node->act_lookahead_enabled) {
+        sp.act_flip_lead_sf = demo_act_flip_lead(sp.sf_seq);
+    }
     sp.flags              = (uint8_t)(((node->afh_countdown & 0x0Fu) << 4) | (ON_PHY_LE_MSK_2M & 0x0Fu));
 
     uint8_t pbuf[ON_SYNC_PAYLOAD_WIRE_LEN];
@@ -198,6 +261,8 @@ void on_node_init(on_node_t *node, const on_hal_ops_t *hal,
         node->hal = *hal;
     }
     on_sf_cfg_default(&node->sf_cfg);
+    node->backup_miss_threshold = ON_BACKUP_MISS_THRESHOLD;
+    node->peer_lease_timeout_sf = ON_PEER_LEASE_TIMEOUT_SF;
     on_sync_init(&node->sync);
     on_sec_init(&node->sec);
     on_afh_init(&node->afh, false);
@@ -377,6 +442,40 @@ static void handle_join_req(on_node_t *node, const on_mac_hdr_t *hdr,
     emit_event(node, as_sub ? "SUB_JOIN_ASSIGNED" : "JOIN_ASSIGNED", pe->short_id, pe->slot_idx);
 }
 
+/* Discard the old assignment without losing link counters. */
+static void rejoin_primary(on_node_t *node, bool reset_clock) {
+    node->role = ON_ROLE_UNJOINED;
+    node->short_id = ON_SHORT_ID_UNASSIGNED;
+    node->my_slot = 0u;
+    node->primary_slot_leased = false;
+    node->awaiting_ack = false;
+    node->harq_retry_pending = false;
+    node->rtt_in_flight = false;
+    node->rtt_next_sf = 0u;
+    node->last_sync_tx_err_ns = 0;
+    node->has_pending_ch_map = false;
+    node->afh_countdown = 0u;
+    node->in_subg_z1_ch = false;
+    node->pending_key_rotation = false;
+    node->rx_slot_mask_this_sf = 0u;
+    node->sub_rx_slot_mask_this_sf = 0u;
+    node->last_ack_bitmap = 0u;
+    node->last_sub_ack_bitmap = 0u;
+    node->sub_tdma_bitmap = 0u;
+    node->relay_head = node->relay_tail = node->relay_count = 0u;
+    node->sub_g_zone = 0u;
+    node->next_alloc_id = 0x002u;
+    memset(node->peers, 0, sizeof(node->peers));
+
+    /* Only a new primary session invalidates the synchronized clock timeline. */
+    if (reset_clock) {
+        const int64_t ant_delay_ns = node->sync.ant_delay_ns;
+        on_sync_reset(&node->sync);
+        on_sync_set_ant_delay_ns(&node->sync, ant_delay_ns);
+    }
+    node->rejoin_count++;
+}
+
 void on_node_on_rx_raw(on_node_t *node, const uint8_t *frame, size_t len, int64_t rx_local_ns) {
     if (!node || !frame) return;
 
@@ -449,22 +548,12 @@ void on_node_on_rx_raw(on_node_t *node, const uint8_t *frame, size_t len, int64_
         case ON_FRAME_SUB_SYNC: {
             bool is_sub = (hdr.type == ON_FRAME_SUB_SYNC);
 
-            if (node->role == ON_ROLE_G) {
-                /* Split-brain reconciliation: yield if a lower Short-ID Primary G is active */
-                if (!is_sub && hdr.src_id < node->short_id) {
-                    node->role = ON_ROLE_T;
-                    emit_event(node, "G_YIELD_TO_PRIMARY", hdr.src_id, (int64_t)node->current_sf_seq);
-                } else {
-                    break;
-                }
-            }
+            /* A current primary only considers beacons from a lower-ID primary. */
+            bool yielding_primary = node->role == ON_ROLE_G;
+            if (yielding_primary && (is_sub || hdr.src_id >= node->short_id)) break;
 
-            /* Never let a 1-hop node that hears Primary SYNC_MAP downgrade to SUB_SYNC */
-            if (!is_sub) {
-                node->heard_primary_sync = true;
-            } else if (node->heard_primary_sync) {
-                break;
-            }
+            /* Never let a 1-hop node that hears Primary SYNC_MAP downgrade to SUB_SYNC. */
+            if (is_sub && node->heard_primary_sync) break;
 
             /* 1-hop joined nodes ignore SUB_SYNC; 2-hop edge nodes only lock to SUB_SYNC */
             if (node->role != ON_ROLE_UNJOINED) {
@@ -481,7 +570,37 @@ void on_node_on_rx_raw(on_node_t *node, const uint8_t *frame, size_t len, int64_
                     emit_event(node, "BEACON_SPOOF_DROP", hdr.src_id, (int64_t)sp.sf_seq);
                     break;
                 }
-                /* Adopt Primary G's session_salt & key_epoch (online KDF key rotation) */
+            }
+
+            /* Change role or assignment only after accepting the beacon. A same-salt key
+             * epoch change preserves the coordinator's schedule and does not require JOIN. */
+            const bool new_primary_session = !is_sub && node->sec.enabled && node->sync_rx_total > 0u &&
+                node->short_id != ON_SHORT_ID_UNASSIGNED && sp.session_salt != node->sec.session_salt;
+            if (node->act_lookahead_enabled && (is_sub || yielding_primary ||
+                hdr.src_id != node->parent_id ||
+                sp.session_salt != node->act_lookahead.session_salt)) {
+                memset(&node->act_lookahead, 0, sizeof(node->act_lookahead));
+            }
+            if (yielding_primary) {
+                node->role = ON_ROLE_T;
+                emit_event(node, "G_YIELD_TO_PRIMARY", hdr.src_id, (int64_t)node->current_sf_seq);
+            }
+            if (new_primary_session) {
+                rejoin_primary(node, true);
+                emit_event(node, "PRIMARY_SESSION_REJOIN", hdr.src_id, (int64_t)sp.sf_seq);
+            } else if (!is_sub && !yielding_primary && node->primary_slot_leased &&
+                       hdr.src_id == node->parent_id && node->my_slot < 16u) {
+                const uint32_t since_join = sp.sf_seq - node->primary_join_sf;
+                /* JOIN_ACK follows the map in its superframe. A later map from the
+                 * same parent must still advertise a dynamically assigned slot. */
+                if (since_join != 0u && since_join <= UINT32_MAX / 2u &&
+                    (sp.tdma_bitmap & (uint16_t)(1u << node->my_slot)) == 0u) {
+                    rejoin_primary(node, false);
+                    emit_event(node, "PRIMARY_LEASE_REJOIN", hdr.src_id, (int64_t)sp.sf_seq);
+                }
+            }
+            if (!is_sub) node->heard_primary_sync = true;
+            if (node->sec.enabled) {
                 on_sec_set_session(&node->sec, sp.session_salt, sp.key_epoch);
             }
 
@@ -493,6 +612,10 @@ void on_node_on_rx_raw(on_node_t *node, const uint8_t *frame, size_t len, int64_
             /* Step 1 + Step 3: Hardware RX capture feeds TC-PLL / NCO lock */
             on_sync_on_beacon(&node->sync, sp.t_tx_net_ns, rx_local_ns);
             node->sync_rx_total++;
+            if (node->backup_min_sync_silence_ns > 0) {
+                node->last_sync_accept_local_ns = node->hal.now_ns
+                    ? node->hal.now_ns(node->hal.user_ctx) : rx_local_ns;
+            }
             node->sync_rx_this_sf   = true;
             node->missed_sync_count = 0u;
             node->parent_id         = hdr.src_id;
@@ -501,7 +624,11 @@ void on_node_on_rx_raw(on_node_t *node, const uint8_t *frame, size_t len, int64_
             node->sf_cfg.sub_g_start_us  = sp.sub_g_win_start_us;
             node->sf_cfg.sub_g_len_us    = sp.sub_g_win_len_us;
             node->sf_cfg.act_fire_off_us = sp.act_fire_off_us;
-            node->act_cmd           = sp.act_cmd;
+            if (node->act_lookahead_enabled && !is_sub) {
+                receive_act_lookahead(node, &sp);
+            } else {
+                node->act_cmd = sp.act_cmd;
+            }
 
             if (is_sub) {
                 /* Sub-SYNC starts at offset sub_g_win_start_us inside primary superframe */
@@ -580,6 +707,8 @@ void on_node_on_rx_raw(on_node_t *node, const uint8_t *frame, size_t len, int64_
                 node->is_sub_node = (ack.is_sub_slot != 0u);
                 node->parent_id   = hdr.src_id;
                 node->role        = ON_ROLE_T;
+                node->primary_slot_leased = !node->is_sub_node;
+                node->primary_join_sf = node->current_sf_seq;
                 node->rtt_next_sf = node->current_sf_seq + 1u;
                 emit_event(node, node->is_sub_node ? "JOINED_VIA_SUBG" : "JOINED_PRIMARY",
                            node->short_id, node->my_slot);
@@ -588,7 +717,7 @@ void on_node_on_rx_raw(on_node_t *node, const uint8_t *frame, size_t len, int64_
         }
 
         case ON_FRAME_RTT_REQ: {
-            if (hdr.dst_id != node->short_id) break;
+            if (node->hal.tx_timing_best_effort || hdr.dst_id != node->short_id) break;
             on_rtt_req_t req;
             if (on_rtt_req_unpack(payload, plen, &req) != ON_OK) break;
 
@@ -627,7 +756,7 @@ void on_node_on_rx_raw(on_node_t *node, const uint8_t *frame, size_t len, int64_
         }
 
         case ON_FRAME_RTT_RESP: {
-            if (hdr.dst_id != node->short_id || !node->rtt_in_flight) break;
+            if (node->hal.tx_timing_best_effort || hdr.dst_id != node->short_id || !node->rtt_in_flight) break;
             on_rtt_resp_t resp;
             if (on_rtt_resp_unpack(payload, plen, &resp) != ON_OK) break;
             if (resp.token != node->rtt_token) break;
@@ -770,7 +899,7 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
 
                 node->current_sf_seq++;
                 node->current_sf_start_net_ns += t_sf_ns;
-                node->act_cmd = (uint8_t)((node->current_sf_seq / 10u) & 0x01u); /* Toggle LED every 10 SF (40ms) */
+                node->act_cmd = demo_act_level(node->current_sf_seq);
 
                 /* Atomic key epoch rotation at exact 0 us superframe boundary */
                 if (node->pending_key_rotation && node->sec.enabled) {
@@ -783,7 +912,7 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
                 /* v3.0 Lease Expiry GC & automatic Sub-G / Backup_ID re-election */
                 for (uint32_t i = 0u; i < ON_MAX_NODES_TABLE; ++i) {
                     if (node->peers[i].active && !node->peers[i].is_sub_slot &&
-                        node->current_sf_seq > node->peers[i].last_seen_sf + ON_PEER_LEASE_TIMEOUT_SF) {
+                        node->current_sf_seq - node->peers[i].last_seen_sf > node->peer_lease_timeout_sf) {
                         uint16_t dead_id = node->peers[i].short_id;
                         uint8_t  dead_slot = node->peers[i].slot_idx;
                         node->tdma_bitmap &= (uint16_t)(~(1u << dead_slot));
@@ -816,12 +945,7 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
         int64_t act_off_ns = (int64_t)node->sf_cfg.act_fire_off_us * 1000LL;
         if (!node->act_fired_this_sf && elapsed_ns >= act_off_ns) {
             node->act_fired_this_sf = true;
-            node->act_fire_total++;
-            node->last_act_local_ns = now_local_ns;
-            if (node->hal.on_act_trigger) {
-                node->hal.on_act_trigger(node->hal.user_ctx, node->current_sf_seq,
-                                         node->act_cmd, now_local_ns);
-            }
+            fire_act(node, node->current_sf_seq, now_local_ns, false);
         }
         return;
     }
@@ -855,15 +979,17 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
 
     /*
      * ZERO-VOTE HOT-STANDBY FAILOVER (Backup_ID):
-     * If primary G missed 3 consecutive SYNC frames (missed_sync_count >= 3),
-     * then on the 4th frame at 0 us (elapsed_ns >= t_sf_ns), Backup_ID immediately
-     * assumes Primary G role inheriting sf_seq, tdma_bitmap, sub_g_id, and locked NCO slope!
+     * After the configured number of consecutive missed SYNC frames (default 3),
+     * Backup_ID takes the role at the next boundary, inheriting the schedule and clock.
+     * Queued radios can additionally require a minimum silence interval on the local clock.
      */
     if (node->role == ON_ROLE_T &&
         !node->is_sub_node &&
         node->short_id != ON_SHORT_ID_UNASSIGNED &&
         node->short_id == node->backup_id &&
-        node->missed_sync_count >= ON_BACKUP_MISS_THRESHOLD &&
+        node->missed_sync_count >= node->backup_miss_threshold &&
+        (node->backup_min_sync_silence_ns <= 0 ||
+         now_local_ns - node->last_sync_accept_local_ns >= node->backup_min_sync_silence_ns) &&
         elapsed_ns >= t_sf_ns) {
         node->current_sf_seq++;
         node->current_sf_start_net_ns += t_sf_ns;
@@ -875,7 +1001,8 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
         node->backup_id         = select_next_backup_id(node);
         node->sync_rx_this_sf   = true;
         node->act_fired_this_sf = false;
-        node->act_cmd           = (uint8_t)((node->current_sf_seq / 10u) & 0x01u);
+        node->act_cmd           = demo_act_level(node->current_sf_seq);
+        memset(&node->act_lookahead, 0, sizeof(node->act_lookahead));
         if (node->afh.enabled) {
             tune_channel(node, on_afh_channel_for(&node->afh, node->current_sf_seq, 0u));
         }
@@ -1116,6 +1243,7 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
 
                 send_frame(node, &hdr, abuf, alen, now_local_ns);
             } else if ((node->role == ON_ROLE_T || node->role == ON_ROLE_SUB_G) &&
+                       !node->hal.tx_timing_best_effort &&
                        node->current_sf_seq >= node->rtt_next_sf &&
                        ((node->current_sf_seq % 7u) == my_turn)) {
                 /* Periodic 4-timestamp RTT calibration */
@@ -1149,14 +1277,15 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
 
     /* Phase 4: ACT / QUIET Silent Guard Band -> Synchronized Hardware Action Trigger */
     int64_t act_off_ns = (int64_t)node->sf_cfg.act_fire_off_us * 1000LL;
-    if (!node->act_fired_this_sf && elapsed_ns >= act_off_ns) {
+    if (node->act_lookahead.pending && now_local_ns >= node->act_lookahead.deadline_local_ns) {
+        node->act_lookahead.pending = false;
+        node->act_cmd = node->act_lookahead.next_level;
+        node->act_lookahead.level_sf = node->act_lookahead.target_sf;
+        if (node->current_sf_seq == node->act_lookahead.target_sf) node->act_fired_this_sf = true;
+        fire_act(node, node->act_lookahead.target_sf, now_local_ns, true);
+    } else if (!node->act_fired_this_sf && elapsed_ns >= act_off_ns) {
         node->act_fired_this_sf = true;
-        node->act_fire_total++;
-        node->last_act_local_ns = now_local_ns;
-        if (node->hal.on_act_trigger) {
-            node->hal.on_act_trigger(node->hal.user_ctx, node->current_sf_seq,
-                                     node->act_cmd, now_local_ns);
-        }
+        fire_act(node, node->current_sf_seq, now_local_ns, false);
     }
 
     /* End of ACT/QUIET: advance AFH countdown & pre-tune radio for next superframe's TSCH channel */
@@ -1218,7 +1347,11 @@ int64_t on_node_next_wakeup_local_ns(const on_node_t *node, int64_t now_local_ns
             best_net = candidates[i];
         }
     }
-    return on_sync_net_to_local(&node->sync, best_net);
+    int64_t best_local = on_sync_net_to_local(&node->sync, best_net);
+    if (node->act_lookahead.pending && node->act_lookahead.deadline_local_ns < best_local) {
+        best_local = node->act_lookahead.deadline_local_ns;
+    }
+    return best_local;
 }
 
 bool on_node_is_rx_open(const on_node_t *node, int64_t now_local_ns) {

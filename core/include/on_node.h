@@ -41,6 +41,8 @@ typedef struct {
     uint16_t       short_id;           /* 12-bit Short-ID (0x001..0xFFE) */
     uint8_t        my_slot;            /* Assigned D-TDMA or Sub-TDMA slot */
     bool           is_sub_node;        /* True if attached behind a Sub-G relay (2-hop) */
+    bool           primary_slot_leased; /* Direct assignment obtained through JOIN_ACK */
+    uint32_t       primary_join_sf;    /* Ignore a map from before or during the JOIN */
     bool           heard_primary_sync; /* True once primary G SYNC_MAP has been heard */
     uint16_t       parent_id;          /* Primary G or Sub-G Short-ID */
 
@@ -56,8 +58,25 @@ typedef struct {
     bool           in_subg_z1_ch;      /* True while Zone-1 Sub-G is hopped onto orthogonal channel */
     int16_t        last_sync_tx_err_ns;/* v3.1: Measured SYNC TX departure error for PTP follow-up */
     uint8_t        act_cmd;
+    bool           act_lookahead_enabled; /* Opt-in for direct, binary GPIO demo only */
+    struct {
+        bool      has_beacon;
+        uint32_t  beacon_sf;
+        uint32_t  session_salt;
+        uint32_t  level_sf;         /* Oldest beacon allowed to replace current level */
+        bool      pending;
+        uint32_t  target_sf;
+        int64_t   deadline_local_ns;
+        uint8_t   next_level;
+    } act_lookahead;
+    bool           last_act_was_scheduled;
+    int64_t        last_act_deadline_local_ns;
     bool           sync_rx_this_sf;
     uint32_t       missed_sync_count;
+    uint32_t       peer_lease_timeout_sf; /* Silent superframes before reclaiming a peer */
+    uint8_t        backup_miss_threshold; /* Consecutive missed beacons before takeover */
+    int64_t        backup_min_sync_silence_ns; /* Optional real local time without a valid beacon */
+    int64_t        last_sync_accept_local_ns;  /* Local processing time, not the network clock */
     bool           act_fired_this_sf;
     bool           tdma_tx_done_this_sf;
     bool           sub_sync_tx_done_this_sf;
@@ -111,6 +130,7 @@ typedef struct {
     uint32_t       tdma_rx_total;
     uint32_t       sub_sync_tx_total;
     uint32_t       failover_count;
+    uint32_t       rejoin_count;       /* Discarded assignments after session change or slot expiry */
     uint32_t       lease_reclaim_count;
     uint32_t       subg_failover_count;
     uint32_t       act_fire_total;
