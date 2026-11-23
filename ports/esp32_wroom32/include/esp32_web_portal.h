@@ -58,7 +58,7 @@ th{color:var(--mut);font-weight:600;font-size:12px}
     <div class="brand">
       <h1>OpenNear</h1>
       <span class="badge" id="b-role">加载中...</span>
-      <span class="badge" id="b-fw">v6.8</span>
+      <span class="badge" id="b-fw">v6.9</span>
     </div>
     <div class="row">
       <input id="g-token" type="password" placeholder="Admin Token (如已设置)" style="width:185px" onchange="saveLocalToken()">
@@ -156,6 +156,12 @@ th{color:var(--mut);font-weight:600;font-size:12px}
       </div>
       <div class="row" style="margin-top:10px">
         <button class="btn" onclick="sendNodeCmd()">发送空口下行指令</button>
+        <button class="btn sec sm" onclick="quickPreset('MODE:SYNC')">同拍 SYNC</button>
+        <button class="btn sec sm" onclick="quickPreset('MODE:STROBE')">高频频闪 STROBE</button>
+        <button class="btn sec sm" onclick="quickPreset('MODE:PULSE')">心跳同拍 PULSE</button>
+        <button class="btn sec sm" onclick="quickPreset('RELAY:1')">继电器 ON</button>
+        <button class="btn sec sm" onclick="quickPreset('RELAY:0')">继电器 OFF</button>
+        <button class="btn sec sm" onclick="quickPreset('PING')">闪烁定位 PING</button>
       </div>
     </div>
 
@@ -463,6 +469,13 @@ async function sendNodeCmd(){
   if(!pay){toast('请输入控制载荷',true);return;}
   if(await postCmd('CMD:'+id+'|'+pay)){
     toast('已下发空口指令至 0x'+id.toUpperCase());
+  }
+}
+async function quickPreset(pay){
+  const id=$('c-id').value.trim().replace(/^0x/i,'')||'FFF';
+  $('c-pay').value=pay;
+  if(await postCmd('CMD:'+id+'|'+pay)){
+    toast('已向 0x'+id.toUpperCase()+' 下发演示模式: '+pay);
   }
 }
 async function triggerOta(){

@@ -1,0 +1,102 @@
+name: Deploy OpenNear Web Flasher (GitHub Pages)
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'core/**'
+      - 'hal/**'
+      - 'ports/esp32_wroom32/**'
+      - 'docs/**'
+      - '.github/workflows/pages-web-flasher.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages-web-flasher
+  cancel-in-progress: true
+
+jobs:
+  build-flasher-bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache PlatformIO Packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: ${{ runner.os }}-pio-esp32-${{ hashFiles('ports/esp32_wroom32/platformio.ini') }}
+
+      - name: Install PlatformIO & esptool
+        run: pip install -U platformio esptool
+
+      - name: Build 4 ESP32 Factory Firmwares & Merge Web-Flasher Images
+        run: |
+          mkdir -p site/firmware
+          cp -r docs/* site/
+
+          ENVS="esp32_iot_mesh_gw_tls esp32_iot_mesh_gw esp32_demo_sync_node esp32_node_t_ota"
+          pio run -d ports/esp32_wroom32 \
+            -e esp32_iot_mesh_gw_tls \
+            -e esp32_iot_mesh_gw \
+            -e esp32_demo_sync_node \
+            -e esp32_node_t_ota
+
+          BOOT_APP0=$(find ~/.platformio/packages/framework-arduinoespressif32 -name boot_app0.bin | head -n 1)
+          echo "Using boot_app0: $BOOT_APP0"
+
+          for ENV in $ENVS; do
+            BDIR="ports/esp32_wroom32/.pio/build/$ENV"
+            OUT="site/firmware/${ENV}.bin"
+            python3 -m esptool --chip esp32 merge_bin \
+              -o "$OUT" \
+              --flash_mode dio --flash_freq 40m --flash_size 4MB \
+              0x1000  "$BDIR/bootloader.bin" \
+              0x8000  "$BDIR/partitions.bin" \
+              0xe000  "$BOOT_APP0" \
+              0x10000 "$BDIR/firmware.bin"
+
+            cat > "site/firmware/manifest-${ENV}.json" <<EOF
+          {
+            "name": "OpenNear v6.9 (${ENV})",
+            "version": "6.9.0",
+            "new_install_prompt_erase": true,
+            "builds": [
+              {
+                "chipFamily": "ESP32",
+                "parts": [
+                  { "path": "${ENV}.bin", "offset": 0 }
+                ]
+              }
+            ]
+          }
+          EOF
+          done
+          ls -lh site/firmware/
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build-flasher-bundle
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

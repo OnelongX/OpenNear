@@ -81,6 +81,6 @@ jobs:
       - name: Install PlatformIO CLI
         run: pip install -U platformio
 
-      - name: Link & Verify ESP32 Gateway (Plain + MQTTS/TLS) & OTA Terminal Firmwares
+      - name: Link & Verify ESP32 Gateway (Plain + MQTTS/TLS), Demo Sync & OTA Terminal Firmwares
         run: |
-          pio run -d ports/esp32_wroom32 -e esp32_iot_mesh_gw -e esp32_iot_mesh_gw_tls -e esp32_node_t_ota
+          pio run -d ports/esp32_wroom32 -e esp32_iot_mesh_gw -e esp32_iot_mesh_gw_tls -e esp32_demo_sync_node -e esp32_node_t_ota

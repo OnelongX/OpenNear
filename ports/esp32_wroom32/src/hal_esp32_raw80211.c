@@ -10,6 +10,9 @@
 #ifdef OPENNEAR_ACT_TRACE
 #include "freertos/queue.h"
 #endif
+#ifdef OPENNEAR_ENABLE_DEMO_APP
+#include "esp32_demo_app.h"
+#endif
 
 /* 802.11 Vendor-Specific Action (0xD0) carrier header:
  * 24-byte 802.11 MAC header + 1-byte Category (0x7F) + 3-byte OpenNear OUI ("ON\x01") = 28 bytes */
@@ -251,8 +254,13 @@ static void esp32_radio_set_channel(void *ctx, uint8_t ch_idx) {
 
 static void esp32_on_act_trigger(void *ctx, uint32_t sf_seq, uint8_t act_cmd, int64_t local_ns) {
     (void)ctx;
+    uint8_t lvl = (uint8_t)(act_cmd & 0x01u);
+#ifdef OPENNEAR_ENABLE_DEMO_APP
+    lvl = on_esp32_demo_act_level(sf_seq, lvl);
+#else
     (void)sf_seq;
-    s_pending_act_level = (act_cmd & 0x01u);
+#endif
+    s_pending_act_level = lvl;
     int64_t now_us = esp_timer_get_time();
     int64_t target_us = local_ns / 1000LL;
     if (s_act_timer && target_us > now_us + 5LL && (target_us - now_us) < 2000LL) {

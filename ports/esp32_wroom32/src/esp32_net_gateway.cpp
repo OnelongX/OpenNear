@@ -1,6 +1,7 @@
 #include "esp32_net_gateway.h"
 #include "hal_esp32_raw80211.h"
 #include "esp32_ota_flash.h"
+#include "esp32_demo_app.h"
 #include "on_mqtt.h"
 #include <Arduino.h>
 #include <string.h>
@@ -537,7 +538,7 @@ static void start_local_http_api(void) {
 
         append_cstr(json, sizeof(json), &pos, "{\"role\":\"");
         append_cstr(json, sizeof(json), &pos, role_s);
-        snprintf(num, sizeof(num), "\",\"id\":\"0x%03X\",\"mac\":\"%s\",\"ble_mac\":\"%s\",\"sf\":%u,\"fw_ver\":\"v6.8\",\"uptime_s\":%u",
+        snprintf(num, sizeof(num), "\",\"id\":\"0x%03X\",\"mac\":\"%s\",\"ble_mac\":\"%s\",\"sf\":%u,\"fw_ver\":\"v6.9\",\"uptime_s\":%u",
                  (unsigned)short_id, mac_s, bmac_s, (unsigned)sf_seq, (unsigned)(millis() / 1000u));
         append_cstr(json, sizeof(json), &pos, num);
 
@@ -719,6 +720,21 @@ static void start_local_http_api(void) {
             body = String("AUTH:") + String(s_gw_ref->cfg.admin_token) + "|" + body;
         }
         on_err_t rc = on_gw_handle_control_text(s_gw_ref, body.c_str(), body.length(), false);
+        /* Also mirror local broadcast/self CMD payloads to gateway's own demo app */
+        if (rc == ON_OK && s_node_ref) {
+            int cpos = body.indexOf("CMD:");
+            if (cpos >= 0) {
+                int bar = body.indexOf('|', cpos + 4);
+                if (bar > cpos + 4) {
+                    String id_s = body.substring(cpos + 4, bar);
+                    uint16_t tid = static_cast<uint16_t>(strtoul(id_s.c_str(), nullptr, 16) & ON_SHORT_ID_MASK);
+                    if (tid == ON_SHORT_ID_BROADCAST || tid == s_node_ref->short_id) {
+                        String pay = body.substring(bar + 1);
+                        on_esp32_demo_on_cmd(reinterpret_cast<const uint8_t *>(pay.c_str()), pay.length());
+                    }
+                }
+            }
+        }
         s_http_srv.send((rc == ON_OK) ? 200 : 400, "application/json",
                         (rc == ON_OK) ? "{\"ok\":true}" : "{\"ok\":false}");
     });
@@ -997,6 +1013,7 @@ static on_err_t esp32_ble_notify_cb(void *ctx, const uint8_t *data, size_t len) 
 static on_err_t esp32_downlink_cb(void *ctx, const on_gw_bridge_msg_t *msg) {
     (void)ctx;
     if (!msg) return ON_ERR_INVALID_ARG;
+    on_esp32_demo_on_cmd(msg->payload, msg->payload_len);
     Serial.printf("[OpenNear GW] Downlink cmd seq=%u type=%u len=%u: %.*s\n",
                   (unsigned)msg->seq, (unsigned)msg->bridge_type,
                   (unsigned)msg->payload_len, (int)msg->payload_len,

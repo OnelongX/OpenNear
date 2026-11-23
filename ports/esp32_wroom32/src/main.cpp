@@ -6,6 +6,7 @@
 #include "act_capture.h"
 #include "esp32_ota_flash.h"
 #include "esp32_net_gateway.h"
+#include "esp32_demo_app.h"
 
 #ifndef OPENNEAR_IS_MASTER
 #define OPENNEAR_IS_MASTER 0
@@ -97,7 +98,7 @@ static void opennear_rt_task(void *arg) {
             last_log_ns = now_ns;
             uint32_t tx_accepted, tx_failed;
             on_esp32_hal_tx_counts(&tx_accepted, &tx_failed);
-            Serial.printf("[OpenNear v6.8] SF=%u role=%d id=0x%03X hop=%d slot=%u nco=%.2fppm rtt=%lldns harq=%u acts=%u\n",
+            Serial.printf("[OpenNear v6.9] SF=%u role=%d id=0x%03X hop=%d slot=%u nco=%.2fppm rtt=%lldns harq=%u acts=%u\n",
                           (unsigned)log_s.sf_seq,
                           log_s.role,
                           (unsigned)log_s.short_id,
@@ -196,6 +197,9 @@ void setup() {
 #if defined(OPENNEAR_ENABLE_WIFI_GW) || defined(OPENNEAR_ENABLE_BLE_GW)
     on_esp32_net_gw_start(&g_node, &g_gw, is_master ? "OpenNear-G-GW" : "OpenNear-T-Node");
 #endif
+#ifdef OPENNEAR_ENABLE_DEMO_APP
+    on_esp32_demo_init();
+#endif
 #ifdef OPENNEAR_ACT_LOOKAHEAD
     g_node.act_lookahead_enabled = true;
     Serial.println("[OpenNear ACT] Lookahead GPIO demo enabled");
@@ -262,6 +266,9 @@ void loop() {
 #endif
 #if defined(OPENNEAR_ENABLE_WIFI_GW) || defined(OPENNEAR_ENABLE_BLE_GW)
     on_esp32_net_gw_poll(&g_node, &g_gw);
+#ifdef OPENNEAR_ENABLE_DEMO_APP
+    on_esp32_demo_poll(&g_node);
+#endif
     /* v6.8 Hardware factory reset: hold onboard BOOT button (GPIO0) LOW continuously for 5 seconds */
     static uint32_t s_boot_hold_start_ms = 0u;
     if (millis() > 3000u && digitalRead(0) == LOW) {

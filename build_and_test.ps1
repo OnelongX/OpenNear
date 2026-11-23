@@ -176,25 +176,26 @@ if ((Test-Path $xbin) -and (Test-Path $sdk)) {
         "$Root\ports\esp32_wroom32\src\act_capture.cpp",
         "$Root\ports\esp32_wroom32\src\esp32_ota_flash.cpp",
         "$Root\ports\esp32_wroom32\src\esp32_tls_transport.cpp",
+        "$Root\ports\esp32_wroom32\src\esp32_demo_app.cpp",
         "$Root\ports\esp32_wroom32\src\esp32_net_gateway.cpp",
         "$Root\ports\esp32_wroom32\src\main.cpp"
     )
     foreach ($f in $espCpp) {
         $obj = Join-Path "$BuildDir\esp32_obj" ([IO.Path]::GetFileNameWithoutExtension($f) + ".o")
         & xtensa-esp32-elf-g++ -std=gnu++11 -Os -Wall -Wextra -mlongcalls -fno-rtti -fno-exceptions `
-            -DOPENNEAR_ENABLE_OTA=1 -DOPENNEAR_ENABLE_WIFI_GW=1 -DOPENNEAR_ENABLE_BLE_GW=1 -DOPENNEAR_LEADERLESS_BOOT=1 `
+            -DOPENNEAR_ENABLE_OTA=1 -DOPENNEAR_ENABLE_WIFI_GW=1 -DOPENNEAR_ENABLE_BLE_GW=1 -DOPENNEAR_LEADERLESS_BOOT=1 -DOPENNEAR_ENABLE_DEMO_APP=1 `
             -c $f @espInc -o $obj
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     }
     # Verify optional MQTTS/HTTPS TLS module (-DOPENNEAR_ENABLE_TLS=1) & BLE coexistence HAL (-DOPENNEAR_ENABLE_BLE_GW=1)
-    & xtensa-esp32-elf-gcc -std=gnu11 -Os -Wall -Wextra -Werror -mlongcalls -DOPENNEAR_ENABLE_BLE_GW=1 `
+    & xtensa-esp32-elf-gcc -std=gnu11 -Os -Wall -Wextra -Werror -mlongcalls -DOPENNEAR_ENABLE_BLE_GW=1 -DOPENNEAR_ENABLE_DEMO_APP=1 `
         -c "$Root\ports\esp32_wroom32\src\hal_esp32_raw80211.c" @espInc -o "$BuildDir\esp32_obj\hal_esp32_raw80211_ble.o"
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     & xtensa-esp32-elf-g++ -std=gnu++11 -Os -Wall -Wextra -Werror -mlongcalls -fno-rtti -fno-exceptions `
-        -DOPENNEAR_ENABLE_OTA=1 -DOPENNEAR_ENABLE_WIFI_GW=1 -DOPENNEAR_ENABLE_BLE_GW=1 -DOPENNEAR_LEADERLESS_BOOT=1 -DOPENNEAR_ENABLE_TLS=1 `
+        -DOPENNEAR_ENABLE_OTA=1 -DOPENNEAR_ENABLE_WIFI_GW=1 -DOPENNEAR_ENABLE_BLE_GW=1 -DOPENNEAR_LEADERLESS_BOOT=1 -DOPENNEAR_ENABLE_TLS=1 -DOPENNEAR_ENABLE_DEMO_APP=1 `
         -c "$Root\ports\esp32_wroom32\src\esp32_tls_transport.cpp" @espInc -o "$BuildDir\esp32_obj\esp32_tls_transport_tls.o"
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    Write-Host "  OK: Route C ESP32-WROOM-32 Xtensa cross-compilation passed (21/21 objs + BLE coex HAL + optional MQTTS/TLS)." -ForegroundColor Green
+    Write-Host "  OK: Route C ESP32-WROOM-32 Xtensa cross-compilation passed (22/22 objs + BLE/Demo HAL + optional MQTTS/TLS)." -ForegroundColor Green
 } else {
     Write-Host "  SKIP: ESP32 Xtensa toolchain not found in default PlatformIO path." -ForegroundColor Yellow
 }

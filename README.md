@@ -5,13 +5,16 @@
 **零历史包袱、从零设计的开源类星闪（NearLink-Class）确定性无线协议栈与万物互联混合 Mesh 平台**
 
 [![OpenNear CI](https://github.com/OnelongX/OpenNear/actions/workflows/ci.yml/badge.svg)](https://github.com/OnelongX/OpenNear/actions/workflows/ci.yml)
-![Version](https://img.shields.io/badge/version-v6.8-0ea5e9?style=flat)
+![Version](https://img.shields.io/badge/version-v6.9-0ea5e9?style=flat)
 ![Core](https://img.shields.io/badge/core-Pure%20C11%20%7C%20Zero%20Deps-10b981?style=flat)
 ![Tests](https://img.shields.io/badge/tests-38%20Suites%20%7C%20391%20Assertions-22c55e?style=flat)
 ![Platforms](https://img.shields.io/badge/hardware-ESP32%20%7C%20nRF52840%20%7C%20FPGA%20RTL-8b5cf6?style=flat)
+[![Web Flasher](https://img.shields.io/badge/ESP32%20Web%20Flasher-%E4%B8%80%E9%94%AE%E5%9C%A8%E7%BA%BF%E5%88%B7%E6%9C%BA-f97316?style=flat)](https://onelongx.github.io/OpenNear/)
 ![License](https://img.shields.io/badge/license-MIT-f59e0b?style=flat)
 
-**亚微秒全网同步 · 6 字节极简帧头 · 零投票热备秒切 · 无主冷启动 · 1~6 跳混合 Mesh · 256 节点 Epoch-TDMA · 多跳加密 OTA · 内置免配网 Web 管理页 · MQTTS/TLS & Home Assistant 自动发现**
+**亚微秒全网同步 · 6 字节极简帧头 · 零投票热备秒切 · 无主冷启动 · 1~6 跳混合 Mesh · 256 节点 Epoch-TDMA · 多跳加密 OTA · 浏览器一键在线刷机 · 内置 SVG 拓扑配网页 · MQTTS/TLS & Home Assistant**
+
+> ⚡ **零门槛 30 秒体验**：插上 15 块钱 ESP32-WROOM-32，直接用 Chrome / Edge 打开 **[OpenNear 在线刷机台](https://onelongx.github.io/OpenNear/)**（基于 ESP Web Tools + GitHub Pages 自动构建），无需安装任何编译器即可一键烧录网关与多板同步灯光/遥测演示节点！
 
 </div>
 
@@ -23,7 +26,7 @@
 
 **OpenNear** 借鉴星闪（NearLink / SparkLink）核心思想，采用**纯 C11 零外部依赖协议核**从零构建，在同一套极简协议上打通 **L1 抗干扰物理层 → L2 四段式确定性超帧 → L3 亚微秒同步与多跳自愈 → L4 万物互联云边协同**，让几块钱一块的 **ESP32-WROOM-32** 或 **nRF52840** 就能组成高确定性、自组网、自修复、直连 Home Assistant 与公网云平台的无线集群。
 
-| 能力维度 | OpenNear v6.8 | BLE Mesh | Wi-Fi Mesh | Zigbee / Thread |
+| 能力维度 | OpenNear v6.9 | BLE Mesh | Wi-Fi Mesh | Zigbee / Thread |
 |---|---|---|---|---|
 | **同步精度（硬件定时 / 仿真）** | **亚微秒级（实测 90 ns 稳态）** | 10 ~ 100 ms | 1 ~ 20 ms | 1 ~ 10 ms |
 | **MAC 帧头开销** | **6 字节**（含 `Hdr_CRC8`，隐式模式 2 字节） | 29+ 字节 | 24~36 字节 | 15~25 字节 |
@@ -134,6 +137,7 @@ sequenceDiagram
   - **可选 MQTTS / HTTPS TLS 加密上云模块（v6.4）**：通过 `-DOPENNEAR_ENABLE_TLS=1` 按需编译，默认零内存开销；开启后支持 MQTTS 8883、HTTPS Webhook/OTA 及 NVS Root CA PEM 证书验签，无缝对接 Home Assistant、EMQX Cloud、AWS IoT、阿里云 IoT。
   - **全网永久硬件 MAC48 透传与实体锚定（v6.5 ~ v6.6）**：自动读取 ESP32 出厂 eFuse Wi-Fi STA MAC（及网关 BLE MAC `ESP_MAC_BT`）/ nRF52840 FICR 地址，经 0~6 跳全链路（Sub-G 私有 D-TDMA `MAC_REPORT` + 3~6 跳 `ON_MESH_TOPO_REPORT` + 3-bit 跳深无截断 `TOPO_RESP`）透传至拓扑表、HTTP/串口/BLE、Web 页与 Home Assistant（`uniq_id: opennear_<MACHEX>`、`cns: [["mac", "..."]]`），配套 2~6 跳幽灵节点自动超时老化清理。
   - **真机工程化与多网关生产级特性（v6.6 ~ v6.8）**：SoftAP 自动弹出配网页（Captive Portal DNS）+ 按 MAC 唯一 mDNS（`opennear-XXXX.local`）与唯一 MQTT ClientID（多网关同 Broker 零互踢）；MQTT 非阻塞 `CONNACK` 鉴权 + LWT 遗嘱在线状态 + **全链路 MAC 主题寻址**（`opennear/node/<MAC>/state` & `opennear/cmd/<MAC>`，主备热切自动零碰撞回填全网 MAC）；按 MAC 永久别名与内置零依赖 **SVG 多跳拓扑图**；集群独立空口密钥 `NETKEY:<32hex>` + 板载 `BOOT` 键（GPIO0）长按 5 秒硬件恢复出厂配网。
+  - **浏览器一键刷机与同步演示套件（v6.9）**：新增 [docs/index.html](./docs/index.html)（ESP Web Tools 零安装在线刷机台，GitHub Pages 自动编译打包 4 套合并固件）与开箱即用同步演示固件 `esp32_demo_sync_node`（支持全网同拍 `SYNC / STROBE / PULSE` 灯效、GPIO26 继电器、GPIO34 实时 ADC 遥测，Web 管理页一键触发）。
 
 ---
 
