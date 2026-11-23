@@ -26,6 +26,21 @@ typedef struct {
     uint32_t rx_packets;
 } on_peer_entry_t;
 
+/* Optional direct ACT clock: lower envelope of recent timestamp blocks. */
+#define ON_ACT_CLOCK_BLOCKS 8u
+typedef struct {
+    bool valid;
+    int64_t net_ns;
+    int64_t offset_ns;
+} on_act_clock_sample_t;
+
+typedef struct {
+    bool valid;
+    int64_t last_net_ns;
+    int32_t rate_ppm;   /* Local elapsed time per network elapsed time, minus one */
+    on_act_clock_sample_t blocks[ON_ACT_CLOCK_BLOCKS];
+} on_act_clock_t;
+
 /* Complete OpenNear Node Context */
 typedef struct {
     on_hal_ops_t   hal;
@@ -69,6 +84,9 @@ typedef struct {
         int64_t   deadline_local_ns;
         uint8_t   next_level;
     } act_lookahead;
+    bool           act_clock_enabled; /* Independent phase estimate for pending GPIO plans */
+    uint32_t       act_clock_bias_us; /* Nominal TX to earliest local RX observation floor */
+    on_act_clock_t act_clock;
     bool           last_act_was_scheduled;
     int64_t        last_act_deadline_local_ns;
     bool           sync_rx_this_sf;
@@ -172,6 +190,11 @@ void     on_node_trigger_alert(on_node_t *node, uint8_t alert_code);
 
 /* Feed a raw received frame with exact hardware RX capture timestamp (local_ns) */
 void     on_node_on_rx_raw(on_node_t *node, const uint8_t *frame, size_t len, int64_t rx_local_ns);
+
+/* Optional second RX timestamp in the same local-clock domain, only for the
+ * independent ACT clock. The normal protocol still uses rx_local_ns. */
+void     on_node_on_rx_raw_timed(on_node_t *node, const uint8_t *frame, size_t len,
+                                int64_t rx_local_ns, int64_t act_rx_local_ns);
 
 /* Advance node state machine to current local_ns (called by timer interrupt or simulator) */
 void     on_node_step(on_node_t *node, int64_t now_local_ns);

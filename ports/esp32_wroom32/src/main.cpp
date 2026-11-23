@@ -109,6 +109,12 @@ void setup() {
     g_node.act_lookahead_enabled = true;
     Serial.println("[OpenNear ACT] Lookahead GPIO demo enabled");
 #endif
+#ifdef OPENNEAR_ACT_CLOCK_BIAS_US
+    g_node.act_clock_enabled = true;
+    g_node.act_clock_bias_us = OPENNEAR_ACT_CLOCK_BIAS_US;
+    Serial.printf("[OpenNear ACT] Independent action clock, RX floor correction=%u us\n",
+                  (unsigned)g_node.act_clock_bias_us);
+#endif
     /* Raw Wi-Fi is contended; tolerate a short burst of delayed/missed beacons. */
     g_node.peer_lease_timeout_sf = kWifiPeerLeaseTimeoutSf;
     g_node.backup_miss_threshold = kWifiBackupMissThreshold;

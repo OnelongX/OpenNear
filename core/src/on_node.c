@@ -18,8 +18,96 @@ static bool sf_after(uint32_t a, uint32_t b) {
     return a != b && a - b <= UINT32_MAX / 2u;
 }
 
-static void receive_act_lookahead(on_node_t *node, const on_sync_payload_t *sp) {
+#define ON_ACT_CLOCK_BLOCK_NS 160000000LL
+#define ON_ACT_CLOCK_WINDOW_NS (ON_ACT_CLOCK_BLOCK_NS * ON_ACT_CLOCK_BLOCKS)
+#define ON_ACT_CLOCK_MAX_PPM 200
+
+static int64_t act_clock_offset_at(const on_act_clock_sample_t *s, int64_t net_ns, int32_t rate_ppm) {
+    return s->offset_ns + (net_ns - s->net_ns) * rate_ppm / 1000000LL;
+}
+
+static const on_act_clock_sample_t *act_clock_floor(const on_act_clock_t *clock,
+                                                   int64_t from_block, int64_t to_block,
+                                                   int64_t at_net_ns) {
+    const on_act_clock_sample_t *first = NULL, *second = NULL;
+    int64_t lo = 0, next_lo = 0;
+    unsigned count = 0;
+    for (unsigned i = 0; i < ON_ACT_CLOCK_BLOCKS; ++i) {
+        const on_act_clock_sample_t *s = &clock->blocks[i];
+        if (!s->valid) continue;
+        int64_t b = s->net_ns / ON_ACT_CLOCK_BLOCK_NS;
+        if (b < from_block || b > to_block) continue;
+        int64_t x = act_clock_offset_at(s, at_net_ns, clock->rate_ppm);
+        ++count;
+        if (!first || x < lo) {
+            second = first;
+            next_lo = lo;
+            first = s;
+            lo = x;
+        } else if (!second || x < next_lo) {
+            second = s;
+            next_lo = x;
+        }
+    }
+    /* Use a repeated low observation rather than trusting one anomalous minimum. */
+    return count >= 3u ? second : first;
+}
+
+static void act_clock_observe(on_act_clock_t *clock, int64_t net_ns, int64_t rx_ns) {
+    if (net_ns < 0 || rx_ns < 0 || (clock->valid && net_ns <= clock->last_net_ns)) return;
+    int64_t block = net_ns / ON_ACT_CLOCK_BLOCK_NS;
+    int64_t old_block = clock->last_net_ns / ON_ACT_CLOCK_BLOCK_NS;
+    if (clock->valid && net_ns - clock->last_net_ns >= ON_ACT_CLOCK_WINDOW_NS) {
+        memset(clock, 0, sizeof(*clock));
+    }
+    if (clock->valid && block != old_block) {
+        /* Compare the low samples of two non-overlapping groups of completed
+         * blocks. Large delay-floor changes are not credible crystal drift. */
+        const on_act_clock_sample_t *older = act_clock_floor(clock, block - 8, block - 5, net_ns);
+        const on_act_clock_sample_t *recent = act_clock_floor(clock, block - 4, block - 1, net_ns);
+        if (older && recent && recent->net_ns - older->net_ns >= 2 * ON_ACT_CLOCK_BLOCK_NS) {
+            int64_t dt = recent->net_ns - older->net_ns;
+            int64_t delta = recent->offset_ns - older->offset_ns;
+            if (delta >= -dt / 1000 && delta <= dt / 1000) {
+                int32_t ppm = (int32_t)(delta * 1000000LL / dt);
+                if (ppm < -ON_ACT_CLOCK_MAX_PPM) ppm = -ON_ACT_CLOCK_MAX_PPM;
+                if (ppm >  ON_ACT_CLOCK_MAX_PPM) ppm =  ON_ACT_CLOCK_MAX_PPM;
+                clock->rate_ppm = (3 * clock->rate_ppm + ppm) / 4;
+            }
+        }
+    }
+    on_act_clock_sample_t *s = &clock->blocks[block % ON_ACT_CLOCK_BLOCKS];
+    const on_act_clock_sample_t sample = {true, net_ns, rx_ns - net_ns};
+    if (!s->valid || s->net_ns / ON_ACT_CLOCK_BLOCK_NS != block ||
+        sample.offset_ns < act_clock_offset_at(s, net_ns, clock->rate_ppm)) {
+        *s = sample;
+    }
+    clock->valid = true;
+    clock->last_net_ns = net_ns;
+}
+
+static int64_t act_clock_deadline(const on_node_t *node, int64_t target_net_ns) {
+    const on_act_clock_t *clock = &node->act_clock;
+    if (node->act_clock_enabled && clock->valid) {
+        int64_t block = clock->last_net_ns / ON_ACT_CLOCK_BLOCK_NS;
+        const on_act_clock_sample_t *floor = act_clock_floor(clock, block - (ON_ACT_CLOCK_BLOCKS - 1),
+                                                             block, target_net_ns);
+        if (floor) {
+            return target_net_ns + act_clock_offset_at(floor, target_net_ns, clock->rate_ppm)
+                   - (int64_t)node->act_clock_bias_us * 1000LL;
+        }
+    }
+    return on_sync_net_to_local(&node->sync, target_net_ns);
+}
+
+static void reset_act_lookahead(on_node_t *node) {
+    memset(&node->act_lookahead, 0, sizeof(node->act_lookahead));
+    memset(&node->act_clock, 0, sizeof(node->act_clock));
+}
+
+static void receive_act_lookahead(on_node_t *node, const on_sync_payload_t *sp, int64_t act_rx_local_ns) {
     if (node->act_lookahead.has_beacon && !sf_after(sp->sf_seq, node->act_lookahead.beacon_sf)) return;
+    if (node->act_clock_enabled) act_clock_observe(&node->act_clock, sp->t_tx_net_ns, act_rx_local_ns);
     node->act_lookahead.beacon_sf = sp->sf_seq;
     node->act_lookahead.session_salt = sp->session_salt;
     if (!node->act_lookahead.has_beacon || !sf_after(node->act_lookahead.level_sf, sp->sf_seq)) {
@@ -39,7 +127,7 @@ static void receive_act_lookahead(on_node_t *node, const on_sync_payload_t *sp) 
     if (!sf_after(target, node->act_lookahead.level_sf)) return;
     int64_t target_net_ns = sp->t_tx_net_ns +
         ((int64_t)sp->act_flip_lead_sf * sp->t_sf_us + sp->act_fire_off_us) * 1000LL;
-    int64_t deadline = on_sync_net_to_local(&node->sync, target_net_ns);
+    int64_t deadline = act_clock_deadline(node, target_net_ns);
     /* Pick the earliest projection across repeated announcements. A delayed
      * beacon cannot postpone an armed deadline; the TDMA clock is unchanged. */
     if (!node->act_lookahead.pending || target != node->act_lookahead.target_sf ||
@@ -477,6 +565,11 @@ static void rejoin_primary(on_node_t *node, bool reset_clock) {
 }
 
 void on_node_on_rx_raw(on_node_t *node, const uint8_t *frame, size_t len, int64_t rx_local_ns) {
+    on_node_on_rx_raw_timed(node, frame, len, rx_local_ns, rx_local_ns);
+}
+
+void on_node_on_rx_raw_timed(on_node_t *node, const uint8_t *frame, size_t len,
+                             int64_t rx_local_ns, int64_t act_rx_local_ns) {
     if (!node || !frame) return;
 
     on_mac_hdr_t hdr;
@@ -579,7 +672,7 @@ void on_node_on_rx_raw(on_node_t *node, const uint8_t *frame, size_t len, int64_
             if (node->act_lookahead_enabled && (is_sub || yielding_primary ||
                 hdr.src_id != node->parent_id ||
                 sp.session_salt != node->act_lookahead.session_salt)) {
-                memset(&node->act_lookahead, 0, sizeof(node->act_lookahead));
+                reset_act_lookahead(node);
             }
             if (yielding_primary) {
                 node->role = ON_ROLE_T;
@@ -625,7 +718,7 @@ void on_node_on_rx_raw(on_node_t *node, const uint8_t *frame, size_t len, int64_
             node->sf_cfg.sub_g_len_us    = sp.sub_g_win_len_us;
             node->sf_cfg.act_fire_off_us = sp.act_fire_off_us;
             if (node->act_lookahead_enabled && !is_sub) {
-                receive_act_lookahead(node, &sp);
+                receive_act_lookahead(node, &sp, act_rx_local_ns);
             } else {
                 node->act_cmd = sp.act_cmd;
             }
@@ -1002,7 +1095,7 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
         node->sync_rx_this_sf   = true;
         node->act_fired_this_sf = false;
         node->act_cmd           = demo_act_level(node->current_sf_seq);
-        memset(&node->act_lookahead, 0, sizeof(node->act_lookahead));
+        reset_act_lookahead(node);
         if (node->afh.enabled) {
             tune_channel(node, on_afh_channel_for(&node->afh, node->current_sf_seq, 0u));
         }

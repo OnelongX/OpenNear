@@ -23,8 +23,10 @@ static const uint8_t kOpenNearVendorTag[ON_VENDOR_TAG_LEN] = { 0x7Fu, 0x4Fu, 0x4
 typedef struct {
     uint16_t len;
     int64_t  rx_local_ns;
-#ifdef OPENNEAR_ACT_TRACE
+#if defined(OPENNEAR_ACT_TRACE) || defined(OPENNEAR_ACT_CLOCK_BIAS_US)
     int64_t rx_callback_us;
+#endif
+#ifdef OPENNEAR_ACT_TRACE
     uint32_t rx_hw_us;
 #endif
     uint8_t  data[ON_MAX_FRAME_LEN];
@@ -140,8 +142,10 @@ static void IRAM_ATTR promiscuous_rx_cb(void *buf, wifi_promiscuous_pkt_type_t t
     if (next_head == s_rx_tail) return; /* ring full */
 
     s_rx_ring[s_rx_head].len = (uint16_t)on_len;
-#ifdef OPENNEAR_ACT_TRACE
+#if defined(OPENNEAR_ACT_TRACE) || defined(OPENNEAR_ACT_CLOCK_BIAS_US)
     s_rx_ring[s_rx_head].rx_callback_us = esp_timer_get_time();
+#endif
+#ifdef OPENNEAR_ACT_TRACE
     s_rx_ring[s_rx_head].rx_hw_us = pkt->rx_ctrl.timestamp;
 #endif
     s_rx_ring[s_rx_head].rx_local_ns = unwrap_rx_timestamp_ns(pkt->rx_ctrl.timestamp);
@@ -302,7 +306,14 @@ void on_esp32_hal_poll_rx(on_node_t *node) {
         uint32_t sync_before = node->sync_rx_total;
         int64_t dequeued_us = esp_timer_get_time();
 #endif
+#ifdef OPENNEAR_ACT_CLOCK_BIAS_US
+        /* Same esp_timer domain as GPIO deadlines, without the baseband/callback
+         * re-anchoring used by TDMA. The ACT filter absorbs variable RX delay. */
+        on_node_on_rx_raw_timed(node, slot->data, slot->len, slot->rx_local_ns,
+                                 slot->rx_callback_us * 1000LL);
+#else
         on_node_on_rx_raw(node, slot->data, slot->len, slot->rx_local_ns);
+#endif
 #ifdef OPENNEAR_ACT_TRACE
         if (node->sync_rx_total != sync_before) {
             s_trace_last_beacon.rx_accepted_us = esp_timer_get_time();

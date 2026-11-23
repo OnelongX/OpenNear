@@ -1134,9 +1134,9 @@ static void test_v40_second_order_thermal_accel_clock(void) {
 }
 
 /* Inject a beacon with an independent RX time (to model variable Wi-Fi queuing). */
-static void act_test_beacon(on_node_t *t, uint16_t src, uint32_t seq, uint32_t salt,
-                            uint8_t level, uint8_t lead, int64_t tx_ns, int64_t rx_ns,
-                            bool tamper) {
+static void act_test_beacon_timed(on_node_t *t, uint16_t src, uint32_t seq, uint32_t salt,
+                                  uint8_t level, uint8_t lead, int64_t tx_ns, int64_t rx_ns,
+                                  int64_t act_rx_ns, bool tamper) {
     on_sync_payload_t sp = {0};
     sp.sf_seq = seq;
     sp.session_salt = salt;
@@ -1156,8 +1156,14 @@ static void act_test_beacon(on_node_t *t, uint16_t src, uint32_t seq, uint32_t s
     }
     if (tamper) pbuf[36] ^= 2u;
     if (on_frame_pack(&hdr, pbuf, plen, frame, sizeof(frame), &flen) == ON_OK) {
-        on_node_on_rx_raw(t, frame, flen, rx_ns);
+        on_node_on_rx_raw_timed(t, frame, flen, rx_ns, act_rx_ns);
     }
+}
+
+static void act_test_beacon(on_node_t *t, uint16_t src, uint32_t seq, uint32_t salt,
+                            uint8_t level, uint8_t lead, int64_t tx_ns, int64_t rx_ns,
+                            bool tamper) {
+    act_test_beacon_timed(t, src, seq, salt, level, lead, tx_ns, rx_ns, rx_ns, tamper);
 }
 
 static void test_act_lookahead(void) {
@@ -1226,6 +1232,68 @@ static void test_act_lookahead(void) {
     EXPECT(t.act_cmd == 0u && t.last_act_was_scheduled, "Wrapped action is applied exactly like any other target");
 }
 
+static void test_independent_act_clock(void) {
+    printf("[TEST ACT CLOCK] Low-delay ACT phase estimate isolated from TDMA...\n");
+    on_node_t filtered, control;
+    on_node_init(&filtered, NULL, ON_ROLE_UNJOINED, 0);
+    on_node_init(&control, NULL, ON_ROLE_UNJOINED, 0);
+    const uint8_t key[16] = {1, 2, 3, 4};
+    on_node_enable_security(&filtered, key);
+    on_node_enable_security(&control, key);
+    filtered.act_lookahead_enabled = control.act_lookahead_enabled = true;
+    filtered.act_clock_enabled = true;
+    filtered.act_clock_bias_us = 750u;
+    const int64_t base_ns = 98000000LL;
+    const int64_t sf_ns = ON_DEFAULT_TSF_US * 1000LL;
+    const uint32_t target_sf = 1000u;
+    /* +100 ppm synthetic clock, one clean sample per eight beacons, with every
+     * fifth block entirely queued. TDMA's RX mapping has a separate error. */
+    for (uint32_t seq = 0; seq < target_sf; ++seq) {
+        int64_t tx = seq * sf_ns;
+        int64_t truth = tx + base_ns + tx / 10000LL;
+        int64_t extra = (seq % 8u != 0u || (seq / 40u) % 5u == 2u) ? 3200000LL : 0LL;
+        uint8_t lead = seq >= target_sf - 7u ? (uint8_t)(target_sf - seq) : 0u;
+        uint8_t level = (uint8_t)((seq / 10u) & 1u);
+        int64_t act_rx = truth + 750000LL + extra;
+        int64_t rx = act_rx + 2000000LL;
+        act_test_beacon_timed(&filtered, 1u, seq, 20u, level, lead, tx, rx, act_rx, false);
+        act_test_beacon_timed(&control, 1u, seq, 20u, level, lead, tx, rx, act_rx, false);
+    }
+    const int64_t target_net = target_sf * sf_ns + ON_DEFAULT_ACT_FIRE_US * 1000LL;
+    const int64_t truth = target_net + base_ns + target_net / 10000LL;
+    const int64_t error = filtered.act_lookahead.deadline_local_ns - truth;
+    EXPECT(filtered.act_lookahead.pending && filtered.act_lookahead.target_sf == target_sf &&
+           llabs(error) < 100000LL && control.act_lookahead.deadline_local_ns - truth > 2000000LL,
+           "Rolling ACT clock survives multi-ms delay bursts and maps the target within 100 us");
+    EXPECT(filtered.act_clock.rate_ppm >= 70 && filtered.act_clock.rate_ppm <= 130,
+           "Independent ACT estimator tracks synthetic +100 ppm crystal drift");
+    EXPECT(filtered.sync.ref_local_ns == control.sync.ref_local_ns &&
+           filtered.sync.ref_net_ns == control.sync.ref_net_ns &&
+           filtered.sync.rate_ppb == control.sync.rate_ppb &&
+           filtered.current_sf_seq == control.current_sf_seq,
+           "ACT estimator does not feed timestamps, drift or phase into TDMA");
+    const int64_t last_net = filtered.act_clock.last_net_ns;
+    act_test_beacon_timed(&filtered, 1u, target_sf - 1u, 20u, 1u, 1u, last_net, truth, 0LL, false);
+    act_test_beacon_timed(&filtered, 1u, target_sf, 20u, 0u, 0u, target_sf * sf_ns, truth, 0LL, true);
+    EXPECT(filtered.act_clock.last_net_ns == last_net &&
+           filtered.act_lookahead.deadline_local_ns == truth + error,
+           "Duplicate and unauthenticated beacons cannot move the independent clock");
+    on_node_step(&filtered, truth + error);
+    EXPECT(filtered.act_cmd == 0u && filtered.last_act_was_scheduled,
+           "ACT fires at its independent deadline when the target beacon is lost");
+    const uint32_t resume = target_sf + 400u;
+    act_test_beacon_timed(&filtered, 1u, resume, 20u, 0u, 0u,
+                         resume * sf_ns, resume * sf_ns + base_ns, resume * sf_ns + base_ns, false);
+    EXPECT(filtered.act_clock.last_net_ns == resume * sf_ns && filtered.act_clock.rate_ppm == 0,
+           "A longer outage discards stale ACT observations on resume");
+    act_test_beacon_timed(&filtered, 1u, 0u, 21u, 0u, 0u, 0LL,
+                         6100000000LL, 6100000000LL, false);
+    unsigned valid = 0;
+    for (unsigned i = 0; i < ON_ACT_CLOCK_BLOCKS; ++i) valid += filtered.act_clock.blocks[i].valid;
+    EXPECT(filtered.act_clock.valid && filtered.act_clock.last_net_ns == 0 && valid == 1 &&
+           !filtered.act_lookahead.pending, "Primary reboot invalidates prior ACT clock and plan");
+}
+
 int main(void) {
     printf("============================================================\n");
     printf("       OpenNear v4.0 Core Protocol Automated Test Suite     \n");
@@ -1255,6 +1323,7 @@ int main(void) {
     test_rejoin_after_primary_reboot();
     test_rejoin_after_primary_lease_expiry();
     test_act_lookahead();
+    test_independent_act_clock();
 
     printf("\n------------------------------------------------------------\n");
     printf("SUMMARY: %d passed, %d failed\n", g_tests_passed, g_tests_failed);
