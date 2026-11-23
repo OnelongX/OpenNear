@@ -251,6 +251,7 @@ typedef struct {
     on_mesh_pkt_t     mesh_tx_pkt;
     uint32_t          mesh_rx_total;
     uint32_t          mesh_tx_total;
+    bool              self_mac_reported_to_g; /* v6.8: false after parent failover -> 1-shot MAC_REPORT */
 } on_node_t;
 
 /* Initialize node as Primary G coordinator or Unjoined Terminal */
@@ -325,6 +326,8 @@ on_err_t on_node_request_cluster_snapshot(on_node_t *node);
 size_t   on_node_get_cluster_snapshot(const on_node_t *node, on_cluster_snapshot_t *out);
 size_t   on_node_format_cluster_json(const on_node_t *node, bool include_data,
                                      char *out_buf, size_t out_cap);
+/* v6.8: Resolve permanent hardware MAC48 -> current dynamic 12-bit Short-ID (0x000 if unknown) */
+uint16_t on_node_find_short_id_by_mac(const on_node_t *node, const uint8_t mac48[6]);
 
 /* v6.0: Leaderless Auto-Boot, 256-Node Epoch-TDMA & 3~6-Hop Hybrid Mesh */
 void     on_node_enable_leaderless_boot(on_node_t *node, uint32_t base_timeout_ms);

@@ -97,7 +97,7 @@ static void opennear_rt_task(void *arg) {
             last_log_ns = now_ns;
             uint32_t tx_accepted, tx_failed;
             on_esp32_hal_tx_counts(&tx_accepted, &tx_failed);
-            Serial.printf("[OpenNear v6.7] SF=%u role=%d id=0x%03X hop=%d slot=%u nco=%.2fppm rtt=%lldns harq=%u acts=%u\n",
+            Serial.printf("[OpenNear v6.8] SF=%u role=%d id=0x%03X hop=%d slot=%u nco=%.2fppm rtt=%lldns harq=%u acts=%u\n",
                           (unsigned)log_s.sf_seq,
                           log_s.role,
                           (unsigned)log_s.short_id,
@@ -150,6 +150,9 @@ void setup() {
 
     /* Optional hardware strap: pull GPIO4 LOW at boot to select Primary G coordinator */
     pinMode(ON_ESP32_MASTER_STRAP_PIN, INPUT_PULLUP);
+#if defined(OPENNEAR_ENABLE_WIFI_GW) || defined(OPENNEAR_ENABLE_BLE_GW)
+    pinMode(0, INPUT_PULLUP); /* Onboard BOOT button: hold LOW 5s after boot for factory reset */
+#endif
     bool is_master = (OPENNEAR_IS_MASTER != 0) || (digitalRead(ON_ESP32_MASTER_STRAP_PIN) == LOW);
 
 #if defined(OPENNEAR_ENABLE_WIFI_GW) || defined(OPENNEAR_ENABLE_BLE_GW)
@@ -259,6 +262,17 @@ void loop() {
 #endif
 #if defined(OPENNEAR_ENABLE_WIFI_GW) || defined(OPENNEAR_ENABLE_BLE_GW)
     on_esp32_net_gw_poll(&g_node, &g_gw);
+    /* v6.8 Hardware factory reset: hold onboard BOOT button (GPIO0) LOW continuously for 5 seconds */
+    static uint32_t s_boot_hold_start_ms = 0u;
+    if (millis() > 3000u && digitalRead(0) == LOW) {
+        if (s_boot_hold_start_ms == 0u) {
+            s_boot_hold_start_ms = millis();
+        } else if ((millis() - s_boot_hold_start_ms) >= 5000u) {
+            on_esp32_net_gw_factory_reset();
+        }
+    } else {
+        s_boot_hold_start_ms = 0u;
+    }
 #endif
 #ifdef OPENNEAR_ENABLE_OTA
     /* Deferred A/B boot confirmation: only cancel rollback after >=10s healthy runtime + sync */

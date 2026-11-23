@@ -2446,9 +2446,71 @@ static void test_v67_mqtt_lwt_alias_and_netkey(void) {
     printf("    -> MQTT LWT CONNECT=%uB | HA Alias+Avty OK | NETKEY(16B) & ALIAS parser OK\n", (unsigned)clen);
 }
 
+/* ========================================================================== */
+/* Test 38: v6.8 Post-Failover Full MAC48 Recovery & MAC-Addressed MQTT Cmds  */
+/* ========================================================================== */
+static void test_v68_failover_mac_recovery_and_mac_mqtt_routing(void) {
+    printf("[TEST 38] v6.8 Post-Failover Full MAC48 Recovery (1-Hop + 2-Hop) & MAC-Addressed MQTT Routing...\n");
+
+    /* 1. Run 10-node cluster -> kill Primary G -> verify Backup_ID takes over AND recovers 1-hop & 2-hop MAC48s! */
+    sim_world_t w;
+    sim_world_init(&w, 0x68F02026ULL);
+    sim_world_setup_10node_demo(&w, true);
+    sim_world_run_us(&w, 200000, 10); /* 50 SFs steady-state */
+
+    uint16_t bk_id = w.nodes[0].backup_id;
+    int bk_idx = -1;
+    for (uint32_t i = 1u; i < w.num_nodes; ++i) {
+        if (w.nodes[i].short_id == bk_id) { bk_idx = (int)i; break; }
+    }
+    EXPECT(bk_idx > 0, "Backup_ID node identified before failover");
+
+    /* Kill Primary G and advance 30 superframes so Backup_ID takes over and 1-hop + 2-hop nodes re-report MAC48s */
+    w.alive[0] = false;
+    sim_world_run_us(&w, 120000, 10);
+
+    EXPECT(w.nodes[bk_idx].role == ON_ROLE_G, "Backup_ID seamlessly promoted to new Primary G");
+    uint16_t resolved_t4 = on_node_find_short_id_by_mac(&w.nodes[bk_idx], w.nodes[4].mac48);
+    uint16_t resolved_t8 = on_node_find_short_id_by_mac(&w.nodes[bk_idx], w.nodes[8].mac48);
+    EXPECT(resolved_t4 == w.nodes[4].short_id,
+           "New Primary G recovers 1-hop T4 permanent MAC48 -> Short-ID mapping after failover");
+    EXPECT(resolved_t8 == w.nodes[8].short_id,
+           "New Primary G recovers wall-blocked 2-hop T8 permanent MAC48 -> Short-ID mapping after failover");
+    EXPECT(w.tdma_subg_collisions == 0u && w.cra_collisions == 0u,
+           "Zero RF collisions during post-failover MAC48 recovery");
+
+    /* 2. Verify MAC-addressed MQTT command topic parsing (compact 12-hex & colon-separated) */
+    uint16_t tid = 0u;
+    uint8_t pmac[6] = {0};
+    bool has_mac = false, is_ota = false;
+    const uint8_t expect_mac[6] = { 0xA4u, 0xCFu, 0x12u, 0xAAu, 0xBBu, 0xCCu };
+    EXPECT(on_mqtt_parse_cmd_topic_ex("opennear/cmd/A4CF12AABBCC", 25u, &tid, pmac, &has_mac, &is_ota) &&
+           has_mac && !is_ota && memcmp(pmac, expect_mac, 6u) == 0,
+           "MQTT parser resolves compact 12-hex MAC command topic");
+    EXPECT(on_mqtt_parse_cmd_topic_ex("opennear/cmd/A4:CF:12:AA:BB:CC", 30u, &tid, pmac, &has_mac, &is_ota) &&
+           has_mac && !is_ota && memcmp(pmac, expect_mac, 6u) == 0,
+           "MQTT parser resolves colon-formatted MAC command topic");
+
+    /* 3. Verify MAC-anchored HA Discovery & State topic use permanent MACHEX */
+    char topic[96], json[600];
+    const uint8_t sample_pay[2] = { 0x12u, 0x34u };
+    EXPECT(on_mqtt_format_ha_discovery_full(0x007u, expect_mac, 2u, "T",
+                                            "Porch_Sensor", "opennear/gw/AABBCC/status",
+                                            topic, sizeof(topic), json, sizeof(json)) &&
+           strstr(json, "\"stat_t\":\"opennear/node/A4CF12AABBCC/state\"") != NULL &&
+           strstr(json, "\"cmd_t\":\"opennear/cmd/A4CF12AABBCC\"") != NULL,
+           "HA Discovery binds stat_t & cmd_t directly to permanent MAC48");
+    EXPECT(on_mqtt_format_node_state_mac(0x007u, expect_mac, 0x005u, 2u, 15,
+                                         sample_pay, 2u, topic, sizeof(topic), json, sizeof(json)) &&
+           strcmp(topic, "opennear/node/A4CF12AABBCC/state") == 0,
+           "Node state publishes to permanent MAC-anchored MQTT topic");
+    printf("    -> Post-failover G=0x%03X recovered T4=0x%03X & 2-hop T8=0x%03X (0 collisions) | MAC MQTT cmd/state OK\n",
+           (unsigned)w.nodes[bk_idx].short_id, (unsigned)resolved_t4, (unsigned)resolved_t8);
+}
+
 int main(void) {
     printf("============================================================\n");
-    printf("       OpenNear v6.7 Core Protocol Automated Test Suite     \n");
+    printf("       OpenNear v6.8 Core Protocol Automated Test Suite     \n");
     printf("============================================================\n");
 
     test_6byte_header_and_frame();
@@ -2489,6 +2551,7 @@ int main(void) {
     test_v65_cluster_mac48_and_ha_identity();
     test_v66_multihop_gc_6hop_mac_and_system_cmds();
     test_v67_mqtt_lwt_alias_and_netkey();
+    test_v68_failover_mac_recovery_and_mac_mqtt_routing();
 
     printf("\n------------------------------------------------------------\n");
     printf("SUMMARY: %d passed, %d failed\n", g_tests_passed, g_tests_failed);

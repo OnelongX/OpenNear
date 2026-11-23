@@ -284,13 +284,13 @@ bool on_mqtt_format_ha_discovery_full(uint16_t short_id, const uint8_t mac48[6],
         int jn = snprintf(json_out, json_cap,
                           "{\"name\":\"%s\","
                           "\"uniq_id\":\"opennear_%s\","
-                          "\"stat_t\":\"opennear/node/0x%03X/state\","
-                          "\"cmd_t\":\"opennear/cmd/0x%03X\","
+                          "\"stat_t\":\"opennear/node/%s/state\","
+                          "\"cmd_t\":\"opennear/cmd/%s\","
                           "\"val_tpl\":\"{{ value_json.data }}\","
-                          "\"json_attr_t\":\"opennear/node/0x%03X/state\"%s,"
+                          "\"json_attr_t\":\"opennear/node/%s/state\"%s,"
                           "\"dev\":{\"ids\":[\"opennear_%s\"],\"cns\":[[\"mac\",\"%s\"]],"
-                          "\"name\":\"%s\",\"mf\":\"OpenNear\",\"mdl\":\"v6.7 Hybrid Mesh (%s)\"}}",
-                          entity_name, mhex, sid, sid, sid, avty_seg,
+                          "\"name\":\"%s\",\"mf\":\"OpenNear\",\"mdl\":\"v6.8 Hybrid Mesh (%s)\"}}",
+                          entity_name, mhex, mhex, mhex, mhex, avty_seg,
                           mhex, mcol, dev_name, r);
         return (jn > 0 && (size_t)jn < json_cap);
     }
@@ -307,7 +307,7 @@ bool on_mqtt_format_ha_discovery_full(uint16_t short_id, const uint8_t mac48[6],
                       "\"val_tpl\":\"{{ value_json.data }}\","
                       "\"json_attr_t\":\"opennear/node/0x%03X/state\"%s,"
                       "\"dev\":{\"ids\":[\"opennear_%03X\"],\"name\":\"OpenNear 0x%03X\","
-                      "\"mf\":\"OpenNear\",\"mdl\":\"v6.7 Hybrid Mesh (%s)\"}}",
+                      "\"mf\":\"OpenNear\",\"mdl\":\"v6.8 Hybrid Mesh (%s)\"}}",
                       entity_name, sid, sid, sid, sid, avty_seg, sid, sid, r);
     return (jn > 0 && (size_t)jn < json_cap);
 }
@@ -342,16 +342,17 @@ bool on_mqtt_format_node_state_mac(uint16_t short_id, const uint8_t mac48[6],
     }
     dhex[n * 2u] = '\0';
 
-    int tn = snprintf(topic_out, topic_cap, "opennear/node/0x%03X/state",
-                      (unsigned)(short_id & ON_SHORT_ID_MASK));
-    if (tn <= 0 || (size_t)tn >= topic_cap) return false;
-
-    int jn;
+    int tn, jn;
     if (mac_valid(mac48)) {
-        char mcol[18];
+        char mhex[13], mcol[18];
+        snprintf(mhex, sizeof(mhex), "%02X%02X%02X%02X%02X%02X",
+                 (unsigned)mac48[0], (unsigned)mac48[1], (unsigned)mac48[2],
+                 (unsigned)mac48[3], (unsigned)mac48[4], (unsigned)mac48[5]);
         snprintf(mcol, sizeof(mcol), "%02X:%02X:%02X:%02X:%02X:%02X",
                  (unsigned)mac48[0], (unsigned)mac48[1], (unsigned)mac48[2],
                  (unsigned)mac48[3], (unsigned)mac48[4], (unsigned)mac48[5]);
+        tn = snprintf(topic_out, topic_cap, "opennear/node/%s/state", mhex);
+        if (tn <= 0 || (size_t)tn >= topic_cap) return false;
         jn = snprintf(json_out, json_cap,
                       "{\"id\":\"0x%03X\",\"mac\":\"%s\",\"parent\":\"0x%03X\",\"hop\":%u,"
                       "\"skew_ns\":%d,\"data\":\"%s\"}",
@@ -360,6 +361,9 @@ bool on_mqtt_format_node_state_mac(uint16_t short_id, const uint8_t mac48[6],
                       (unsigned)(parent_id & ON_SHORT_ID_MASK),
                       (unsigned)hop_depth, (int)skew_ns, dhex);
     } else {
+        tn = snprintf(topic_out, topic_cap, "opennear/node/0x%03X/state",
+                      (unsigned)(short_id & ON_SHORT_ID_MASK));
+        if (tn <= 0 || (size_t)tn >= topic_cap) return false;
         jn = snprintf(json_out, json_cap,
                       "{\"id\":\"0x%03X\",\"parent\":\"0x%03X\",\"hop\":%u,"
                       "\"skew_ns\":%d,\"data\":\"%s\"}",
@@ -378,21 +382,51 @@ bool on_mqtt_format_node_state(uint16_t short_id, uint16_t parent_id, uint8_t ho
                                          data, data_len, topic_out, topic_cap, json_out, json_cap);
 }
 
-bool on_mqtt_parse_cmd_topic(const char *topic, size_t topic_len,
-                             uint16_t *out_target_id, bool *out_is_ota) {
+bool on_mqtt_parse_cmd_topic_ex(const char *topic, size_t topic_len,
+                                uint16_t *out_target_id, uint8_t out_mac48[6],
+                                bool *out_has_mac, bool *out_is_ota) {
     if (!topic || topic_len < 13u) return false;
-    if (out_is_ota) *out_is_ota = false;
+    if (out_is_ota)    *out_is_ota    = false;
+    if (out_has_mac)   *out_has_mac   = false;
     if (out_target_id) *out_target_id = ON_SHORT_ID_UNASSIGNED;
+    if (out_mac48)     memset(out_mac48, 0, 6u);
 
     if (topic_len == 20u && memcmp(topic, "opennear/ota/trigger", 20u) == 0) {
         if (out_is_ota) *out_is_ota = true;
         return true;
     }
     if (topic_len > 13u && memcmp(topic, "opennear/cmd/", 13u) == 0) {
+        const char *seg = topic + 13;
+        size_t slen = topic_len - 13u;
+
+        /* Check for 12-hex MAC48 ("A4CF12AABBCC" or "A4:CF:12:AA:BB:CC") */
+        if (slen == 12u || slen == 17u) {
+            uint8_t mac[6];
+            size_t nibs = 0u;
+            uint8_t cur = 0u;
+            bool ok = true;
+            for (size_t i = 0u; i < slen; ++i) {
+                char c = seg[i];
+                if (c == ':' || c == '-') continue;
+                int v = -1;
+                if (c >= '0' && c <= '9') v = c - '0';
+                else if (c >= 'A' && c <= 'F') v = 10 + (c - 'A');
+                else if (c >= 'a' && c <= 'f') v = 10 + (c - 'a');
+                if (v < 0 || nibs >= 12u) { ok = false; break; }
+                if ((nibs & 1u) == 0u) cur = (uint8_t)(v << 4);
+                else mac[nibs >> 1] = (uint8_t)(cur | (uint8_t)v);
+                nibs++;
+            }
+            if (ok && nibs == 12u && mac_valid(mac)) {
+                if (out_mac48)   memcpy(out_mac48, mac, 6u);
+                if (out_has_mac) *out_has_mac = true;
+                return true;
+            }
+        }
+
         char num[16];
-        size_t nlen = topic_len - 13u;
-        if (nlen >= sizeof(num)) nlen = sizeof(num) - 1u;
-        memcpy(num, topic + 13, nlen);
+        size_t nlen = (slen < sizeof(num)) ? slen : (sizeof(num) - 1u);
+        memcpy(num, seg, nlen);
         num[nlen] = '\0';
         uint16_t id = (uint16_t)(strtoul(num, NULL, 16) & ON_SHORT_ID_MASK);
         if (id == ON_SHORT_ID_UNASSIGNED) return false;
@@ -400,4 +434,11 @@ bool on_mqtt_parse_cmd_topic(const char *topic, size_t topic_len,
         return true;
     }
     return false;
+}
+
+bool on_mqtt_parse_cmd_topic(const char *topic, size_t topic_len,
+                             uint16_t *out_target_id, bool *out_is_ota) {
+    bool has_mac = false;
+    return on_mqtt_parse_cmd_topic_ex(topic, topic_len, out_target_id, NULL, &has_mac, out_is_ota)
+           && !has_mac;
 }

@@ -95,9 +95,13 @@ bool   on_mqtt_format_node_state_mac(uint16_t short_id, const uint8_t mac48[6],
                                      char *topic_out, size_t topic_cap,
                                      char *json_out, size_t json_cap);
 
-/* Parse inbound MQTT topic ("opennear/cmd/0x100" or "opennear/ota/trigger") */
+/* Parse inbound MQTT topic ("opennear/cmd/0x100", "opennear/cmd/A4CF12AABBCC", or "opennear/ota/trigger") */
 bool   on_mqtt_parse_cmd_topic(const char *topic, size_t topic_len,
                                uint16_t *out_target_id, bool *out_is_ota);
+
+bool   on_mqtt_parse_cmd_topic_ex(const char *topic, size_t topic_len,
+                                  uint16_t *out_target_id, uint8_t out_mac48[6],
+                                  bool *out_has_mac, bool *out_is_ota);
 
 #ifdef __cplusplus
 }

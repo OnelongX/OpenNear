@@ -58,7 +58,7 @@ th{color:var(--mut);font-weight:600;font-size:12px}
     <div class="brand">
       <h1>OpenNear</h1>
       <span class="badge" id="b-role">加载中...</span>
-      <span class="badge" id="b-fw">v6.7</span>
+      <span class="badge" id="b-fw">v6.8</span>
     </div>
     <div class="row">
       <input id="g-token" type="password" placeholder="Admin Token (如已设置)" style="width:185px" onchange="saveLocalToken()">
@@ -78,8 +78,11 @@ th{color:var(--mut);font-weight:600;font-size:12px}
   <section id="p-topo">
     <div class="card">
       <div class="row" style="justify-content:space-between;margin-bottom:8px">
-        <h2 style="margin:0">全网在线节点（0~6 跳实时快照）</h2>
+        <h2 style="margin:0">多跳无线集群实时拓扑图（点击节点可快速控制）</h2>
         <span class="muted mono" id="topo-meta">--</span>
+      </div>
+      <div style="overflow-x:auto;background:#030712;border:1px solid var(--bd);border-radius:10px;padding:6px;margin-bottom:12px">
+        <svg id="topo-svg" width="100%" height="180" viewBox="0 0 880 180" style="display:block;min-width:520px"></svg>
       </div>
       <div class="tbl-wrap">
         <table>
@@ -137,9 +140,9 @@ th{color:var(--mut);font-weight:600;font-size:12px}
         </div>
       </div>
       <div class="muted mono" style="margin-top:12px;line-height:1.7">
-        HA 自动发现: homeassistant/sensor/opennear_&lt;MACHEX&gt;/config（按 MAC 永久锚定 + 别名 + LWT）<br>
+        HA 自动发现: homeassistant/sensor/opennear_&lt;MACHEX&gt;/config（MAC 永久锚定 + 别名 + LWT）<br>
         网关在线遗嘱: <span id="mqtt-avty-hint">opennear/gw/&lt;MAC&gt;/status</span>（online / offline）<br>
-        节点状态上报: opennear/node/0x&lt;ID&gt;/state | 下行控制: opennear/cmd/0x&lt;ID&gt;
+        状态上报: opennear/node/&lt;MACHEX&gt;/state | 控制: opennear/cmd/&lt;MACHEX&gt; 或 0x&lt;ID&gt;
       </div>
     </div>
   </section>
@@ -182,7 +185,7 @@ th{color:var(--mut);font-weight:600;font-size:12px}
         <button class="btn sec" onclick="resetWifi()">清除 Wi-Fi 并重开热点</button>
         <button class="btn danger" onclick="rebootGw()">重启网关</button>
       </div>
-      <div class="muted" style="margin-top:8px">集群内所有节点需配置相同 NETKEY 方可解密通信；修改后自动写入 NVS 并即时生效</div>
+      <div class="muted" style="margin-top:8px">集群内所有节点需配置相同 NETKEY 方可解密通信；忘记 Token 可长按板载 BOOT 键 (GPIO0) 5 秒恢复出厂热点</div>
     </div>
   </section>
 </div>
@@ -293,11 +296,61 @@ async function renameNode(mac){
     fetchData();
   }
 }
+function renderTopoSvg(d){
+  const svg=$('topo-svg');
+  if(!svg)return;
+  const nodes=(d&&Array.isArray(d.nodes))?d.nodes:[];
+  if(!nodes.length){
+    svg.setAttribute('viewBox','0 0 880 90');svg.setAttribute('height','90');
+    svg.innerHTML='<text x="440" y="50" text-anchor="middle" fill="#64748b" font-size="13">等待节点入网...</text>';
+    return;
+  }
+  const byHop={};
+  let maxHop=0;
+  nodes.forEach(n=>{
+    const h=Math.max(0,Math.min(6,Number(n.hop)||0));
+    if(h>maxHop)maxHop=h;
+    (byHop[h]=byHop[h]||[]).push(n);
+  });
+  const W=880,rowH=86,H=Math.max(120,(maxHop+1)*rowH+32);
+  svg.setAttribute('viewBox','0 0 '+W+' '+H);svg.setAttribute('height',String(H));
+  const pos={};
+  Object.keys(byHop).forEach(hk=>{
+    const h=Number(hk),arr=byHop[h],step=W/(arr.length+1);
+    arr.forEach((n,idx)=>{pos[n.id]={x:Math.round(step*(idx+1)),y:44+h*rowH,n};});
+  });
+  const parts=[];
+  nodes.forEach(n=>{
+    const c=pos[n.id],p=pos[n.parent];
+    if(c&&p&&n.id!==n.parent){
+      const col=n.hop>=3?'#a855f7':(n.hop===2?'#f59e0b':'#38bdf8');
+      const dash=n.hop>=2?' stroke-dasharray="5,4"':'';
+      const my=Math.round((p.y+c.y)/2);
+      parts.push('<path d="M'+p.x+' '+(p.y+22)+' C'+p.x+' '+my+','+c.x+' '+my+','+c.x+' '+(c.y-22)+'" fill="none" stroke="'+col+'" stroke-width="2" stroke-opacity="0.7"'+dash+'/>');
+    }
+  });
+  nodes.forEach(n=>{
+    const p=pos[n.id];if(!p)return;
+    const isBk=(d.backup&&n.id===d.backup);
+    const fill=n.role==='G'?'#064e3b':(n.role==='SUB_G'?'#451a03':'#0f172a');
+    const stroke=n.role==='G'?'#22c55e':(n.role==='SUB_G'?'#f59e0b':(isBk?'#38bdf8':'#475569'));
+    const lbl=(n.mac&&gAliases[n.mac])?gAliases[n.mac]:(n.role+' '+n.id);
+    const shortLbl=lbl.length>14?lbl.slice(0,13)+'…':lbl;
+    const sub=n.id+(isBk?' [BK]':'')+' · '+(n.skew_ns||0)+'ns';
+    parts.push('<g style="cursor:pointer" onclick="quickCtrl(\''+esc(n.id)+'\')">'
+      +'<rect x="'+(p.x-58)+'" y="'+(p.y-22)+'" width="116" height="44" rx="9" fill="'+fill+'" stroke="'+stroke+'" stroke-width="1.8"/>'
+      +'<text x="'+p.x+'" y="'+(p.y-4)+'" text-anchor="middle" fill="#f8fafc" font-size="11.5" font-weight="600">'+esc(shortLbl)+'</text>'
+      +'<text x="'+p.x+'" y="'+(p.y+13)+'" text-anchor="middle" fill="#94a3b8" font-size="10" font-family="monospace">'+esc(sub)+'</text>'
+      +'</g>');
+  });
+  svg.innerHTML=parts.join('');
+}
 async function fetchData(){
   try{
     const r=await fetch('/api/data');
     const d=await r.json();
     $('topo-meta').textContent='SF='+d.sf+' | G='+d.g+' | Backup='+d.backup+' | Sub-G='+d.sub_g+' | 节点='+d.count;
+    renderTopoSvg(d);
     const tb=$('node-rows');
     if(!d.nodes||!d.nodes.length){
       tb.innerHTML='<tr><td colspan="11" class="muted">暂无在线节点</td></tr>';

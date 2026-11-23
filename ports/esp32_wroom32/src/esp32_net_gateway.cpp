@@ -69,10 +69,29 @@ bool on_esp32_net_gw_load_netkey(uint8_t out_key[16]) {
     s_netkey_custom = false;
     return false;
 }
+
+void on_esp32_net_gw_factory_reset(void) {
+    if (s_prefs.begin("opennear_gw", false)) {
+        s_prefs.clear();
+        s_prefs.end();
+    }
+    if (s_prefs.begin("opennear_alias", false)) {
+        s_prefs.clear();
+        s_prefs.end();
+    }
+    Serial.println("[OpenNear GW] Hardware factory reset (GPIO0 held 5s) -> NVS cleared, rebooting into OpenNear-Setup!");
+    Serial.flush();
+    delay(200);
+    esp_restart();
+}
 #else
 bool on_esp32_net_gw_load_netkey(uint8_t out_key[16]) {
     (void)out_key;
     return false;
+}
+
+void on_esp32_net_gw_factory_reset(void) {
+    esp_restart();
 }
 #endif
 
@@ -413,8 +432,11 @@ static void esp32_mqtt_poll(on_node_t *node, on_gw_ctx_t *gw) {
             on_mqtt_pub_view_t pub;
             if (on_mqtt_decode_publish(s_mqtt_rxbuf + consumed, pkt_len, &pub)) {
                 uint16_t target_id = 0u;
+                uint8_t target_mac[6] = {0};
+                bool has_mac = false;
                 bool is_ota = false;
-                if (on_mqtt_parse_cmd_topic(pub.topic, pub.topic_len, &target_id, &is_ota)) {
+                if (on_mqtt_parse_cmd_topic_ex(pub.topic, pub.topic_len, &target_id,
+                                               target_mac, &has_mac, &is_ota)) {
                     if (is_ota) {
                         char cmd_txt[256];
                         int cl = 0;
@@ -439,12 +461,17 @@ static void esp32_mqtt_poll(on_node_t *node, on_gw_ctx_t *gw) {
                         uint8_t plen = (pub.payload_len <= ON_GW_MAX_PAYLOAD_LEN)
                                        ? static_cast<uint8_t>(pub.payload_len) : ON_GW_MAX_PAYLOAD_LEN;
                         on_esp32_node_lock();
-                        if (node->mesh &&
-                            on_mesh_lookup_next_hop(node->mesh, target_id) != ON_SHORT_ID_UNASSIGNED) {
-                            on_node_send_mesh_downlink(node, target_id, pub.payload, plen);
-                        } else {
-                            on_node_send_gw_downlink(node, target_id, ON_GW_MSG_CLOUD_CMD_DOWN,
-                                                     pub.payload, plen);
+                        if (has_mac) {
+                            target_id = on_node_find_short_id_by_mac(node, target_mac);
+                        }
+                        if (target_id != ON_SHORT_ID_UNASSIGNED) {
+                            if (node->mesh &&
+                                on_mesh_lookup_next_hop(node->mesh, target_id) != ON_SHORT_ID_UNASSIGNED) {
+                                on_node_send_mesh_downlink(node, target_id, pub.payload, plen);
+                            } else {
+                                on_node_send_gw_downlink(node, target_id, ON_GW_MSG_CLOUD_CMD_DOWN,
+                                                         pub.payload, plen);
+                            }
                         }
                         on_esp32_node_unlock();
                     }
@@ -510,7 +537,7 @@ static void start_local_http_api(void) {
 
         append_cstr(json, sizeof(json), &pos, "{\"role\":\"");
         append_cstr(json, sizeof(json), &pos, role_s);
-        snprintf(num, sizeof(num), "\",\"id\":\"0x%03X\",\"mac\":\"%s\",\"ble_mac\":\"%s\",\"sf\":%u,\"fw_ver\":\"v6.7\",\"uptime_s\":%u",
+        snprintf(num, sizeof(num), "\",\"id\":\"0x%03X\",\"mac\":\"%s\",\"ble_mac\":\"%s\",\"sf\":%u,\"fw_ver\":\"v6.8\",\"uptime_s\":%u",
                  (unsigned)short_id, mac_s, bmac_s, (unsigned)sf_seq, (unsigned)(millis() / 1000u));
         append_cstr(json, sizeof(json), &pos, num);
 

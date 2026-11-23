@@ -980,6 +980,18 @@ void on_node_on_rx_raw_timed(on_node_t *node, const uint8_t *frame, size_t len,
             }
             node->sync_rx_this_sf   = true;
             node->missed_sync_count = 0u;
+            /* v6.8: Detect Primary G failover (parent_id changed on joined 1-hop node) -> re-report MAC48s */
+            if (!is_sub && node->role != ON_ROLE_UNJOINED && !node->is_sub_node &&
+                node->parent_id != ON_SHORT_ID_UNASSIGNED && hdr.src_id != node->parent_id) {
+                node->self_mac_reported_to_g = false;
+                if (node->role == ON_ROLE_SUB_G) {
+                    for (uint32_t pi = 0u; pi < ON_MAX_NODES_TABLE; ++pi) {
+                        if (node->peers[pi].active && node->peers[pi].is_sub_slot) {
+                            node->peers[pi].mac_reported_to_g = false;
+                        }
+                    }
+                }
+            }
             node->parent_id         = hdr.src_id;
             node->current_sf_seq    = sp.sf_seq;
             node->sf_cfg.t_sf_us         = sp.t_sf_us;
@@ -1075,6 +1087,7 @@ void on_node_on_rx_raw_timed(on_node_t *node, const uint8_t *frame, size_t len,
                 node->role        = ON_ROLE_T;
                 node->primary_slot_leased = !node->is_sub_node;
                 node->primary_join_sf = node->current_sf_seq;
+                node->self_mac_reported_to_g = true; /* Primary G already learned MAC48 from JOIN_REQ */
                 node->rtt_next_sf = node->current_sf_seq + 1u;
                 node->sync.rtt_calibrated = false; /* Fresh RTT lock to new parent */
                 sync_mesh_identity(node);
@@ -1314,13 +1327,26 @@ void on_node_on_rx_raw_timed(on_node_t *node, const uint8_t *frame, size_t len,
                     } else if (msg.bridge_type == ON_GW_MSG_MAC_REPORT && msg.payload_len >= 6u) {
                         node->rx_slot_mask_this_sf |= (uint16_t)(1u << (hdr.slot_idx & 0x0Fu));
                         on_peer_entry_t *pe_sg = find_peer_by_id(node, hdr.src_id);
-                        if (pe_sg) pe_sg->last_seen_sf = node->current_sf_seq;
+                        if (pe_sg) {
+                            pe_sg->last_seen_sf = node->current_sf_seq;
+                            if (msg.origin_id == hdr.src_id) {
+                                memcpy(pe_sg->mac48, msg.payload, 6u);
+                            }
+                        }
                         on_cluster_node_t *cn = cluster_find_or_alloc(node, msg.origin_id);
                         if (cn) {
                             memcpy(cn->mac48, msg.payload, 6u);
-                            if (cn->parent_id == ON_SHORT_ID_UNASSIGNED) cn->parent_id = hdr.src_id;
-                            if (cn->hop_depth == 0u) cn->hop_depth = 2u;
-                            if (cn->role == 0u) cn->role = (uint8_t)ON_ROLE_T;
+                            if (msg.origin_id == hdr.src_id) {
+                                cn->parent_id = node->short_id;
+                                cn->hop_depth = 1u;
+                                cn->slot_idx  = pe_sg ? pe_sg->slot_idx : hdr.slot_idx;
+                                cn->role      = (hdr.src_id == node->sub_g_id || hdr.src_id == node->sub_g_id_2)
+                                                ? (uint8_t)ON_ROLE_SUB_G : (uint8_t)ON_ROLE_T;
+                            } else {
+                                if (cn->parent_id == ON_SHORT_ID_UNASSIGNED) cn->parent_id = hdr.src_id;
+                                if (cn->hop_depth == 0u) cn->hop_depth = 2u;
+                                if (cn->role == 0u) cn->role = (uint8_t)ON_ROLE_T;
+                            }
                             cn->last_seen_sf = node->current_sf_seq;
                         }
                     } else if (node->gw) {
@@ -1833,6 +1859,35 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
         int64_t slot_ns = (int64_t)on_sf_slot_start_us(&node->sf_cfg, node->my_slot) * 1000LL;
         if (elapsed_ns >= slot_ns && elapsed_ns < slot_ns + 80000LL) {
             node->tdma_tx_done_this_sf = true;
+            /* v6.8: After Backup_ID failover, 1-hop nodes re-report their own MAC48 once in their private D-TDMA slot */
+            if (!node->self_mac_reported_to_g && !node->harq_retry_pending &&
+                node->tdma_tx_total > 0u && mac48_nonzero(node->mac48)) {
+                on_gw_bridge_msg_t mrep;
+                memset(&mrep, 0, sizeof(mrep));
+                mrep.bridge_type = (uint8_t)ON_GW_MSG_MAC_REPORT;
+                mrep.flags       = 0u;
+                mrep.origin_id   = node->short_id;
+                mrep.seq         = ++node->data_tx_seq;
+                mrep.payload_len = 6u;
+                memcpy(mrep.payload, node->mac48, 6u);
+                uint8_t mbuf[ON_GW_BRIDGE_HDR_LEN + 6u];
+                size_t mlen = 0u;
+                if (on_gw_bridge_pack(&mrep, mbuf, sizeof(mbuf), &mlen) == ON_OK) {
+                    on_mac_hdr_t hdr;
+                    memset(&hdr, 0, sizeof(hdr));
+                    hdr.version    = ON_PROTO_VERSION;
+                    hdr.type       = (uint8_t)ON_FRAME_GW_BRIDGE;
+                    hdr.is_sub_g   = false;
+                    hdr.src_id     = node->short_id;
+                    hdr.dst_id     = node->parent_id;
+                    hdr.sf_seq_low = (uint8_t)(node->current_sf_seq & 0x0Fu);
+                    hdr.slot_idx   = node->my_slot;
+                    send_frame(node, &hdr, mbuf, mlen, now_local_ns);
+                    node->self_mac_reported_to_g = true;
+                    node->gw_tx_total++;
+                    goto tdma_slot_done;
+                }
+            }
             /* v6.5: Sub-G reports each newly-joined 2-hop child's MAC48 in its own private D-TDMA slot (guaranteed 0 collision!) */
             if (node->role == ON_ROLE_SUB_G && !node->harq_retry_pending && node->tdma_tx_total > 0u) {
                 for (uint32_t pi = 0u; pi < ON_MAX_NODES_TABLE; ++pi) {
@@ -2694,6 +2749,26 @@ size_t on_node_format_cluster_json(const on_node_t *node, bool include_data,
     int tail = snprintf(out_buf + pos, out_cap - (size_t)pos, "]}");
     if (tail <= 0 || (size_t)(pos + tail) >= out_cap) return 0u;
     return (size_t)(pos + tail);
+}
+
+uint16_t on_node_find_short_id_by_mac(const on_node_t *node, const uint8_t mac48[6]) {
+    if (!node || !mac48 || !mac48_nonzero(mac48)) return ON_SHORT_ID_UNASSIGNED;
+    if (memcmp(node->mac48, mac48, 6u) == 0) {
+        return node->short_id & ON_SHORT_ID_MASK;
+    }
+    for (uint32_t i = 0u; i < ON_MAX_CLUSTER_NODES; ++i) {
+        if (node->cluster_tbl[i].active &&
+            memcmp(node->cluster_tbl[i].mac48, mac48, 6u) == 0) {
+            return node->cluster_tbl[i].short_id & ON_SHORT_ID_MASK;
+        }
+    }
+    for (uint32_t i = 0u; i < ON_MAX_NODES_TABLE; ++i) {
+        if (node->peers[i].active &&
+            memcmp(node->peers[i].mac48, mac48, 6u) == 0) {
+            return node->peers[i].short_id & ON_SHORT_ID_MASK;
+        }
+    }
+    return ON_SHORT_ID_UNASSIGNED;
 }
 
 /* ========================================================================== */
