@@ -74,6 +74,7 @@ typedef struct {
     uint32_t ota_target_ver;
     bool     wifi_creds_updated;
     bool     mqtt_creds_updated;
+    bool     admin_token_updated;
     bool     ota_pull_requested;
     bool     topo_query_requested;
     bool     topo_include_data;

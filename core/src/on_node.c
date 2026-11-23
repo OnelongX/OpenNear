@@ -68,6 +68,22 @@ static void emit_event(on_node_t *node, const char *name, uint32_t a1, int64_t a
     }
 }
 
+static void sync_mesh_identity(on_node_t *node) {
+    if (!node || !node->mesh) return;
+    node->mesh->my_id = node->short_id & ON_SHORT_ID_MASK;
+    if (node->role == ON_ROLE_G) {
+        node->mesh->my_hop_depth = 0u;
+        node->mesh->parent_id    = ON_SHORT_ID_UNASSIGNED;
+        node->mesh->root_id      = node->short_id & ON_SHORT_ID_MASK;
+    } else if (node->role == ON_ROLE_UNJOINED) {
+        node->mesh->my_hop_depth = 0xFFu;
+        node->mesh->parent_id    = ON_SHORT_ID_UNASSIGNED;
+    } else if (node->mesh->my_hop_depth == 0xFFu || node->mesh->my_hop_depth <= 2u) {
+        node->mesh->my_hop_depth = node->is_sub_node ? 2u : 1u;
+        node->mesh->parent_id    = node->parent_id & ON_SHORT_ID_MASK;
+    }
+}
+
 static on_peer_entry_t *find_peer_by_mac(on_node_t *node, const uint8_t mac48[6]) {
     for (uint32_t i = 0; i < ON_MAX_NODES_TABLE; ++i) {
         if (node->peers[i].active && memcmp(node->peers[i].mac48, mac48, 6u) == 0) {
@@ -682,6 +698,7 @@ static void rejoin_primary(on_node_t *node, bool reset_clock) {
         on_sync_reset(&node->sync);
         on_sync_set_ant_delay_ns(&node->sync, ant_delay_ns);
     }
+    sync_mesh_identity(node);
     node->rejoin_count++;
 }
 
@@ -800,6 +817,7 @@ void on_node_on_rx_raw(on_node_t *node, const uint8_t *frame, size_t len, int64_
             }
             if (yielding_primary) {
                 node->role = ON_ROLE_T;
+                sync_mesh_identity(node);
                 emit_event(node, "G_YIELD_TO_PRIMARY", hdr.src_id, (int64_t)node->current_sf_seq);
             }
             if (new_primary_session) {
@@ -933,6 +951,7 @@ void on_node_on_rx_raw(on_node_t *node, const uint8_t *frame, size_t len, int64_
                 node->primary_join_sf = node->current_sf_seq;
                 node->rtt_next_sf = node->current_sf_seq + 1u;
                 node->sync.rtt_calibrated = false; /* Fresh RTT lock to new parent */
+                sync_mesh_identity(node);
                 emit_event(node, node->is_sub_node ? "JOINED_VIA_SUBG" : "JOINED_PRIMARY",
                            node->short_id, node->my_slot);
             }
@@ -1544,6 +1563,7 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
                                             (uint32_t)node->mac48[5];
                         on_sec_set_session(&node->sec, mac_salt, node->sec.key_epoch);
                     }
+                    sync_mesh_identity(node);
                     send_sync_map(node, false);
                     emit_event(node, "LEADERLESS_ELECTED_G", node->short_id, (int64_t)node->mac48[5]);
                 }
@@ -1563,6 +1583,7 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
      */
     if (node->role == ON_ROLE_T &&
         !node->is_sub_node &&
+        node->epoch_period <= 1u &&
         node->short_id != ON_SHORT_ID_UNASSIGNED &&
         node->short_id == node->backup_id &&
         node->missed_sync_count >= node->backup_miss_threshold &&
@@ -1573,6 +1594,7 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
         node->current_sf_start_net_ns += t_sf_ns;
         node->role = ON_ROLE_G;
         node->failover_count++;
+        sync_mesh_identity(node);
         /* Anchor G clock smoothly to our locked NCO network time without tick-overshoot jump */
         node->sync.ref_local_ns = on_sync_net_to_local(&node->sync, node->current_sf_start_net_ns);
         node->sync.ref_net_ns   = node->current_sf_start_net_ns;
@@ -1600,7 +1622,13 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
     int64_t expected_next_sync_ns = t_sf_ns +
         (node->is_sub_node ? (int64_t)node->sf_cfg.sub_g_start_us * 1000LL : 0LL);
     if (elapsed_ns >= expected_next_sync_ns + 280000LL) {
-        node->missed_sync_count++;
+        bool planned_epoch_sleep = (node->epoch_period > 1u && node->sync.lock_count >= 4u &&
+                                    node->role == ON_ROLE_T && !node->is_sub_node &&
+                                    !on_epoch_is_my_sf(node->current_sf_seq + 1u,
+                                                       node->epoch_phase, node->epoch_period));
+        if (!planned_epoch_sleep) {
+            node->missed_sync_count++;
+        }
         on_sync_on_missed_beacon(&node->sync);
         node->current_sf_seq++;
         node->current_sf_start_net_ns += t_sf_ns;
@@ -1628,6 +1656,7 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
             node->missed_sync_count   = 0u;
             node->awaiting_ack        = false;
             node->harq_retry_pending  = false;
+            sync_mesh_identity(node);
             emit_event(node, "SUB_NODE_DETACHED", node->parent_id, (int64_t)node->current_sf_seq);
             return;
         }
@@ -2478,11 +2507,20 @@ void on_node_set_epoch_schedule(on_node_t *node, uint8_t epoch_phase, uint8_t ep
     if (!node) return;
     node->epoch_phase  = epoch_phase;
     node->epoch_period = epoch_period;
+    if (epoch_period > 1u) {
+        /* Sleeping Epoch-TDMA nodes must not be elected as always-on Backup_ID */
+        node->capabilities &= (uint8_t)(~0x01u);
+        uint32_t min_lease = (uint32_t)epoch_period * 3u;
+        if (node->peer_lease_timeout_sf < min_lease) {
+            node->peer_lease_timeout_sf = min_lease;
+        }
+    }
 }
 
 void on_node_attach_mesh(on_node_t *node, on_mesh_ctx_t *mesh) {
     if (!node) return;
     node->mesh = mesh;
+    sync_mesh_identity(node);
 }
 
 on_err_t on_node_send_mesh_uplink(on_node_t *node, const uint8_t *payload, uint8_t len) {

@@ -303,6 +303,9 @@ on_err_t on_esp32_hal_init(const on_esp32_cfg_t *cfg, on_hal_ops_t *hal_out) {
 
         if (esp_wifi_start() != ESP_OK) return ON_ERR_NOT_READY;
         esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+    } else {
+        /* Even when sharing public Wi-Fi STA, lock raw 802.11 TX frames to 54 Mbps OFDM */
+        esp_wifi_config_80211_tx_rate(WIFI_IF_STA, WIFI_PHY_RATE_54M);
     }
     if (esp_wifi_set_ps(WIFI_PS_NONE) != ESP_OK) return ON_ERR_NOT_READY;
     esp_wifi_get_mac(WIFI_IF_STA, s_mac48);

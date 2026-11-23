@@ -134,6 +134,34 @@ bool on_mqtt_decode_publish(const uint8_t *in, size_t len, on_mqtt_pub_view_t *o
     return true;
 }
 
+int on_mqtt_next_packet(const uint8_t *in, size_t len,
+                        uint8_t *out_pkt_type, size_t *out_pkt_len) {
+    if (!in || !out_pkt_type || !out_pkt_len) return -1;
+    if (len < 2u) return 0;
+
+    size_t mult = 1u, val = 0u, i = 0u;
+    bool done = false;
+    while (i < len - 1u && i < 4u) {
+        uint8_t b = in[1u + i];
+        val += (size_t)(b & 0x7Fu) * mult;
+        ++i;
+        if ((b & 0x80u) == 0u) {
+            done = true;
+            break;
+        }
+        mult <<= 7u;
+    }
+    if (!done) {
+        return (i >= 4u) ? -1 : 0;
+    }
+    size_t total = 1u + i + val;
+    if (total > len) return 0;
+
+    *out_pkt_type = (uint8_t)(in[0] & 0xF0u);
+    *out_pkt_len  = total;
+    return 1;
+}
+
 size_t on_mqtt_encode_subscribe(uint16_t pkt_id, const char *topic_filter,
                                 uint8_t *out, size_t cap) {
     if (!topic_filter || !out) return 0u;

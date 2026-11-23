@@ -32,7 +32,7 @@ opennear/
 │   ├── sim_world.h / sim_world.c
 │   └── main_sim.c
 ├── tests/
-│   └── test_opennear.c              # 32 组全链路自动化单测与集成断言套件（230+ 项断言）
+│   └── test_opennear.c              # 33 组全链路自动化单测与集成断言套件（347 项断言）
 ├── tools/
 │   ├── dashboard.html               # 交互式 HTML 协议可视化与极限破坏性压测工作台
 │   ├── chaos_server.mjs             # 在线调用底层 C11 仿真引擎的交互式混沌压测本地服务器
@@ -67,7 +67,7 @@ powershell -ExecutionPolicy Bypass -File d:\AIOS\opennear\build_and_test.ps1
 - **v6.0 万物互联全功能网关**（公网 Wi-Fi STA + HTTP `/api/topology` & `/api/data` + BLE GATT `0xFFE0` + MQTT/Home Assistant 自动发现 + A/B 分区 OTA + 无主冷启动）：
   - 网关/主控：`pio run -d .\ports\esp32_wroom32 -e esp32_iot_mesh_gw -t upload`
   - OTA/BLE 终端：`pio run -d .\ports\esp32_wroom32 -e esp32_node_t_ota -t upload`
-  - 蓝牙 `0xFFE2` / HTTP `POST /api/cmd` 支持指令：`WIFI:<ssid>|<pass>|<cloud_url>`、`MQTT:<host>|<port>|<user>|<pass>`、`OTA:<target_hex>|<ver>|<http_url>`、`CMD:<target_hex>|<payload>`、`TOPO?`、`DATA?`（开启 `OPENNEAR_ADMIN_TOKEN` 时自动要求 `AUTH:<token>|...` 或 HTTP Header `X-OpenNear-Token`）。
+  - 蓝牙 `0xFFE2` / HTTP `POST /api/cmd` 支持指令：`WIFI:<ssid>|<pass>|<cloud_url>`、`MQTT:<host>|<port>|<user>|<pass>`、`TOKEN:<new_token>`、`OTA:<target_hex>|<ver>|<http_url>`、`CMD:<target_hex>|<payload>`、`TOPO?`、`DATA?`（开启 `OPENNEAR_ADMIN_TOKEN` 或 `TOKEN:` 后自动要求 `AUTH:<token>|...` 或 HTTP Header `X-OpenNear-Token`）。
 - 节点使用 `GPIO2` 输出超帧中的 ACT 动作；串口 `115200` 下可查看角色、同步帧接收量、上行收发计数和接管次数。
 - ESP32 的原始 Wi-Fi 发送由驱动排队，提交成功不代表已经发射，且没有可用于此端口 RTT 校准的实际发射时间戳。因此这个端口不启用空口 RTT 校准或基于提交时间的 PTP 跟进修正，备用节点须同时满足连续漏收至少 12 帧和本地时钟计时至少 150 ms 未收到有效同步帧才接管；仿真和其他端口默认仍为 3 帧，无额外时长门槛。GPIO 对齐精度需用示波器或逻辑分析仪独立测量。
 

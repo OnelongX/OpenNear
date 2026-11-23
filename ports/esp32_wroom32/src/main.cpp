@@ -35,8 +35,10 @@ static const uint8_t kDefaultNetMasterKey[ON_SEC_KEY_LEN] = {
 };
 
 static on_node_t g_node;
+static on_mesh_ctx_t g_mesh;
 #ifdef OPENNEAR_ENABLE_OTA
 static on_ota_ctx_t g_ota;
+static bool s_ota_boot_confirmed = false;
 #endif
 #if defined(OPENNEAR_ENABLE_WIFI_GW) || defined(OPENNEAR_ENABLE_BLE_GW)
 static on_gw_ctx_t g_gw;
@@ -55,41 +57,74 @@ static void opennear_rt_task(void *arg) {
         on_esp32_hal_poll_rx(&g_node);
         int64_t now_ns = g_node.hal.now_ns(g_node.hal.user_ctx);
         on_node_step(&g_node, now_ns);
+        const int64_t until_deadline_ns = on_node_next_wakeup_local_ns(&g_node, now_ns) - now_ns;
+        const bool should_log = (now_ns - last_log_ns >= 1000000000LL) &&
+                                (!g_node.sync.locked || until_deadline_ns > 600000LL);
+        struct {
+            uint32_t sf_seq, harq_retx, act_fire, sync_rx, tdma_tx, tdma_rx, missed, failover, rejoins, leases;
+            int      role, hop;
+            uint16_t short_id, backup_id;
+            uint8_t  my_slot;
+            double   rate_ppb;
+            int64_t  link_delay_ns;
+        } log_s;
+        if (should_log) {
+            log_s.sf_seq        = g_node.current_sf_seq;
+            log_s.role          = (int)g_node.role;
+            log_s.short_id      = g_node.short_id;
+            log_s.hop           = (g_node.mesh && g_node.mesh->my_hop_depth != 0xFFu)
+                                  ? (int)g_node.mesh->my_hop_depth
+                                  : (g_node.is_sub_node ? 2 : (g_node.role == ON_ROLE_G ? 0 : 1));
+            log_s.my_slot       = g_node.my_slot;
+            log_s.rate_ppb      = g_node.sync.rate_ppb;
+            log_s.link_delay_ns = g_node.sync.link_delay_ns;
+            log_s.harq_retx     = g_node.harq_retx_total;
+            log_s.act_fire      = g_node.act_fire_total;
+            log_s.sync_rx       = g_node.sync_rx_total;
+            log_s.tdma_tx       = g_node.tdma_tx_total;
+            log_s.tdma_rx       = g_node.tdma_rx_total;
+            log_s.missed        = g_node.missed_sync_count;
+            log_s.failover      = g_node.failover_count;
+            log_s.backup_id     = g_node.backup_id;
+            log_s.rejoins       = g_node.rejoin_count;
+            log_s.leases        = g_node.lease_reclaim_count;
+        }
         on_esp32_node_unlock();
 
         /* Network SF can reset on a primary reboot; local time stays monotonic.
          * Defer 1 Hz UART formatting if an ACT/SYNC deadline is within 600 us. */
-        const int64_t until_deadline_ns = on_node_next_wakeup_local_ns(&g_node, now_ns) - now_ns;
-        if (now_ns - last_log_ns >= 1000000000LL &&
-            (!g_node.sync.locked || until_deadline_ns > 600000LL)) {
+        if (should_log) {
             last_log_ns = now_ns;
             uint32_t tx_accepted, tx_failed;
             on_esp32_hal_tx_counts(&tx_accepted, &tx_failed);
-            Serial.printf("[OpenNear v3.0] SF=%u role=%d id=0x%03X hop=%d slot=%u nco=%.2fppm rtt=%lldns harq=%u acts=%u\n",
-                          (unsigned)g_node.current_sf_seq,
-                          (int)g_node.role,
-                          (unsigned)g_node.short_id,
-                          g_node.is_sub_node ? 2 : (g_node.role == ON_ROLE_G ? 0 : 1),
-                          (unsigned)g_node.my_slot,
-                          g_node.sync.rate_ppb * 1e-3,
-                          (long long)g_node.sync.link_delay_ns,
-                          (unsigned)g_node.harq_retx_total,
-                          (unsigned)g_node.act_fire_total);
+            Serial.printf("[OpenNear v6.2] SF=%u role=%d id=0x%03X hop=%d slot=%u nco=%.2fppm rtt=%lldns harq=%u acts=%u\n",
+                          (unsigned)log_s.sf_seq,
+                          log_s.role,
+                          (unsigned)log_s.short_id,
+                          log_s.hop,
+                          (unsigned)log_s.my_slot,
+                          log_s.rate_ppb * 1e-3,
+                          (long long)log_s.link_delay_ns,
+                          (unsigned)log_s.harq_retx,
+                          (unsigned)log_s.act_fire);
             Serial.printf("[OpenNear TX] accepted=%u failed=%u\n",
                           (unsigned)tx_accepted, (unsigned)tx_failed);
             Serial.printf("[OpenNear Link] sync_rx=%u data_tx=%u data_rx=%u missed=%u takeovers=%u backup=0x%03X rejoins=%u leases=%u\n",
-                          (unsigned)g_node.sync_rx_total, (unsigned)g_node.tdma_tx_total,
-                          (unsigned)g_node.tdma_rx_total, (unsigned)g_node.missed_sync_count,
-                          (unsigned)g_node.failover_count, (unsigned)g_node.backup_id,
-                          (unsigned)g_node.rejoin_count,
-                          (unsigned)g_node.lease_reclaim_count);
+                          (unsigned)log_s.sync_rx, (unsigned)log_s.tdma_tx,
+                          (unsigned)log_s.tdma_rx, (unsigned)log_s.missed,
+                          (unsigned)log_s.failover, (unsigned)log_s.backup_id,
+                          (unsigned)log_s.rejoins,
+                          (unsigned)log_s.leases);
         }
         /* A 1 ms tick delay near a deadline can skip the entire ACT window. */
         if ((++loop_iters & 0x3Fu) == 0u) {
             const int64_t tick_ns = 1000000000LL / configTICK_RATE_HZ;
+            on_esp32_node_lock();
             const int64_t now = g_node.hal.now_ns(g_node.hal.user_ctx);
             const int64_t until_wakeup = on_node_next_wakeup_local_ns(&g_node, now) - now;
-            if (!g_node.sync.locked || until_wakeup > tick_ns + 300000LL) {
+            const bool can_delay = !g_node.sync.locked || until_wakeup > tick_ns + 300000LL;
+            on_esp32_node_unlock();
+            if (can_delay) {
                 vTaskDelay(1);
                 continue;
             }
@@ -141,13 +176,17 @@ void setup() {
     on_node_init(&g_node, &hal,
                  is_master ? ON_ROLE_G : ON_ROLE_UNJOINED,
                  is_master ? 0x00u : (uint8_t)OPENNEAR_CAPS);
+    on_mesh_init(&g_mesh,
+                 is_master ? ON_SHORT_ID_G_DEFAULT : ON_SHORT_ID_UNASSIGNED,
+                 is_master ? 0u : 0xFFu,
+                 ON_SHORT_ID_UNASSIGNED);
+    on_node_attach_mesh(&g_node, &g_mesh);
 #ifdef OPENNEAR_ENABLE_OTA
-    on_esp32_ota_confirm_running_app();
     on_ota_storage_ops_t ota_ops;
     on_esp32_ota_storage_init(&ota_ops);
     on_ota_init(&g_ota, OPENNEAR_FW_VERSION, 1u /* ESP32 */, &ota_ops);
     on_node_attach_ota(&g_node, &g_ota);
-    Serial.printf("[OpenNear OTA] A/B Dual-Partition OTA armed (fw=0x%08X)\n",
+    Serial.printf("[OpenNear OTA] A/B Dual-Partition OTA armed (fw=0x%08X, deferred boot-confirm)\n",
                   (unsigned)OPENNEAR_FW_VERSION);
 #endif
 #if defined(OPENNEAR_ENABLE_WIFI_GW) || defined(OPENNEAR_ENABLE_BLE_GW)
@@ -206,6 +245,18 @@ void loop() {
 #if defined(OPENNEAR_ENABLE_WIFI_GW) || defined(OPENNEAR_ENABLE_BLE_GW)
     on_esp32_net_gw_poll(&g_node, &g_gw);
 #endif
+#ifdef OPENNEAR_ENABLE_OTA
+    /* Deferred A/B boot confirmation: only cancel rollback after >=10s healthy runtime + sync */
+    if (!s_ota_boot_confirmed && millis() >= 10000u) {
+        on_esp32_node_lock();
+        bool healthy = (g_node.role == ON_ROLE_G) || (g_node.sync_rx_total >= 4u) || (millis() >= 30000u);
+        on_esp32_node_unlock();
+        if (healthy) {
+            on_esp32_ota_confirm_running_app();
+            s_ota_boot_confirmed = true;
+        }
+    }
+#endif
     /* Interactive USB Serial query: type "TOPO?" or "DATA?" on ANY node to dump cluster JSON */
     if (Serial.available() > 0) {
         String cmd = Serial.readStringUntil('\n');
@@ -215,7 +266,7 @@ void loop() {
             if (g_node.role != ON_ROLE_G && !g_node.cluster_snapshot_valid) {
                 on_node_request_cluster_snapshot(&g_node);
             }
-            static char s_json[1024];
+            static char s_json[2048];
             size_t n = on_node_format_cluster_json(&g_node, cmd.equalsIgnoreCase("DATA?"),
                                                    s_json, sizeof(s_json));
             on_esp32_node_unlock();

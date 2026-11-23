@@ -2020,9 +2020,138 @@ static void test_v61_audit_regressions(void) {
     EXPECT(wake_sfs == 1u, "Sleeping Epoch-TDMA node opens SYNC RX only on 1/16 scheduled superframes");
 }
 
+/* ========================================================================== */
+/* Test 33: v6.2 Deep Hardening Regressions                                   */
+/* ========================================================================== */
+static void test_v62_deep_hardening_regressions(void) {
+    printf("[TEST 33] v6.2 Deep Hardening (MQTT Stream Framing + Replay LRU + Epoch Sleep + Mesh Loop Guard + Token Rotate)...\n");
+
+    /* 1. Coalesced TCP MQTT stream: [CONNACK][SUBACK][PINGRESP][PUBLISH #1][PUBLISH #2] */
+    uint8_t stream[256];
+    size_t pos = 0u;
+    /* CONNACK (4B) */
+    stream[pos++] = ON_MQTT_PKT_CONNACK; stream[pos++] = 2u; stream[pos++] = 0u; stream[pos++] = 0u;
+    /* SUBACK (5B) */
+    stream[pos++] = ON_MQTT_PKT_SUBACK; stream[pos++] = 3u; stream[pos++] = 0u; stream[pos++] = 1u; stream[pos++] = 0u;
+    /* PINGRESP (2B) */
+    stream[pos++] = ON_MQTT_PKT_PINGRESP; stream[pos++] = 0u;
+    /* Two back-to-back PUBLISH packets */
+    size_t p1 = on_mqtt_encode_publish("opennear/cmd/0x100", (const uint8_t *)"ON", 2u, false,
+                                       stream + pos, sizeof(stream) - pos);
+    pos += p1;
+    size_t p2 = on_mqtt_encode_publish("opennear/cmd/0x200", (const uint8_t *)"OFF", 3u, false,
+                                       stream + pos, sizeof(stream) - pos);
+    pos += p2;
+
+    /* Partial packet check (first 1 byte only) */
+    uint8_t ptype = 0u;
+    size_t plen = 0u;
+    EXPECT(on_mqtt_next_packet(stream, 1u, &ptype, &plen) == 0,
+           "MQTT stream framer returns 0 (need more bytes) on truncated header");
+
+    /* Drain full coalesced buffer */
+    size_t off = 0u;
+    uint32_t total_pkts = 0u, pub_pkts = 0u;
+    uint16_t targets[2] = {0u, 0u};
+    while (off < pos) {
+        int st = on_mqtt_next_packet(stream + off, pos - off, &ptype, &plen);
+        if (st != 1) break;
+        total_pkts++;
+        if (ptype == ON_MQTT_PKT_PUBLISH) {
+            on_mqtt_pub_view_t pv;
+            if (on_mqtt_decode_publish(stream + off, plen, &pv)) {
+                uint16_t tid = 0u;
+                bool is_ota = false;
+                if (on_mqtt_parse_cmd_topic(pv.topic, pv.topic_len, &tid, &is_ota) && !is_ota) {
+                    if (pub_pkts < 2u) targets[pub_pkts] = tid;
+                    pub_pkts++;
+                }
+            }
+        }
+        off += plen;
+    }
+    EXPECT(off == pos && total_pkts == 5u && pub_pkts == 2u &&
+           targets[0] == 0x100u && targets[1] == 0x200u,
+           "MQTT stream framer drains coalesced CONNACK+SUBACK+PINGRESP+2xPUBLISH without dropping commands");
+
+    /* 2. Anti-replay table LRU eviction beyond ON_SEC_REPLAY_SLOTS (never fails open) */
+    on_sec_ctx_t sec;
+    on_sec_init(&sec);
+    static const uint8_t kKey[ON_SEC_KEY_LEN] = {
+        0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,0x99,0xAA,0xBB,0xCC,0xDD,0xEE,0xFF,0x01
+    };
+    on_sec_set_key(&sec, kKey);
+    for (uint16_t i = 0u; i < 40u; ++i) {
+        EXPECT(on_sec_check_replay(&sec, (uint16_t)(0x010u + i), 100u + i, 1u, ON_FRAME_TDMA_DATA),
+               "Fresh packet accepted for node beyond replay table capacity");
+    }
+    EXPECT(!on_sec_check_replay(&sec, 0x037u, 139u, 1u, ON_FRAME_TDMA_DATA) && sec.replay_drops >= 1u,
+           "40th node still protected against replay after LRU eviction of oldest slot");
+
+    /* 3. Epoch-TDMA planned sleep keeps missed_sync_count=0 & prevents spurious Backup Takeover */
+    on_node_t slp;
+    on_node_init(&slp, NULL, ON_ROLE_T, 0x03u);
+    slp.short_id                = 0x040u;
+    slp.backup_id               = 0x040u; /* Even if designated backup before epoch config */
+    slp.sync.locked             = true;
+    slp.sync.lock_count         = 10u;
+    slp.current_sf_seq          = 0u;
+    slp.current_sf_start_net_ns = 0;
+    on_node_set_epoch_schedule(&slp, 0u, 16u);
+    for (uint32_t sf = 1u; sf < 15u; ++sf) {
+        int64_t t = (int64_t)sf * 4000000LL + 350000LL;
+        on_node_step(&slp, t);
+    }
+    EXPECT((slp.capabilities & 0x01u) == 0u && slp.missed_sync_count == 0u && slp.role == ON_ROLE_T,
+           "Epoch-TDMA planned sleep keeps missed_sync_count=0 and blocks spurious Backup Takeover");
+
+    /* 4. Mesh neighbor loop-guard & parent-safe eviction when neighbor table is full */
+    on_mesh_ctx_t mesh;
+    on_mesh_init(&mesh, 0x020u, 0xFFu, ON_SHORT_ID_UNASSIGNED);
+    on_mesh_on_beacon(&mesh, 0x010u, 1u, 240u, 10u); /* Best hop-1 parent -> my_hop_depth = 2 */
+    for (uint16_t k = 1u; k < ON_MESH_MAX_NEIGHBORS; ++k) {
+        on_mesh_on_beacon(&mesh, (uint16_t)(0x010u + k), 1u, (uint8_t)(200u - k * 5u), 10u);
+    }
+    /* Inject deeper neighbor (loop candidate) & weaker hop-1 neighbor into full table */
+    on_mesh_on_beacon(&mesh, 0x099u, 2u, 255u, 11u);
+    on_mesh_on_beacon(&mesh, 0x098u, 1u, 50u,  11u);
+    EXPECT(mesh.parent_id == 0x010u && mesh.my_hop_depth == 2u,
+           "Mesh neighbor loop-guard & smart eviction never overwrite active parent");
+
+    /* 5. Runtime Gateway TOKEN:<new_token> rotation & clear */
+    on_gw_ctx_t gw;
+    on_gw_init(&gw, ON_GW_MODE_WIFI_AND_BLE, NULL);
+    EXPECT(on_gw_handle_control_text(&gw, "TOKEN:INIT123", 13u, false) == ON_OK &&
+           gw.cfg.admin_token_updated && strcmp(gw.cfg.admin_token, "INIT123") == 0,
+           "Initial TOKEN:<pin> accepted when no token is configured");
+    gw.cfg.admin_token_updated = false;
+    EXPECT(on_gw_handle_control_text(&gw, "TOKEN:HACK", 10u, true) == ON_ERR_DECODE_FAIL,
+           "Unauthenticated TOKEN rotation rejected once token is active");
+    EXPECT(on_gw_handle_control_text(&gw, "AUTH:INIT123|TOKEN:NEXT456", 26u, true) == ON_OK &&
+           gw.cfg.admin_token_updated && strcmp(gw.cfg.admin_token, "NEXT456") == 0,
+           "Authenticated TOKEN rotation succeeds and flags NVS persistence");
+    EXPECT(on_gw_handle_control_text(&gw, "AUTH:NEXT456|TOKEN:", 19u, true) == ON_OK &&
+           gw.cfg.admin_token[0] == '\0',
+           "Authenticated empty TOKEN: cleanly clears admin token");
+
+    /* 6. Mesh identity auto-sync when unjoined node promotes via Leaderless Boot */
+    on_node_t lb;
+    on_mesh_ctx_t lb_mesh;
+    on_node_init(&lb, NULL, ON_ROLE_UNJOINED, 0x03u);
+    lb.mac48[5] = 0x01u;
+    on_mesh_init(&lb_mesh, ON_SHORT_ID_UNASSIGNED, 0xFFu, ON_SHORT_ID_UNASSIGNED);
+    on_node_attach_mesh(&lb, &lb_mesh);
+    on_node_enable_leaderless_boot(&lb, 20u);
+    on_node_step(&lb, 1000000LL);
+    on_node_step(&lb, 30000000LL);
+    EXPECT(lb.role == ON_ROLE_G && lb_mesh.my_id == ON_SHORT_ID_G_DEFAULT && lb_mesh.my_hop_depth == 0u,
+           "Mesh identity auto-syncs to root (id=0x001, hop=0) upon leaderless G election");
+    printf("    -> MQTT 5-pkt coalesced stream OK | Replay LRU(40>32) OK | Epoch sleep missed=0 | Mesh root sync OK\n");
+}
+
 int main(void) {
     printf("============================================================\n");
-    printf("       OpenNear v6.0 Core Protocol Automated Test Suite     \n");
+    printf("       OpenNear v6.2 Core Protocol Automated Test Suite     \n");
     printf("============================================================\n");
 
     test_6byte_header_and_frame();
@@ -2057,6 +2186,7 @@ int main(void) {
     test_v60_6hop_mesh_routing_and_256node_epoch_tdma();
     test_v60_mqtt311_and_home_assistant_discovery();
     test_v61_audit_regressions();
+    test_v62_deep_hardening_regressions();
 
     printf("\n------------------------------------------------------------\n");
     printf("SUMMARY: %d passed, %d failed\n", g_tests_passed, g_tests_failed);

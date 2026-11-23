@@ -22,7 +22,7 @@ extern "C" {
 #define ON_SEC_KEY_LEN        16u
 #define ON_SEC_NONCE_LEN      13u
 #define ON_SEC_MIC_LEN        4u
-#define ON_SEC_REPLAY_SLOTS   16u
+#define ON_SEC_REPLAY_SLOTS   32u
 
 typedef struct {
     bool     used;

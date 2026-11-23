@@ -341,6 +341,7 @@ bool on_sec_check_replay(on_sec_ctx_t *ctx, uint16_t src_id,
                 | (uint64_t)(slot_idx & 0x0Fu);
 
     int free_idx = -1;
+    uint32_t oldest_idx = 0u;
     for (uint32_t i = 0u; i < ON_SEC_REPLAY_SLOTS; ++i) {
         if (ctx->replay_tbl[i].used && ctx->replay_tbl[i].src_id == src_id) {
             if (wm <= ctx->replay_tbl[i].last_watermark) {
@@ -353,11 +354,15 @@ bool on_sec_check_replay(on_sec_ctx_t *ctx, uint16_t src_id,
         if (!ctx->replay_tbl[i].used && free_idx < 0) {
             free_idx = (int)i;
         }
+        if (ctx->replay_tbl[i].used &&
+            ctx->replay_tbl[i].last_watermark < ctx->replay_tbl[oldest_idx].last_watermark) {
+            oldest_idx = i;
+        }
     }
-    if (free_idx >= 0) {
-        ctx->replay_tbl[free_idx].used           = true;
-        ctx->replay_tbl[free_idx].src_id         = src_id;
-        ctx->replay_tbl[free_idx].last_watermark = wm;
-    }
+    /* Evict oldest watermark when full so anti-replay never fails open */
+    uint32_t target = (free_idx >= 0) ? (uint32_t)free_idx : oldest_idx;
+    ctx->replay_tbl[target].used           = true;
+    ctx->replay_tbl[target].src_id         = src_id;
+    ctx->replay_tbl[target].last_watermark = wm;
     return true;
 }

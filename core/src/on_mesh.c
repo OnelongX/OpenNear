@@ -132,7 +132,7 @@ static void elect_best_parent(on_mesh_ctx_t *m, uint32_t current_sf) {
     for (uint32_t i = 0u; i < ON_MESH_MAX_NEIGHBORS; ++i) {
         on_mesh_neighbor_t *nb = &m->neighbors[i];
         if (!nb->active) continue;
-        if (current_sf > nb->last_seen_sf + m->parent_timeout_sf) {
+        if ((uint32_t)(current_sf - nb->last_seen_sf) > m->parent_timeout_sf) {
             nb->active = false;
             continue;
         }
@@ -180,18 +180,49 @@ void on_mesh_on_beacon(on_mesh_ctx_t *m, uint16_t sender_id, uint8_t sender_hop,
     if (!m || sender_id == ON_SHORT_ID_UNASSIGNED || sender_id == m->my_id) return;
     if (sender_hop >= ON_MESH_MAX_HOPS || m->my_hop_depth == 0u) return;
 
-    /* Avoid routing loops: never adopt a neighbor deeper than or equal to ourselves */
+    /* Avoid routing loops: never adopt a non-parent neighbor deeper than or equal to ourselves */
+    if (m->parent_id != ON_SHORT_ID_UNASSIGNED && m->my_hop_depth < 0xFFu &&
+        sender_id != m->parent_id && sender_hop >= m->my_hop_depth) {
+        return;
+    }
+
     on_mesh_neighbor_t *slot = NULL;
+    on_mesh_neighbor_t *worst = NULL;
     for (uint32_t i = 0u; i < ON_MESH_MAX_NEIGHBORS; ++i) {
-        if (m->neighbors[i].active && m->neighbors[i].neighbor_id == sender_id) {
-            slot = &m->neighbors[i];
+        on_mesh_neighbor_t *nb = &m->neighbors[i];
+        if (nb->active && nb->neighbor_id == sender_id) {
+            slot = nb;
             break;
         }
-        if (!m->neighbors[i].active && !slot) {
-            slot = &m->neighbors[i];
+        if (!nb->active && !slot) {
+            slot = nb;
+        }
+        /* Candidate eviction target: never evict current active parent */
+        if (nb->active && nb->neighbor_id != m->parent_id) {
+            bool nb_stale = ((uint32_t)(current_sf - nb->last_seen_sf) > m->parent_timeout_sf);
+            if (!worst) {
+                worst = nb;
+            } else {
+                bool w_stale = ((uint32_t)(current_sf - worst->last_seen_sf) > m->parent_timeout_sf);
+                if ((nb_stale && !w_stale) ||
+                    (nb_stale == w_stale &&
+                     (nb->hop_to_root > worst->hop_to_root ||
+                      (nb->hop_to_root == worst->hop_to_root && nb->lqi < worst->lqi)))) {
+                    worst = nb;
+                }
+            }
         }
     }
-    if (!slot) slot = &m->neighbors[0];
+    if (!slot) {
+        if (!worst) return;
+        bool w_stale = ((uint32_t)(current_sf - worst->last_seen_sf) > m->parent_timeout_sf);
+        if (!w_stale &&
+            (sender_hop > worst->hop_to_root ||
+             (sender_hop == worst->hop_to_root && lqi <= worst->lqi))) {
+            return; /* Keep better existing neighbor */
+        }
+        slot = worst;
+    }
     slot->active       = true;
     slot->neighbor_id  = sender_id;
     slot->hop_to_root  = sender_hop;

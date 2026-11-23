@@ -50,6 +50,8 @@ static uint32_t    s_last_wifi_retry_ms = 0u;
 static uint32_t    s_last_mqtt_retry_ms = 0u;
 static uint32_t    s_last_mqtt_ping_ms  = 0u;
 static uint32_t    s_last_ha_pub_ms     = 0u;
+static uint8_t     s_mqtt_rxbuf[512];
+static size_t      s_mqtt_rxlen         = 0u;
 
 static on_err_t esp32_mqtt_publish_cb(void *ctx, const char *topic,
                                       const char *payload, bool retain) {
@@ -70,6 +72,7 @@ static void esp32_mqtt_poll(on_node_t *node, on_gw_ctx_t *gw) {
     if (gw->cfg.mqtt_creds_updated) {
         gw->cfg.mqtt_creds_updated = false;
         if (s_mqtt_tcp.connected()) s_mqtt_tcp.stop();
+        s_mqtt_rxlen = 0u;
         if (s_prefs.begin("opennear_gw", false)) {
             s_prefs.putString("mhost", gw->cfg.mqtt_host);
             s_prefs.putUShort("mport", gw->cfg.mqtt_port);
@@ -82,6 +85,7 @@ static void esp32_mqtt_poll(on_node_t *node, on_gw_ctx_t *gw) {
     uint32_t now_ms = millis();
     if (!s_mqtt_tcp.connected()) {
         gw->mqtt_connected = false;
+        s_mqtt_rxlen = 0u;
         if ((now_ms - s_last_mqtt_retry_ms) < 5000u) return;
         s_last_mqtt_retry_ms = now_ms;
         uint16_t port = gw->cfg.mqtt_port ? gw->cfg.mqtt_port : 1883u;
@@ -117,7 +121,9 @@ static void esp32_mqtt_poll(on_node_t *node, on_gw_ctx_t *gw) {
     if (node && (s_last_ha_pub_ms == 0u || (now_ms - s_last_ha_pub_ms) > 15000u)) {
         s_last_ha_pub_ms = now_ms;
         on_cluster_snapshot_t snap;
+        on_esp32_node_lock();
         on_node_get_cluster_snapshot(node, &snap);
+        on_esp32_node_unlock();
         static char topic[96];
         static char payload[512];
         for (uint8_t i = 0u; i < snap.active_count; ++i) {
@@ -136,22 +142,54 @@ static void esp32_mqtt_poll(on_node_t *node, on_gw_ctx_t *gw) {
         }
     }
 
-    /* Drain inbound MQTT PUBLISH packets (Home Assistant / Cloud commands & OTA triggers) */
-    if (s_mqtt_tcp.available() >= 4) {
-        static uint8_t rxbuf[384];
-        int n = s_mqtt_tcp.read(rxbuf, sizeof(rxbuf));
-        if (n >= 4) {
+    /* Drain inbound MQTT TCP stream cleanly across coalesced CONNACK/SUBACK/PINGRESP/PUBLISH packets */
+    while (s_mqtt_tcp.available() > 0 && s_mqtt_rxlen < sizeof(s_mqtt_rxbuf)) {
+        int avail = s_mqtt_tcp.available();
+        size_t space = sizeof(s_mqtt_rxbuf) - s_mqtt_rxlen;
+        size_t to_read = (static_cast<size_t>(avail) < space) ? static_cast<size_t>(avail) : space;
+        int n = s_mqtt_tcp.read(s_mqtt_rxbuf + s_mqtt_rxlen, to_read);
+        if (n <= 0) break;
+        s_mqtt_rxlen += static_cast<size_t>(n);
+    }
+
+    size_t consumed = 0u;
+    while (consumed < s_mqtt_rxlen) {
+        uint8_t pkt_type = 0u;
+        size_t  pkt_len  = 0u;
+        int st = on_mqtt_next_packet(s_mqtt_rxbuf + consumed, s_mqtt_rxlen - consumed,
+                                     &pkt_type, &pkt_len);
+        if (st == 0) break; /* Wait for remaining TCP bytes */
+        if (st < 0 || pkt_len == 0u) {
+            /* Malformed header: discard stream buffer to resync */
+            consumed = s_mqtt_rxlen;
+            break;
+        }
+        if (pkt_type == ON_MQTT_PKT_PUBLISH) {
             on_mqtt_pub_view_t pub;
-            if (on_mqtt_decode_publish(rxbuf, static_cast<size_t>(n), &pub)) {
+            if (on_mqtt_decode_publish(s_mqtt_rxbuf + consumed, pkt_len, &pub)) {
                 uint16_t target_id = 0u;
                 bool is_ota = false;
                 if (on_mqtt_parse_cmd_topic(pub.topic, pub.topic_len, &target_id, &is_ota)) {
                     if (is_ota) {
-                        char cmd_txt[192];
-                        int cl = snprintf(cmd_txt, sizeof(cmd_txt), "OTA:%.*s",
-                                          static_cast<int>(pub.payload_len),
-                                          reinterpret_cast<const char *>(pub.payload));
-                        if (cl > 4) on_gw_handle_control_text(gw, cmd_txt, static_cast<size_t>(cl), false);
+                        char cmd_txt[256];
+                        int cl = 0;
+                        const char *pay_s = reinterpret_cast<const char *>(pub.payload);
+                        const char *bar = (pub.payload_len > 6u && memcmp(pay_s, "AUTH:", 5u) == 0)
+                                          ? static_cast<const char *>(memchr(pay_s + 5, '|', pub.payload_len - 5u))
+                                          : nullptr;
+                        if (bar) {
+                            size_t auth_prefix_len = static_cast<size_t>((bar - pay_s) + 1);
+                            size_t rest_len = pub.payload_len - auth_prefix_len;
+                            cl = snprintf(cmd_txt, sizeof(cmd_txt), "%.*sOTA:%.*s",
+                                          static_cast<int>(auth_prefix_len), pay_s,
+                                          static_cast<int>(rest_len), bar + 1);
+                        } else {
+                            cl = snprintf(cmd_txt, sizeof(cmd_txt), "OTA:%.*s",
+                                          static_cast<int>(pub.payload_len), pay_s);
+                        }
+                        if (cl > 4 && static_cast<size_t>(cl) < sizeof(cmd_txt)) {
+                            on_gw_handle_control_text(gw, cmd_txt, static_cast<size_t>(cl), false);
+                        }
                     } else if (node) {
                         uint8_t plen = (pub.payload_len <= ON_GW_MAX_PAYLOAD_LEN)
                                        ? static_cast<uint8_t>(pub.payload_len) : ON_GW_MAX_PAYLOAD_LEN;
@@ -167,6 +205,15 @@ static void esp32_mqtt_poll(on_node_t *node, on_gw_ctx_t *gw) {
                     }
                 }
             }
+        }
+        consumed += pkt_len;
+    }
+    if (consumed > 0u) {
+        if (consumed < s_mqtt_rxlen) {
+            memmove(s_mqtt_rxbuf, s_mqtt_rxbuf + consumed, s_mqtt_rxlen - consumed);
+            s_mqtt_rxlen -= consumed;
+        } else {
+            s_mqtt_rxlen = 0u;
         }
     }
 }
@@ -568,19 +615,35 @@ void on_esp32_net_gw_poll(on_node_t *node, on_gw_ctx_t *gw) {
     }
     esp32_mqtt_poll(node, gw);
 
+    if (gw->cfg.admin_token_updated) {
+        gw->cfg.admin_token_updated = false;
+        if (s_prefs.begin("opennear_gw", false)) {
+            s_prefs.putString("atoken", gw->cfg.admin_token);
+            s_prefs.end();
+        }
+        Serial.printf("[OpenNear GW] Admin token %s in NVS\n",
+                      gw->cfg.admin_token[0] ? "updated & saved" : "cleared");
+    }
+
     if (connected && gw->cfg.ota_pull_requested) {
         gw->cfg.ota_pull_requested = false;
         esp32_pull_http_ota(node, gw);
     }
 
     /* Auto-commit staged cluster OTA once all target nodes verify & report READY */
-    if (node && node->role == ON_ROLE_G && node->ota &&
-        node->ota->tx.active && !node->ota->tx.commit_sent &&
-        on_ota_tx_all_targets_ready(&node->ota->tx, 1u)) {
+    if (node) {
+        bool committed_now = false;
         on_esp32_node_lock();
-        on_node_ota_commit(node, 8u, ON_OTA_FLAG_AUTO_REBOOT);
+        if (node->role == ON_ROLE_G && node->ota &&
+            node->ota->tx.active && !node->ota->tx.commit_sent &&
+            on_ota_tx_all_targets_ready(&node->ota->tx, 1u)) {
+            on_node_ota_commit(node, 8u, ON_OTA_FLAG_AUTO_REBOOT);
+            committed_now = true;
+        }
         on_esp32_node_unlock();
-        Serial.println("[OpenNear OTA] All targets READY -> scheduled synchronized cluster commit (+8 SFs)");
+        if (committed_now) {
+            Serial.println("[OpenNear OTA] All targets READY -> scheduled synchronized cluster commit (+8 SFs)");
+        }
     }
 #else
     (void)node;
@@ -588,12 +651,14 @@ void on_esp32_net_gw_poll(on_node_t *node, on_gw_ctx_t *gw) {
 
     if (node && gw->cfg.topo_query_requested) {
         gw->cfg.topo_query_requested = false;
+        static char topo_json[2048];
+        on_esp32_node_lock();
         if (node->role != ON_ROLE_G && !node->cluster_snapshot_valid) {
             on_node_request_cluster_snapshot(node);
         }
-        static char topo_json[1024];
         size_t jlen = on_node_format_cluster_json(node, gw->cfg.topo_include_data,
                                                   topo_json, sizeof(topo_json));
+        on_esp32_node_unlock();
         if (jlen > 0u) {
             Serial.printf("[OpenNear Cluster] %s\n", topo_json);
 #ifdef OPENNEAR_ENABLE_BLE_GW

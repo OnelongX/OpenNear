@@ -51,6 +51,13 @@ size_t on_mqtt_encode_publish(const char *topic, const uint8_t *payload, size_t 
 
 bool   on_mqtt_decode_publish(const uint8_t *in, size_t len, on_mqtt_pub_view_t *out);
 
+/* TCP stream framer for ANY OASIS MQTT 3.1.1 packet (CONNACK/SUBACK/PINGRESP/PUBLISH):
+ * returns  1 if a full packet of *out_pkt_len bytes is ready at in[0],
+ *          0 if more TCP bytes are needed,
+ *         -1 if the variable remaining-length header is malformed. */
+int    on_mqtt_next_packet(const uint8_t *in, size_t len,
+                           uint8_t *out_pkt_type, size_t *out_pkt_len);
+
 size_t on_mqtt_encode_subscribe(uint16_t pkt_id, const char *topic_filter,
                                 uint8_t *out, size_t cap);
 

@@ -314,6 +314,16 @@ on_err_t on_gw_handle_control_text(on_gw_ctx_t *gw, const char *text, size_t len
         return ON_OK;
     }
 
+    /* Format 6: TOKEN:<new_token> -> Set/rotate (or clear if empty) Gateway Admin Token */
+    if (clean_len >= 6u && memcmp(text, "TOKEN:", 6u) == 0) {
+        const char *p1 = text + 6;
+        char tbuf[sizeof(gw->cfg.admin_token)];
+        copy_cstr(tbuf, sizeof(tbuf), p1, (size_t)(end - p1));
+        on_gw_set_admin_token(gw, tbuf);
+        gw->cfg.admin_token_updated = true;
+        return ON_OK;
+    }
+
     return ON_ERR_INVALID_ARG;
 }
 

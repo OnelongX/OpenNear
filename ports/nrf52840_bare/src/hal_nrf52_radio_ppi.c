@@ -79,6 +79,7 @@
 /* PPI (0x4001F000): Programmable Peripheral Interconnect (Zero CPU Latency!) */
 #define NRF_PPI_BASE                0x4001F000UL
 #define PPI_CHENSET                 REG32(NRF_PPI_BASE + 0x504UL)
+#define PPI_CHENCLR                 REG32(NRF_PPI_BASE + 0x508UL)
 #define PPI_CH_EEP(n)               REG32(NRF_PPI_BASE + 0x510UL + (n) * 8UL)
 #define PPI_CH_TEP(n)               REG32(NRF_PPI_BASE + 0x514UL + (n) * 8UL)
 
@@ -91,6 +92,7 @@ static uint8_t  s_dma_pkt[1u + ON_MAX_FRAME_LEN] __attribute__((aligned(4)));
 static uint64_t s_timer_high_ticks   = 0u;
 static uint32_t s_timer_last_ticks   = 0u;
 static uint64_t s_sleep_offset_ticks = 0u; /* Accumulated 16 MHz ticks elapsed while TIMER0 was stopped */
+static volatile bool s_tx_active     = false;
 
 /* Convert 16 MHz TIMER0 ticks (62.5 ns/tick) <-> monotonic 64-bit nanoseconds (bidirectional!) */
 static int64_t ticks16m_to_ns(uint32_t ticks32) {
@@ -124,12 +126,15 @@ static on_err_t nrf52_tx_raw(void *ctx, const uint8_t *frame, size_t len, int64_
     s_dma_pkt[0] = (uint8_t)len;
     memcpy(&s_dma_pkt[1], frame, len);
 
+    /* Clear stale TX PPI trigger before arming a new TX */
+    PPI_CHENCLR = (1UL << 1);
     REG32(RADIO_TASKS_DISABLE) = 1UL;
     while (REG32(RADIO_EVENTS_DISABLED) == 0UL) { }
     REG32(RADIO_EVENTS_DISABLED) = 0UL;
     REG32(RADIO_EVENTS_END)      = 0UL;
 
     RADIO_PACKETPTR = (uint32_t)(uintptr_t)s_dma_pkt;
+    s_tx_active     = true;
 
     if (tx_at_local_ns > 0) {
         /* Hardware-timed TX via PPI CH1: TIMER0->COMPARE[1] -> RADIO->TASKS_TXEN
@@ -146,6 +151,8 @@ static on_err_t nrf52_tx_raw(void *ctx, const uint8_t *frame, size_t len, int64_
 
 static void nrf52_radio_set_rx(void *ctx, bool enable) {
     (void)ctx;
+    PPI_CHENCLR = (1UL << 1);
+    s_tx_active = false;
     if (enable) {
         RADIO_PACKETPTR = (uint32_t)(uintptr_t)s_dma_pkt;
         REG32(RADIO_EVENTS_END) = 0UL;
@@ -186,6 +193,7 @@ static void nrf52_get_mac48(void *ctx, uint8_t mac_out[6]) {
 }
 
 void on_nrf52_arm_hw_act_ns(int64_t target_local_ns) {
+    PPI_CHENCLR = (1UL << 2);
     TIMER0_CC2 = ns_to_ticks16m(target_local_ns);
     REG32(TIMER0_EVENTS_COMPARE2) = 0UL;
     PPI_CHENSET = (1UL << 2);
@@ -316,6 +324,13 @@ on_err_t on_nrf52_hal_init(const on_nrf52_cfg_t *cfg, on_hal_ops_t *hal_out) {
 void on_nrf52_radio_isr(on_node_t *node) {
     if (REG32(RADIO_EVENTS_END) == 0UL) return;
     REG32(RADIO_EVENTS_END) = 0UL;
+
+    /* TX completion also raises EVENTS_END: disarm one-shot PPI CH1 & never feed TX buffer to RX */
+    if (s_tx_active) {
+        s_tx_active = false;
+        PPI_CHENCLR = (1UL << 1);
+        return;
+    }
 
     if (RADIO_CRCSTATUS == 1UL && s_dma_pkt[0] >= ON_MAC_HDR_LEN + ON_PAYLOAD_CRC_LEN) {
         /* Read exact 62.5 ns hardware timestamp captured by PPI CH0 at preamble ADDRESS match! */
