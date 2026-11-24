@@ -46,7 +46,8 @@ typedef enum {
     ON_GW_MSG_TOPO_RESP      = 0x08, /* v5.1: Paginated cluster topology & data snapshot from G */
     ON_GW_MSG_MAC_REPORT        = 0x09, /* v6.5: Sub-G -> G 2-hop child hardware MAC48 registration */
     ON_GW_MSG_RSSI_REPORT       = 0x0A, /* v7.0: Anchor -> G overheard peer RSSI observation batch */
-    ON_GW_MSG_BLE_BEACON_REPORT = 0x0B  /* v7.1: Anchor -> G passive BLE iBeacon/Eddystone batch */
+    ON_GW_MSG_BLE_BEACON_REPORT = 0x0B, /* v7.1: Anchor -> G passive BLE iBeacon/Eddystone batch */
+    ON_GW_MSG_CSI_REPORT        = 0x0C  /* v7.2: Anchor -> G IEEE 802.11bf Wi-Fi CSI motion & spectrum */
 } on_gw_msg_type_t;
 
 #define ON_GW_FLAG_RELAYED_2HOP  0x01u
@@ -104,6 +105,20 @@ typedef struct {
     bool     anchor_updated;
     bool     ble_scan_enabled; /* v7.1 Passive BLE iBeacon/Eddystone scanner toggle (BLESCAN:<0|1>) */
     bool     ble_scan_updated;
+    char     fence_name[20];   /* v7.2 2D circular geofence (FENCE:<name>|<x_cm>|<y_cm>|<radius_cm>) */
+    int32_t  fence_x_cm;
+    int32_t  fence_y_cm;
+    uint16_t fence_radius_cm;
+    bool     fence_updated;
+    uint8_t  rule_id;          /* v7.2 Offline automation rule (RULE:<id>|<trig>|<zone>|<th_csi>|<tag>|<cmd>) */
+    uint8_t  rule_trig_type;
+    char     rule_zone[20];
+    uint8_t  rule_csi_thresh;
+    char     rule_cmd_tag[20];
+    char     rule_cmd_payload[28];
+    bool     rule_updated;
+    uint8_t  loc_demo_mode;    /* v7.2 Showcase demo (LOCDEMO:<0|1|2>) */
+    bool     loc_demo_updated;
 } on_gw_config_t;
 
 /* Lock-free SPSC ring buffer for cross-core/cross-task decoupling (ON_GW_RING_DEPTH must be power of 2) */

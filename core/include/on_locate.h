@@ -30,6 +30,52 @@ extern "C" {
 #define ON_LOC_LABEL_MAX_LEN       20u
 #define ON_LOC_OBS_STALE_MS        20000u
 #define ON_LOC_HYSTERESIS_DB       4
+#define ON_LOC_CSI_BINS            16u
+#define ON_LOC_MAX_GEOFENCES       8u
+#define ON_LOC_MAX_RULES           8u
+#define ON_LOC_RULE_COOLDOWN_MS    1500u
+
+/* v7.2: IEEE 802.11bf Wi-Fi CSI device-free room presence state */
+typedef enum {
+    ON_CSI_STATE_EMPTY  = 0, /* Quiet / unoccupied (motion score < 15) */
+    ON_CSI_STATE_STATIC = 1, /* Micro-motion / breathing / seated (15..44) */
+    ON_CSI_STATE_MOVING = 2  /* Active walking / intrusion (45..100) */
+} on_csi_state_t;
+
+/* v7.2: Offline Edge Spatial & CSI Automation Rule Trigger Types */
+typedef enum {
+    ON_RULE_TRIG_NONE       = 0,
+    ON_RULE_TRIG_ENTER_ROOM = 1, /* Any/target enters room <zone> */
+    ON_RULE_TRIG_LEAVE_ROOM = 2, /* All targets leave room <zone> */
+    ON_RULE_TRIG_IN_FENCE   = 3, /* Any/target enters 2D circular geofence <zone> */
+    ON_RULE_TRIG_OUT_FENCE  = 4, /* All targets exit 2D circular geofence <zone> */
+    ON_RULE_TRIG_CSI_MOTION = 5, /* Room <zone> Wi-Fi CSI score >= threshold (device-free!) */
+    ON_RULE_TRIG_CSI_QUIET  = 6  /* Room <zone> Wi-Fi CSI score < threshold */
+} on_loc_rule_trig_t;
+
+/* v7.2: 2D Circular Geofence definition */
+typedef struct {
+    bool     active;
+    char     name[ON_LOC_ROOM_MAX_LEN];
+    int32_t  x_cm;
+    int32_t  y_cm;
+    uint16_t radius_cm;
+    bool     occupied;
+} on_loc_geofence_t;
+
+/* v7.2: Offline Edge Automation Rule (persisted in NVS, runs with zero cloud/HA dependency) */
+typedef struct {
+    bool     active;
+    uint8_t  id;                           /* 1..ON_LOC_MAX_RULES */
+    uint8_t  trig_type;                    /* on_loc_rule_trig_t */
+    char     zone[ON_LOC_ROOM_MAX_LEN];    /* Room name or Geofence name */
+    uint8_t  csi_threshold;                /* 1..100 for CSI triggers */
+    char     cmd_tag[20];                  /* Target Tag group (e.g. "书房") or "*" for local/all */
+    char     cmd_payload[28];              /* e.g. "RELAY:1", "MODE:STROBE", "MODE:PULSE" */
+    bool     last_cond_met;                /* Edge-trigger latch */
+    uint32_t fire_count;
+    uint32_t last_fired_ms;
+} on_loc_rule_t;
 
 /* v7.1: Target radio / beacon standard origin */
 typedef enum {
@@ -64,6 +110,11 @@ typedef struct {
     int32_t  y_cm;             /* Anchor Y coordinate in centimeters */
     int8_t   tx_power_1m_dbm;  /* Reference RSSI at 1 m (default -45 dBm) */
     float    path_loss_n;      /* Indoor path-loss exponent (default 2.5) */
+    /* v7.2: IEEE 802.11bf Wi-Fi CSI passive human presence & 16-bin OFDM subcarrier profile */
+    uint8_t  csi_motion_score; /* 0..100 smoothed spatial perturbation score */
+    uint8_t  csi_presence;     /* on_csi_state_t (0=EMPTY, 1=STATIC, 2=MOVING) */
+    uint8_t  csi_bins[ON_LOC_CSI_BINS];
+    uint32_t csi_last_ms;
 } on_loc_anchor_t;
 
 typedef struct {
@@ -108,8 +159,12 @@ typedef struct {
 } on_loc_estimate_t;
 
 typedef struct {
-    on_loc_anchor_t anchors[ON_LOC_MAX_ANCHORS];
-    on_loc_target_t targets[ON_LOC_MAX_TARGETS];
+    on_loc_anchor_t   anchors[ON_LOC_MAX_ANCHORS];
+    on_loc_target_t   targets[ON_LOC_MAX_TARGETS];
+    on_loc_geofence_t fences[ON_LOC_MAX_GEOFENCES];
+    on_loc_rule_t     rules[ON_LOC_MAX_RULES];
+    uint8_t           last_fired_rule_id;
+    char              last_fired_summary[64];
 } on_loc_ctx_t;
 
 void     on_loc_init(on_loc_ctx_t *ctx);
@@ -145,7 +200,39 @@ void     on_ble_beacon_derive_mac(const on_ble_beacon_t *b, const uint8_t fallba
 bool     on_loc_solve(on_loc_ctx_t *ctx, const uint8_t target_mac48[6],
                       uint32_t now_ms, on_loc_estimate_t *out_est);
 
-/* Format all active anchors and solved target positions into compact JSON for HTTP /api/locate */
+/* v7.2: Extract 0..100 motion score & 16-bin OFDM subcarrier spectrum from raw ESP32 CSI I/Q buffer */
+uint8_t  on_csi_extract_iq_score(const int8_t *iq_buf, uint16_t iq_len, bool skip_first_word,
+                                 float *inout_baseline, float *inout_var_ema,
+                                 uint8_t out_bins16[ON_LOC_CSI_BINS]);
+
+/* v7.2: Ingest a Wi-Fi CSI motion score & 16-bin subcarrier profile for a fixed room Anchor */
+on_err_t on_loc_observe_csi(on_loc_ctx_t *ctx, const uint8_t anchor_mac48[6],
+                            uint16_t anchor_short_id, uint8_t motion_score,
+                            const uint8_t bins16[ON_LOC_CSI_BINS], uint32_t now_ms);
+
+/* v7.2: Configure or remove (radius_cm == 0) a 2D circular Geofence */
+on_err_t on_loc_set_geofence(on_loc_ctx_t *ctx, const char *name,
+                             int32_t x_cm, int32_t y_cm, uint16_t radius_cm);
+
+/* v7.2: Check whether (x_cm, y_cm) lies inside a named 2D circular Geofence */
+bool     on_loc_check_geofence(const on_loc_ctx_t *ctx, int32_t x_cm, int32_t y_cm,
+                               const char *fence_name);
+
+/* v7.2: Configure or remove (trig_type == 0) an offline Edge Spatial / CSI Automation Rule */
+on_err_t on_loc_set_rule(on_loc_ctx_t *ctx, uint8_t rule_id, uint8_t trig_type,
+                         const char *zone, uint8_t csi_threshold,
+                         const char *cmd_tag, const char *cmd_payload);
+
+/* v7.2: Evaluate all active Geofences & Offline Rules; invokes on_fire callback on edge transitions */
+uint32_t on_loc_evaluate_rules(on_loc_ctx_t *ctx, uint32_t now_ms,
+                               void (*on_fire)(void *user_ctx, const on_loc_rule_t *rule),
+                               void *user_ctx);
+
+/* v7.2: Load out-of-the-box 4-Room + 2-Geofence + 4-Rule + Wi-Fi CSI Showcase Demo & advance virtual walk */
+void     on_loc_load_demo_preset(on_loc_ctx_t *ctx, const uint8_t gw_mac48[6], uint32_t now_ms);
+void     on_loc_step_demo(on_loc_ctx_t *ctx, uint32_t step_idx, uint32_t now_ms);
+
+/* Format all active anchors, targets, geofences, rules & CSI into compact JSON for HTTP /api/locate */
 size_t   on_loc_format_json(on_loc_ctx_t *ctx, uint32_t now_ms,
                             char *out_buf, size_t out_cap);
 

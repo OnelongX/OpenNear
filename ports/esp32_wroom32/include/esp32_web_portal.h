@@ -58,7 +58,7 @@ th{color:var(--mut);font-weight:600;font-size:12px}
     <div class="brand">
       <h1>OpenNear</h1>
       <span class="badge" id="b-role">加载中...</span>
-      <span class="badge" id="b-fw">v7.1</span>
+      <span class="badge" id="b-fw">v7.2</span>
     </div>
     <div class="row">
       <input id="g-token" type="password" placeholder="Admin Token (如已设置)" style="width:185px" onchange="saveLocalToken()">
@@ -70,7 +70,7 @@ th{color:var(--mut);font-weight:600;font-size:12px}
 
   <div class="tabs">
     <button class="tab active" data-t="topo" onclick="switchTab('topo')">集群拓扑与数据</button>
-    <button class="tab" data-t="loc" onclick="switchTab('loc')">室内定位 / Tag 分组</button>
+    <button class="tab" data-t="loc" onclick="switchTab('loc')">室内定位 / 围栏 / CSI 雷达</button>
     <button class="tab" data-t="wifi" onclick="switchTab('wifi')">Wi-Fi / 云端配网</button>
     <button class="tab" data-t="mqtt" onclick="switchTab('mqtt')">MQTT / Home Assistant</button>
     <button class="tab" data-t="ctrl" onclick="switchTab('ctrl')">节点控制 / OTA / 安全</button>
@@ -97,20 +97,80 @@ th{color:var(--mut);font-weight:600;font-size:12px}
   <section id="p-loc" class="hide">
     <div class="card">
       <div class="row" style="justify-content:space-between;margin-bottom:8px">
-        <h2 style="margin:0">2D 室内定位平面图（OpenNear + BLE iBeacon / Eddystone 多锚点融合）</h2>
+        <h2 style="margin:0">2D 室内定位 · 电子围栏 · Wi-Fi CSI 隔空感知雷达</h2>
         <div class="row">
+          <button class="btn ok sm" id="btn-locdemo" onclick="toggleLocDemo()">🎬 一键运行围栏+CSI 联动演示</button>
+          <button class="btn sec sm" onclick="stepLocDemo()">单步推进</button>
           <button class="btn sec sm" id="btn-blescan" onclick="toggleBleScan()">BLE 信标扫描: 开</button>
-          <span class="muted mono" id="loc-meta">锚点=0 | 定位目标=0</span>
+          <span class="muted mono" id="loc-meta">锚点=0 | 目标=0</span>
         </div>
       </div>
+      <div id="loc-evt-banner" class="hide" style="background:#052e16;border:1px solid #22c55e;color:#bbf7d0;border-radius:8px;padding:7px 12px;margin-bottom:10px;font-size:12.5px;display:flex;justify-content:space-between;align-items:center">
+        <span>⚡ <b>离线边缘自动化最新触发：</b><span class="mono" id="loc-evt-txt">--</span></span>
+        <span class="badge ok">0 云端 · 本地毫秒级闭环</span>
+      </div>
       <div style="overflow-x:auto;background:#030712;border:1px solid var(--bd);border-radius:10px;padding:6px;margin-bottom:12px">
-        <svg id="loc-svg" width="100%" height="260" viewBox="0 0 880 260" style="display:block;min-width:520px"></svg>
+        <svg id="loc-svg" width="100%" height="270" viewBox="0 0 880 270" style="display:block;min-width:520px"></svg>
       </div>
       <div class="tbl-wrap">
         <table>
           <thead><tr><th>目标 / 信标</th><th>来源</th><th>MAC / 标识</th><th>所在房间</th><th>估算坐标 (m)</th><th>RSSI / tx1m</th><th>锚点数</th><th>误差</th><th>操作</th></tr></thead>
-          <tbody id="loc-rows"><tr><td colspan="9" class="muted">先在下方添加 1~4 个固定锚点基站坐标，即可实时解算 OpenNear 节点与周边 BLE iBeacon / Eddystone 卡片</td></tr></tbody>
+          <tbody id="loc-rows"><tr><td colspan="9" class="muted">点击右上角「🎬 一键运行围栏+CSI 联动演示」可立即体验 4 房间 + 2 电子围栏 + Wi-Fi CSI 隔空人体雷达联动；或手动添加 1~4 个固定锚点</td></tr></tbody>
         </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="row" style="justify-content:space-between;margin-bottom:8px">
+        <h2 style="margin:0">Wi-Fi CSI 隔空无源人体感知雷达（IEEE 802.11bf · 64 子载波 I/Q 多径扰动）</h2>
+        <span class="muted">无需佩戴任何设备 · 穿墙感知房间内走动与静坐微动</span>
+      </div>
+      <div id="csi-cards" class="grid">
+        <div class="muted">配置房间锚点或开启一键演示后，此处实时显示各房间 Wi-Fi CSI 16 频段子载波瀑布与人体活动评分</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>纯 ESP32 离线边缘电子围栏与空间+CSI 自动化规则（存 NVS · 断网/无 HA 照常毫秒级触发）</h2>
+      <div class="grid">
+        <div><label>电子围栏名称（留空半径=0 删除）</label><input id="f-name" placeholder="例如 StudyDesk 或 KitchenZone"></div>
+        <div><label>围栏中心 X (m)</label><input id="f-x" type="number" step="0.1" value="4.2"></div>
+        <div><label>围栏中心 Y (m)</label><input id="f-y" type="number" step="0.1" value="0.5"></div>
+        <div><label>围栏半径 (m，0=删除)</label><input id="f-r" type="number" step="0.1" value="1.3"></div>
+      </div>
+      <div class="row" style="margin-top:8px;margin-bottom:10px">
+        <button class="btn sec sm" onclick="saveFence()">保存 2D 圆形电子围栏</button>
+        <div id="fence-pills" class="pills" style="margin:0"></div>
+      </div>
+      <div style="border-top:1px solid var(--bd);padding-top:10px;margin-top:6px">
+        <div class="grid">
+          <div><label>规则槽位 ID (1~8)</label><input id="r-id" type="number" min="1" max="8" value="1"></div>
+          <div><label>触发条件</label>
+            <select id="r-trig">
+              <option value="3">进入 2D 电子围栏 (IN_FENCE)</option>
+              <option value="4">离开 2D 电子围栏 (OUT_FENCE)</option>
+              <option value="1">定位进入房间 (ENTER_ROOM)</option>
+              <option value="2">定位离开房间 (LEAVE_ROOM)</option>
+              <option value="5">Wi-Fi CSI 有人活动 ≥ 阈值 (CSI_MOTION)</option>
+              <option value="6">Wi-Fi CSI 安静无人 ≤ 阈值 (CSI_QUIET)</option>
+              <option value="0">删除该槽位规则</option>
+            </select>
+          </div>
+          <div><label>房间名 或 围栏名</label><input id="r-zone" placeholder="例如 StudyDesk 或 Living"></div>
+          <div><label>CSI 阈值 (0~100)</label><input id="r-th" type="number" min="0" max="100" value="45"></div>
+          <div><label>联动目标 Tag (*=本机+全网)</label><input id="r-tag" value="*"></div>
+          <div><label>联动空口指令</label><input id="r-cmd" placeholder="RELAY:1 或 MODE:STROBE"></div>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <button class="btn ok sm" onclick="saveRule()">保存离线自动化规则</button>
+          <span class="muted">支持「蓝牙信标围栏 + Wi-Fi CSI 隔空雷达」双模融合触发，直接驱动板载继电器/同拍灯光或按 Tag 群发</span>
+        </div>
+        <div class="tbl-wrap" style="margin-top:10px">
+          <table>
+            <thead><tr><th>ID</th><th>触发类型</th><th>监控区域/围栏</th><th>CSI 阈值</th><th>目标 Tag</th><th>执行指令</th><th>状态</th><th>触发次数</th></tr></thead>
+            <tbody id="rule-rows"><tr><td colspan="8" class="muted">暂未配置离线规则（点击上方「🎬 一键运行围栏+CSI 联动演示」可自动载入 4 条典型规则）</td></tr></tbody>
+          </table>
+        </div>
       </div>
     </div>
 
@@ -313,6 +373,12 @@ async function fetchStatus(){
     gBleScan=!!s.ble_scan;
     if($('btn-blescan'))$('btn-blescan').textContent='BLE 信标扫描: '+(gBleScan?'开':'关');
     if(gBleScan)pills.push('<span class="badge purp">iBeacon/Eddystone 扫描中</span>');
+    gLocDemo=!!s.loc_demo;
+    if($('btn-locdemo')){
+      $('btn-locdemo').textContent=gLocDemo?'⏹ 停止围栏+CSI 演示':'🎬 一键运行围栏+CSI 联动演示';
+      $('btn-locdemo').className='btn sm '+(gLocDemo?'danger':'ok');
+    }
+    if(gLocDemo)pills.push('<span class="badge ok">🎬 围栏+CSI 联动演示运行中</span>');
     if(typeof s.free_heap==='number'){
       const fh=(s.free_heap/1024).toFixed(1),mh=((s.min_heap||0)/1024).toFixed(1);
       pills.push('<span class="badge mono '+(s.free_heap<28000?'warn':'')+'">Heap '+fh+'K (min '+mh+'K)</span>');
@@ -398,6 +464,7 @@ async function sendTagCmd(){
   }
 }
 let gBleScan=true;
+let gLocDemo=false;
 async function toggleBleScan(){
   const next=gBleScan?0:1;
   if(await postCmd('BLESCAN:'+next)){
@@ -407,19 +474,119 @@ async function toggleBleScan(){
     setTimeout(fetchStatus,300);
   }
 }
+async function toggleLocDemo(){
+  const next=gLocDemo?0:1;
+  if(await postCmd('LOCDEMO:'+next)){
+    gLocDemo=!!next;
+    if($('btn-locdemo')){
+      $('btn-locdemo').textContent=gLocDemo?'⏹ 停止围栏+CSI 演示':'🎬 一键运行围栏+CSI 联动演示';
+      $('btn-locdemo').className='btn sm '+(gLocDemo?'danger':'ok');
+    }
+    toast(gLocDemo?'🎬 已载入 4 房间 + 2 围栏 + Wi-Fi CSI 雷达自动联动演示！':'已停止演示并恢复 NVS 配置');
+    setTimeout(()=>{fetchStatus();fetchLocate();},250);
+  }
+}
+async function stepLocDemo(){
+  if(await postCmd('LOCDEMO:2')){
+    toast('已推进下一幕空间轨迹与 CSI 波形，并即时评估离线规则');
+    setTimeout(fetchLocate,200);
+  }
+}
+function fillFenceForm(nm,xCm,yCm,rCm){
+  $('f-name').value=nm||'';
+  if(xCm!==undefined)$('f-x').value=(xCm/100).toFixed(2);
+  if(yCm!==undefined)$('f-y').value=(yCm/100).toFixed(2);
+  if(rCm!==undefined)$('f-r').value=(rCm/100).toFixed(2);
+}
+async function saveFence(){
+  const nm=$('f-name').value.trim();
+  const xCm=Math.round((parseFloat($('f-x').value)||0)*100);
+  const yCm=Math.round((parseFloat($('f-y').value)||0)*100);
+  const rCm=Math.max(0,Math.round((parseFloat($('f-r').value)||0)*100));
+  if(!nm){toast('请填写电子围栏名称',true);return;}
+  if(await postCmd('FENCE:'+nm+'|'+xCm+'|'+yCm+'|'+rCm)){
+    toast(rCm>0?('已保存 2D 电子围栏 '+nm+' (R='+(rCm/100).toFixed(1)+'m)'):('已移除电子围栏 '+nm));
+    setTimeout(fetchLocate,250);
+  }
+}
+async function saveRule(){
+  const id=parseInt($('r-id').value,10)||1;
+  const trig=parseInt($('r-trig').value,10)||0;
+  const zone=$('r-zone').value.trim();
+  const th=parseInt($('r-th').value,10)||40;
+  const tag=$('r-tag').value.trim()||'*';
+  const cmd=$('r-cmd').value.trim();
+  if(trig>0&&(!zone||!cmd)){toast('请填写监控区域/围栏名称与执行指令',true);return;}
+  if(await postCmd('RULE:'+id+'|'+trig+'|'+(zone||'None')+'|'+th+'|'+tag+'|'+(cmd||'NONE'))){
+    toast(trig>0?('已保存离线自动化规则 R#'+id):('已删除规则 R#'+id));
+    setTimeout(fetchLocate,250);
+  }
+}
 function renderLocateSvg(d){
   const svg=$('loc-svg');
   if(!svg)return;
   const ancs=(d&&Array.isArray(d.anchors))?d.anchors:[];
   const tgts=(d&&Array.isArray(d.targets))?d.targets:[];
+  const fns=(d&&Array.isArray(d.fences))?d.fences:[];
+  const rls=(d&&Array.isArray(d.rules))?d.rules:[];
   const bleCnt=tgts.filter(t=>t.src&&t.src!=='opennear').length;
-  $('loc-meta').textContent='锚点='+ancs.length+' | 目标='+tgts.length+' (BLE信标 '+bleCnt+')';
+  $('loc-meta').textContent='锚点='+ancs.length+' | 目标='+tgts.length+' (BLE '+bleCnt+') | 围栏='+fns.length+' | 规则='+rls.length;
+  const eb=$('loc-evt-banner');
+  if(eb){
+    if(d&&d.last_evt){
+      eb.classList.remove('hide');
+      $('loc-evt-txt').textContent=d.last_evt;
+    }else{
+      eb.classList.add('hide');
+    }
+  }
   const ap=$('anchor-pills');
   if(ap){
     ap.innerHTML=ancs.length?ancs.map(a=>
       '<span class="badge ok" style="cursor:pointer" onclick="fillAnchorForm(\''+esc(a.mac)+'\',\''+esc(a.room)+'\','+a.x_cm+','+a.y_cm+')">'
-      +'⚓ '+esc(a.room)+' ('+(a.x_cm/100).toFixed(1)+'m,'+(a.y_cm/100).toFixed(1)+'m)</span>'
+      +'⚓ '+esc(a.room)+' ('+(a.x_cm/100).toFixed(1)+'m,'+(a.y_cm/100).toFixed(1)+'m) · CSI '+(a.csi||0)+'</span>'
     ).join(''):'<span class="muted">暂未配置固定锚点（可在拓扑表中点击节点「设锚点」快速填入 MAC）</span>';
+  }
+  const fp=$('fence-pills');
+  if(fp){
+    fp.innerHTML=fns.length?fns.map(f=>
+      '<span class="badge '+(f.in?'err':'')+'" style="cursor:pointer" onclick="fillFenceForm(\''+esc(f.name)+'\','+f.x_cm+','+f.y_cm+','+f.r_cm+')">'
+      +'⭕ '+esc(f.name)+' R='+(f.r_cm/100).toFixed(1)+'m '+(f.in?'[有人在围栏内]':'[空闲]')+'</span>'
+    ).join(''):'<span class="muted">暂无电子围栏</span>';
+  }
+  const cbox=$('csi-cards');
+  if(cbox){
+    const stNames=['安静无人','微动静坐','有人走动'];
+    const stCls=['','warn','err'];
+    cbox.innerHTML=ancs.length?ancs.map(a=>{
+      const sc=Number(a.csi)||0,st=Number(a.csi_st)||0;
+      const bins=Array.isArray(a.bins)?a.bins:[];
+      const bars=bins.map(v=>{
+        const h=Math.max(4,Math.min(34,Math.round((Number(v)||0)*0.34)));
+        const bcol=st===2?'#f43f5e':(st===1?'#f59e0b':'#38bdf8');
+        return '<span style="display:inline-block;width:6px;height:'+h+'px;background:'+bcol+';border-radius:2px"></span>';
+      }).join('');
+      return '<div style="background:#030712;border:1px solid var(--bd);border-radius:10px;padding:10px 12px">'
+        +'<div class="row" style="justify-content:space-between;margin-bottom:6px">'
+        +'<b>📡 '+esc(a.room)+'</b>'
+        +'<span class="badge '+stCls[st]+'">'+(stNames[st]||'安静无人')+' · CSI '+sc+'</span></div>'
+        +'<div style="height:36px;display:flex;align-items:flex-end;gap:3px;padding:2px 0">'+(bars||'<span class="muted">等待 CSI 采样...</span>')+'</div>'
+        +'</div>';
+    }).join(''):'<div class="muted">配置房间锚点或开启一键演示后，此处实时显示各房间 Wi-Fi CSI 16 频段子载波瀑布与人体活动评分</div>';
+  }
+  const rtb=$('rule-rows');
+  if(rtb){
+    const tNames=['--','进入房间','离开房间','进入围栏','离开围栏','CSI 有人活动 ≥','CSI 安静无人 ≤'];
+    rtb.innerHTML=rls.length?rls.map(r=>
+      '<tr><td class="mono"><b>R#'+r.id+'</b></td>'
+      +'<td><span class="badge">'+(tNames[r.trig]||r.trig)+'</span></td>'
+      +'<td><b>'+esc(r.zone)+'</b></td>'
+      +'<td class="mono">'+(r.trig>=5?r.th:'--')+'</td>'
+      +'<td><span class="badge purp">'+esc(r.tag)+'</span></td>'
+      +'<td class="mono">'+esc(r.cmd)+'</td>'
+      +'<td><span class="badge '+(r.on?'ok':'')+'">'+(r.on?'⚡ 触发中':'监听中')+'</span></td>'
+      +'<td class="mono">'+r.fires+' 次</td></tr>'
+    ).join(''):'<tr><td colspan="8" class="muted">暂未配置离线规则（点击上方「🎬 一键运行围栏+CSI 联动演示」可自动载入 4 条典型规则）</td></tr>';
   }
   const tb=$('loc-rows');
   if(tb){
@@ -436,25 +603,32 @@ function renderLocateSvg(d){
         +'<td class="mono">('+(t.x_cm/100).toFixed(2)+', '+(t.y_cm/100).toFixed(2)+')</td>'
         +'<td class="mono">'+t.rssi+txTxt+' dBm</td><td>'+t.anchors+'</td>'
         +'<td class="mono">±'+(t.err_cm/100).toFixed(2)+' m</td>'
-        +'<td><button class="btn sec sm" onclick="editAlias(\''+esc(t.mac)+'\')">改名</button></td></tr>';
-    }).join(''):'<tr><td colspan="9" class="muted">暂无实时定位数据（添加至少 1 个在线节点为锚点后自动开始解算 OpenNear 与 BLE 信标）</td></tr>';
+        +'<td><button class="btn sec sm" onclick="renameNode(\''+esc(t.mac)+'\')">改名</button></td></tr>';
+    }).join(''):'<tr><td colspan="9" class="muted">暂无实时定位数据（点击右上角「🎬 一键运行围栏+CSI 联动演示」或添加至少 1 个在线锚点）</td></tr>';
   }
-  if(!ancs.length&&!tgts.length){
-    svg.innerHTML='<text x="440" y="135" text-anchor="middle" fill="#64748b" font-size="13">配置 1~4 个固定锚点后，此处实时显示 OpenNear 节点与 BLE iBeacon/Eddystone 2D 平面图</text>';
+  if(!ancs.length&&!tgts.length&&!fns.length){
+    svg.innerHTML='<text x="440" y="135" text-anchor="middle" fill="#64748b" font-size="13">点击右上角「🎬 一键运行围栏+CSI 联动演示」，或配置 1~4 个固定锚点后实时显示 2D 平面图</text>';
     return;
   }
   const pts=ancs.concat(tgts);
-  let minX=0,maxX=600,minY=0,maxY=400;
+  let minX=-60,maxX=560,minY=-60,maxY=410;
   pts.forEach(p=>{
-    if(p.x_cm-100<minX)minX=p.x_cm-100;
-    if(p.x_cm+100>maxX)maxX=p.x_cm+100;
-    if(p.y_cm-100<minY)minY=p.y_cm-100;
-    if(p.y_cm+100>maxY)maxY=p.y_cm+100;
+    if(p.x_cm-110<minX)minX=p.x_cm-110;
+    if(p.x_cm+110>maxX)maxX=p.x_cm+110;
+    if(p.y_cm-110<minY)minY=p.y_cm-110;
+    if(p.y_cm+110>maxY)maxY=p.y_cm+110;
+  });
+  fns.forEach(f=>{
+    if(f.x_cm-f.r_cm-40<minX)minX=f.x_cm-f.r_cm-40;
+    if(f.x_cm+f.r_cm+40>maxX)maxX=f.x_cm+f.r_cm+40;
+    if(f.y_cm-f.r_cm-40<minY)minY=f.y_cm-f.r_cm-40;
+    if(f.y_cm+f.r_cm+40>maxY)maxY=f.y_cm+f.r_cm+40;
   });
   const spanX=Math.max(200,maxX-minX),spanY=Math.max(200,maxY-minY);
-  const pad=42,W=880,H=260;
+  const pad=42,W=880,H=270;
   const sx=x=>Math.round(pad+((x-minX)/spanX)*(W-pad*2));
   const sy=y=>Math.round(H-pad-((y-minY)/spanY)*(H-pad*2));
+  const sr=r=>Math.max(14,Math.round((r/spanX)*(W-pad*2)));
   const out=[];
   for(let gx=0;gx<=4;++gx){
     const x=Math.round(pad+(gx/4)*(W-pad*2));
@@ -464,17 +638,28 @@ function renderLocateSvg(d){
     const y=Math.round(16+(gy/3)*(H-38));
     out.push('<line x1="'+pad+'" y1="'+y+'" x2="'+(W-pad)+'" y2="'+y+'" stroke="#1e293b" stroke-width="1"/>');
   }
+  fns.forEach(f=>{
+    const x=sx(f.x_cm),y=sy(f.y_cm),r=sr(f.r_cm);
+    const col=f.in?'#f43f5e':'#38bdf8';
+    out.push('<circle cx="'+x+'" cy="'+y+'" r="'+r+'" fill="'+col+'" fill-opacity="'+(f.in?'0.18':'0.07')+'" stroke="'+col+'" stroke-width="'+(f.in?'2':'1.4')+'" stroke-dasharray="6,4"/>');
+    out.push('<text x="'+x+'" y="'+(y-r+14)+'" text-anchor="middle" fill="'+col+'" font-size="10.5" font-weight="600">⭕ '+esc(f.name)+(f.in?' [触发]':'')+'</text>');
+  });
   ancs.forEach(a=>{
     const x=sx(a.x_cm),y=sy(a.y_cm);
+    const st=Number(a.csi_st)||0,sc=Number(a.csi)||0;
+    if(st>0){
+      const wcol=st===2?'#f43f5e':'#f59e0b';
+      out.push('<circle cx="'+x+'" cy="'+y+'" r="'+(st===2?28:20)+'" fill="'+wcol+'" fill-opacity="0.16" stroke="'+wcol+'" stroke-opacity="0.7" stroke-dasharray="3,3"/>');
+    }
     out.push('<polygon points="'+x+','+(y-10)+' '+(x+9)+','+(y+8)+' '+(x-9)+','+(y+8)+'" fill="#0284c7" stroke="#38bdf8" stroke-width="1.5"/>');
-    out.push('<text x="'+x+'" y="'+(y+22)+'" text-anchor="middle" fill="#7dd3fc" font-size="11" font-weight="600">'+esc(a.room)+'</text>');
+    out.push('<text x="'+x+'" y="'+(y+22)+'" text-anchor="middle" fill="#7dd3fc" font-size="11" font-weight="600">'+esc(a.room)+(sc>0?' (CSI '+sc+')':'')+'</text>');
   });
   tgts.forEach(t=>{
     const x=sx(t.x_cm),y=sy(t.y_cm);
     const nm=(t.mac&&gAliases[t.mac])?gAliases[t.mac]:(t.label||t.id);
     const src=t.src||'opennear';
     const col=src==='ibeacon'?'#a855f7':(src==='eddystone'?'#f59e0b':'#22c55e');
-    out.push('<circle cx="'+x+'" cy="'+y+'" r="16" fill="'+col+'" fill-opacity="0.16" stroke="'+col+'" stroke-opacity="0.55" stroke-dasharray="3,2"/>');
+    out.push('<circle cx="'+x+'" cy="'+y+'" r="16" fill="'+col+'" fill-opacity="0.18" stroke="'+col+'" stroke-opacity="0.6" stroke-dasharray="3,2"/>');
     if(src==='opennear'){
       out.push('<circle cx="'+x+'" cy="'+y+'" r="6" fill="'+col+'" stroke="#fff" stroke-width="1.5"/>');
     }else{

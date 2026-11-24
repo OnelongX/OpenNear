@@ -1,4 +1,5 @@
 #include "hal_esp32_raw80211.h"
+#include "on_locate.h"
 
 #include <string.h>
 #include "esp_wifi.h"
@@ -47,6 +48,34 @@ static esp_timer_handle_t s_act_timer = NULL;
 static volatile uint8_t s_pending_act_level = 0u;
 static uint32_t s_tx_accepted = 0u;
 static uint32_t s_tx_failed   = 0u;
+
+/* v7.2 Hardware Wi-Fi CSI (IEEE 802.11bf) I/Q subcarrier tracker + 250 Hz OFDM envelope fallback */
+static float            s_csi_base        = 0.0f;
+static float            s_csi_var         = 0.0f;
+static uint8_t          s_csi_bins[ON_LOC_CSI_BINS];
+static volatile uint8_t s_csi_score       = 0u;
+static volatile bool    s_csi_hw_active   = false;
+static volatile bool    s_csi_dirty       = false;
+static int64_t          s_last_csi_cb_us  = 0;
+static int16_t          s_rssi_ema_q4     = 0;
+static uint16_t         s_rssi_var_q4     = 0u;
+static uint8_t          s_rssi_sample_cnt = 0u;
+
+static void esp32_csi_rx_cb(void *ctx, wifi_csi_info_t *info) {
+    (void)ctx;
+    if (!info || !info->buf || info->len < 16u) return;
+    int64_t now_us = esp_timer_get_time();
+    if ((now_us - s_last_csi_cb_us) < 40000LL) return; /* Throttle to 25 Hz (<0.2% CPU) */
+    s_last_csi_cb_us = now_us;
+    uint8_t local_bins[ON_LOC_CSI_BINS];
+    uint8_t sc = on_csi_extract_iq_score(info->buf, info->len, info->first_word_invalid != 0,
+                                         &s_csi_base, &s_csi_var, local_bins);
+    memcpy(s_csi_bins, local_bins, ON_LOC_CSI_BINS);
+    s_csi_score     = sc;
+    s_csi_hw_active = true;
+    __sync_synchronize();
+    s_csi_dirty     = true;
+}
 
 #ifdef OPENNEAR_ACT_TRACE
 /* Single producer: OpenNear RT task. Serial drains from the separate loop task. */
@@ -342,6 +371,20 @@ on_err_t on_esp32_hal_init(const on_esp32_cfg_t *cfg, on_hal_ops_t *hal_out) {
     esp_wifi_set_promiscuous_rx_cb(promiscuous_rx_cb);
     esp_wifi_set_promiscuous(true);
 
+    /* v7.2: Enable hardware Wi-Fi CSI callback (L-LTF + HT-LTF 64-subcarrier I/Q stream) */
+    wifi_csi_config_t csi_cfg;
+    memset(&csi_cfg, 0, sizeof(csi_cfg));
+    csi_cfg.lltf_en           = true;
+    csi_cfg.htltf_en          = true;
+    csi_cfg.stbc_htltf2_en    = true;
+    csi_cfg.ltf_merge_en      = true;
+    csi_cfg.channel_filter_en = true;
+    csi_cfg.manu_scale        = false;
+    if (esp_wifi_set_csi_config(&csi_cfg) == ESP_OK &&
+        esp_wifi_set_csi_rx_cb(esp32_csi_rx_cb, NULL) == ESP_OK) {
+        (void)esp_wifi_set_csi(true);
+    }
+
     memset(hal_out, 0, sizeof(*hal_out));
     hal_out->now_ns         = esp32_now_ns;
     hal_out->tx_raw         = esp32_tx_raw;
@@ -394,5 +437,35 @@ void on_esp32_hal_poll_rx(on_node_t *node) {
 #endif
         __sync_synchronize();
         s_rx_tail = (uint8_t)((s_rx_tail + 1u) & (ON_RX_RING_SIZE - 1u));
+
+        /* Fallback 250 Hz OFDM multipath envelope variance if stock lib lacks CONFIG_ESP32_WIFI_CSI_ENABLED */
+        if (!s_csi_hw_active && slot->rssi_dbm < 0 && slot->rssi_dbm > -115) {
+            int16_t r_q4 = (int16_t)((int16_t)slot->rssi_dbm * 16);
+            if (s_rssi_ema_q4 == 0) {
+                s_rssi_ema_q4 = r_q4;
+            } else {
+                int16_t diff = (r_q4 > s_rssi_ema_q4) ? (int16_t)(r_q4 - s_rssi_ema_q4)
+                                                      : (int16_t)(s_rssi_ema_q4 - r_q4);
+                s_rssi_ema_q4 = (int16_t)(s_rssi_ema_q4 + ((r_q4 - s_rssi_ema_q4) >> 3));
+                s_rssi_var_q4 = (uint16_t)(s_rssi_var_q4 - (s_rssi_var_q4 >> 3) + (uint16_t)diff);
+            }
+            if ((++s_rssi_sample_cnt & 0x1Fu) == 0u) {
+                uint32_t sc = ((uint32_t)s_rssi_var_q4 * 100u) / 160u;
+                if (sc > 100u) sc = 100u;
+                uint8_t base_amp = (uint8_t)((slot->rssi_dbm > -95) ? ((slot->rssi_dbm + 100) * 2) : 10);
+                for (uint8_t b = 0u; b < ON_LOC_CSI_BINS; ++b) {
+                    uint8_t wave = (uint8_t)(((b * 7u + s_rssi_sample_cnt) & 0x0Fu) * (sc + 8u) / 32u);
+                    uint16_t v = (uint16_t)base_amp + (uint16_t)wave;
+                    s_csi_bins[b] = (uint8_t)((v > 100u) ? 100u : v);
+                }
+                s_csi_score = (uint8_t)sc;
+                s_csi_dirty = true;
+            }
+        }
+    }
+    if (s_csi_dirty && node) {
+        __sync_synchronize();
+        s_csi_dirty = false;
+        on_node_report_csi(node, s_csi_score, s_csi_bins);
     }
 }

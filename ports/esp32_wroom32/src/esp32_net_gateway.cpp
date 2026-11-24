@@ -91,6 +91,14 @@ void on_esp32_net_gw_factory_reset(void) {
         s_prefs.clear();
         s_prefs.end();
     }
+    if (s_prefs.begin("opennear_fence", false)) {
+        s_prefs.clear();
+        s_prefs.end();
+    }
+    if (s_prefs.begin("opennear_rule", false)) {
+        s_prefs.clear();
+        s_prefs.end();
+    }
     Serial.println("[OpenNear GW] Hardware factory reset (GPIO0 held 5s) -> NVS cleared, rebooting into OpenNear-Setup!");
     Serial.flush();
     delay(200);
@@ -221,7 +229,11 @@ typedef struct {
 } on_tag_entry_t;
 static on_tag_entry_t s_node_tags[ON_MAX_TAG_ENTRIES];
 static on_loc_ctx_t   s_loc;
-static bool           s_loc_inited = false;
+static bool           s_loc_inited        = false;
+static bool           s_loc_demo_running  = false;
+static uint32_t       s_loc_demo_step     = 0u;
+static uint32_t       s_last_demo_step_ms = 0u;
+static uint32_t       s_last_rule_eval_ms = 0u;
 
 static const char *lookup_mac_tags(const uint8_t mac[6]) {
     if (!mac || (mac[0] | mac[1] | mac[2] | mac[3] | mac[4] | mac[5]) == 0u) return nullptr;
@@ -381,6 +393,145 @@ static void esp32_on_ble_beacon_observed_cb(void *ctx, uint16_t anchor_id,
     }
     on_loc_observe_beacon(&s_loc, amac, tag_mac48, static_cast<on_loc_source_t>(source),
                           tx_power_1m_dbm, rssi_dbm, auto_lbl[0] ? auto_lbl : nullptr, millis());
+}
+
+/* v7.2: Invoked on Core 1 when G hears or receives ON_GW_MSG_CSI_REPORT (0x0C) from an Anchor */
+static void esp32_on_csi_observed_cb(void *ctx, uint16_t anchor_id,
+                                     uint8_t csi_score, const uint8_t subcarrier_bins[16]) {
+    auto *node = static_cast<on_node_t *>(ctx);
+    if (!node || !s_loc_inited) return;
+    uint8_t amac[6] = {0};
+    (void)on_node_find_mac_by_short_id(node, anchor_id, amac);
+    on_loc_observe_csi(&s_loc, amac, anchor_id, csi_score, subcarrier_bins, millis());
+}
+
+static void save_fences_to_nvs(void) {
+    if (!s_prefs.begin("opennear_fence", false)) return;
+    s_prefs.clear();
+    uint32_t slot = 0u;
+    for (uint32_t i = 0u; i < ON_LOC_MAX_GEOFENCES; ++i) {
+        if (!s_loc.fences[i].active) continue;
+        char k[8], v[64];
+        snprintf(k, sizeof(k), "f%u", (unsigned)slot++);
+        snprintf(v, sizeof(v), "%s|%ld|%ld|%u", s_loc.fences[i].name,
+                 (long)s_loc.fences[i].x_cm, (long)s_loc.fences[i].y_cm,
+                 (unsigned)s_loc.fences[i].radius_cm);
+        s_prefs.putString(k, v);
+    }
+    s_prefs.end();
+}
+
+static void load_fences_from_nvs(void) {
+    if (!s_prefs.begin("opennear_fence", true)) return;
+    for (uint32_t i = 0u; i < ON_LOC_MAX_GEOFENCES; ++i) {
+        char k[8];
+        snprintf(k, sizeof(k), "f%u", (unsigned)i);
+        String v = s_prefs.getString(k, "");
+        if (v.length() < 5) continue;
+        int b1 = v.indexOf('|');
+        int b2 = (b1 > 0) ? v.indexOf('|', b1 + 1) : -1;
+        int b3 = (b2 > 0) ? v.indexOf('|', b2 + 1) : -1;
+        if (b1 <= 0 || b2 <= b1 || b3 <= b2) continue;
+        String nm = v.substring(0, b1);
+        int32_t x_cm = static_cast<int32_t>(v.substring(b1 + 1, b2).toInt());
+        int32_t y_cm = static_cast<int32_t>(v.substring(b2 + 1, b3).toInt());
+        uint16_t rad = static_cast<uint16_t>(v.substring(b3 + 1).toInt());
+        if (rad > 0u) on_loc_set_geofence(&s_loc, nm.c_str(), x_cm, y_cm, rad);
+    }
+    s_prefs.end();
+}
+
+static void save_rules_to_nvs(void) {
+    if (!s_prefs.begin("opennear_rule", false)) return;
+    s_prefs.clear();
+    for (uint32_t i = 0u; i < ON_LOC_MAX_RULES; ++i) {
+        if (!s_loc.rules[i].active) continue;
+        char k[8], v[96];
+        snprintf(k, sizeof(k), "r%u", (unsigned)s_loc.rules[i].id);
+        snprintf(v, sizeof(v), "%u|%u|%s|%u|%s|%s",
+                 (unsigned)s_loc.rules[i].id,
+                 (unsigned)s_loc.rules[i].trig_type,
+                 s_loc.rules[i].zone,
+                 (unsigned)s_loc.rules[i].csi_threshold,
+                 s_loc.rules[i].cmd_tag,
+                 s_loc.rules[i].cmd_payload);
+        s_prefs.putString(k, v);
+    }
+    s_prefs.end();
+}
+
+static void load_rules_from_nvs(void) {
+    if (!s_prefs.begin("opennear_rule", true)) return;
+    for (uint32_t i = 1u; i <= ON_LOC_MAX_RULES; ++i) {
+        char k[8];
+        snprintf(k, sizeof(k), "r%u", (unsigned)i);
+        String v = s_prefs.getString(k, "");
+        if (v.length() < 9) continue;
+        int b1 = v.indexOf('|');
+        int b2 = (b1 > 0) ? v.indexOf('|', b1 + 1) : -1;
+        int b3 = (b2 > 0) ? v.indexOf('|', b2 + 1) : -1;
+        int b4 = (b3 > 0) ? v.indexOf('|', b3 + 1) : -1;
+        int b5 = (b4 > 0) ? v.indexOf('|', b4 + 1) : -1;
+        if (b1 <= 0 || b2 <= b1 || b3 <= b2 || b4 <= b3 || b5 <= b4) continue;
+        uint8_t rid  = static_cast<uint8_t>(v.substring(0, b1).toInt());
+        uint8_t trig = static_cast<uint8_t>(v.substring(b1 + 1, b2).toInt());
+        String zone  = v.substring(b2 + 1, b3);
+        uint8_t th   = static_cast<uint8_t>(v.substring(b3 + 1, b4).toInt());
+        String tag   = v.substring(b4 + 1, b5);
+        String cmd   = v.substring(b5 + 1);
+        on_loc_set_rule(&s_loc, rid, trig, zone.c_str(), th, tag.c_str(), cmd.c_str());
+    }
+    s_prefs.end();
+}
+
+static uint32_t dispatch_tag_or_local_cmd(on_node_t *node, const char *tag,
+                                          const uint8_t *pay, uint8_t plen) {
+    if (!tag || !pay || plen == 0u) return 0u;
+    bool all_tags = (strcmp(tag, "*") == 0);
+    uint32_t sent_cnt = 0u;
+    if (node) {
+        on_cluster_snapshot_t snap;
+        on_esp32_node_lock();
+        on_node_get_cluster_snapshot(node, &snap);
+        on_esp32_node_unlock();
+        for (uint8_t i = 0u; i < snap.active_count; ++i) {
+            const on_cluster_node_t *cn = &snap.nodes[i];
+            if (!all_tags && !mac_has_tag(cn->mac48, tag)) continue;
+            if (cn->short_id == node->short_id) {
+                on_esp32_demo_on_cmd(pay, plen);
+                sent_cnt++;
+            } else {
+                on_esp32_node_lock();
+                if (node->mesh &&
+                    on_mesh_lookup_next_hop(node->mesh, cn->short_id) != ON_SHORT_ID_UNASSIGNED) {
+                    on_node_send_mesh_downlink(node, cn->short_id, pay, plen);
+                } else {
+                    on_node_send_gw_downlink(node, cn->short_id, ON_GW_MSG_CLOUD_CMD_DOWN, pay, plen);
+                }
+                on_esp32_node_unlock();
+                sent_cnt++;
+            }
+        }
+    }
+    /* When running on a single standalone board (or wildcard '*'), also trigger local demo LED/Relay */
+    if (sent_cnt == 0u) {
+        on_esp32_demo_on_cmd(pay, plen);
+        sent_cnt = 1u;
+    }
+    return sent_cnt;
+}
+
+static void esp32_on_rule_fired_cb(void *user_ctx, const on_loc_rule_t *rule) {
+    auto *node = static_cast<on_node_t *>(user_ctx);
+    if (!rule || !rule->cmd_payload[0]) return;
+    size_t clen = strlen(rule->cmd_payload);
+    if (clen == 0u || clen > ON_GW_MAX_PAYLOAD_LEN) return;
+    const char *tag = rule->cmd_tag[0] ? rule->cmd_tag : "*";
+    uint32_t sent = dispatch_tag_or_local_cmd(node, tag,
+                                              reinterpret_cast<const uint8_t *>(rule->cmd_payload),
+                                              static_cast<uint8_t>(clen));
+    Serial.printf("[OpenNear Rule] Fired R#%u [%s] -> tag='%s' cmd='%s' (dispatched=%u)\n",
+                  (unsigned)rule->id, rule->zone, tag, rule->cmd_payload, (unsigned)sent);
 }
 
 static void ensure_gateway_mac_ids(const on_node_t *node) {
@@ -777,7 +928,7 @@ static void start_local_http_api(void) {
 
         append_cstr(json, sizeof(json), &pos, "{\"role\":\"");
         append_cstr(json, sizeof(json), &pos, role_s);
-        snprintf(num, sizeof(num), "\",\"id\":\"0x%03X\",\"mac\":\"%s\",\"ble_mac\":\"%s\",\"sf\":%u,\"fw_ver\":\"v7.1\",\"uptime_s\":%u",
+        snprintf(num, sizeof(num), "\",\"id\":\"0x%03X\",\"mac\":\"%s\",\"ble_mac\":\"%s\",\"sf\":%u,\"fw_ver\":\"v7.2\",\"uptime_s\":%u",
                  (unsigned)short_id, mac_s, bmac_s, (unsigned)sf_seq, (unsigned)(millis() / 1000u));
         append_cstr(json, sizeof(json), &pos, num);
 
@@ -810,9 +961,10 @@ static void start_local_http_api(void) {
         append_json_escaped(json, sizeof(json), &pos, s_gw_ref ? s_gw_ref->cfg.mqtt_host : "");
 
         ensure_gateway_mac_ids(s_node_ref);
-        snprintf(num, sizeof(num), "\",\"ble_ok\":%s,\"ble_scan\":%s,\"token_set\":%s,\"netkey_custom\":%s,\"tls_compiled\":%s,\"mqtt_tls\":%s,\"tls_ca_set\":%s,\"mqtt_avty\":\"",
+        snprintf(num, sizeof(num), "\",\"ble_ok\":%s,\"ble_scan\":%s,\"loc_demo\":%s,\"token_set\":%s,\"netkey_custom\":%s,\"tls_compiled\":%s,\"mqtt_tls\":%s,\"tls_ca_set\":%s,\"mqtt_avty\":\"",
                  (s_gw_ref && s_gw_ref->ble_connected) ? "true" : "false",
                  (s_gw_ref && s_gw_ref->cfg.ble_scan_enabled) ? "true" : "false",
+                 s_loc_demo_running ? "true" : "false",
                  (s_gw_ref && s_gw_ref->cfg.admin_token[0] != '\0') ? "true" : "false",
                  s_netkey_custom ? "true" : "false",
                  on_esp32_tls_is_compiled() ? "true" : "false",
@@ -973,9 +1125,9 @@ static void start_local_http_api(void) {
     });
 
     s_http_srv.on("/api/locate", HTTP_GET, []() {
-        static char json[2048];
+        static char json[3072];
         if (!s_loc_inited) {
-            s_http_srv.send(200, "application/json", "{\"anchors\":[],\"targets\":[]}");
+            s_http_srv.send(200, "application/json", "{\"anchors\":[],\"targets\":[],\"fences\":[],\"rules\":[]}");
             return;
         }
         on_esp32_node_lock();
@@ -1464,9 +1616,12 @@ void on_esp32_net_gw_start(on_node_t *node, on_gw_ctx_t *gw, const char *ble_nam
     }
 #ifdef OPENNEAR_ENABLE_WIFI_GW
     load_anchors_from_nvs();
+    load_fences_from_nvs();
+    load_rules_from_nvs();
     if (node) {
         on_node_set_rssi_observer(node, esp32_on_rssi_observed_cb, node);
         on_node_set_ble_beacon_observer(node, esp32_on_ble_beacon_observed_cb, node);
+        on_node_set_csi_observer(node, esp32_on_csi_observed_cb, node);
     }
 #endif
 #ifdef OPENNEAR_ENABLE_BLE_GW
@@ -1693,33 +1848,84 @@ void on_esp32_net_gw_poll(on_node_t *node, on_gw_ctx_t *gw) {
 
     if (gw->cfg.cmd_tag_requested && node) {
         gw->cfg.cmd_tag_requested = false;
-        on_cluster_snapshot_t snap;
-        on_esp32_node_lock();
-        on_node_get_cluster_snapshot(node, &snap);
-        on_esp32_node_unlock();
-        uint32_t sent_cnt = 0u;
-        for (uint8_t i = 0u; i < snap.active_count; ++i) {
-            const on_cluster_node_t *cn = &snap.nodes[i];
-            if (!mac_has_tag(cn->mac48, gw->cfg.cmd_tag)) continue;
-            if (cn->short_id == node->short_id) {
-                on_esp32_demo_on_cmd(gw->cfg.cmd_tag_payload, gw->cfg.cmd_tag_payload_len);
-                sent_cnt++;
-            } else {
-                on_esp32_node_lock();
-                if (node->mesh &&
-                    on_mesh_lookup_next_hop(node->mesh, cn->short_id) != ON_SHORT_ID_UNASSIGNED) {
-                    on_node_send_mesh_downlink(node, cn->short_id,
-                                               gw->cfg.cmd_tag_payload, gw->cfg.cmd_tag_payload_len);
-                } else {
-                    on_node_send_gw_downlink(node, cn->short_id, ON_GW_MSG_CLOUD_CMD_DOWN,
-                                             gw->cfg.cmd_tag_payload, gw->cfg.cmd_tag_payload_len);
-                }
-                on_esp32_node_unlock();
-                sent_cnt++;
-            }
-        }
+        uint32_t sent_cnt = dispatch_tag_or_local_cmd(node, gw->cfg.cmd_tag,
+                                                      gw->cfg.cmd_tag_payload,
+                                                      gw->cfg.cmd_tag_payload_len);
         Serial.printf("[OpenNear Tag] Group CMD tag='%s' -> dispatched to %u node(s)\n",
                       gw->cfg.cmd_tag, (unsigned)sent_cnt);
+    }
+
+    if (gw->cfg.fence_updated) {
+        gw->cfg.fence_updated = false;
+        on_esp32_node_lock();
+        if (!s_loc_inited) { on_loc_init(&s_loc); s_loc_inited = true; }
+        on_loc_set_geofence(&s_loc, gw->cfg.fence_name,
+                            gw->cfg.fence_x_cm, gw->cfg.fence_y_cm, gw->cfg.fence_radius_cm);
+        on_esp32_node_unlock();
+        if (!s_loc_demo_running) save_fences_to_nvs();
+        Serial.printf("[OpenNear Fence] Geofence '%s' (%ld,%ld cm, r=%u cm)\n",
+                      gw->cfg.fence_name, (long)gw->cfg.fence_x_cm,
+                      (long)gw->cfg.fence_y_cm, (unsigned)gw->cfg.fence_radius_cm);
+    }
+
+    if (gw->cfg.rule_updated) {
+        gw->cfg.rule_updated = false;
+        on_esp32_node_lock();
+        if (!s_loc_inited) { on_loc_init(&s_loc); s_loc_inited = true; }
+        on_loc_set_rule(&s_loc, gw->cfg.rule_id, gw->cfg.rule_trig_type,
+                        gw->cfg.rule_zone, gw->cfg.rule_csi_thresh,
+                        gw->cfg.rule_cmd_tag, gw->cfg.rule_cmd_payload);
+        on_esp32_node_unlock();
+        if (!s_loc_demo_running) save_rules_to_nvs();
+        Serial.printf("[OpenNear Rule] Rule R#%u trig=%u zone='%s' th=%u -> tag='%s' cmd='%s'\n",
+                      (unsigned)gw->cfg.rule_id, (unsigned)gw->cfg.rule_trig_type,
+                      gw->cfg.rule_zone, (unsigned)gw->cfg.rule_csi_thresh,
+                      gw->cfg.rule_cmd_tag, gw->cfg.rule_cmd_payload);
+    }
+
+    if (gw->cfg.loc_demo_updated) {
+        gw->cfg.loc_demo_updated = false;
+        uint32_t dnow = millis();
+        on_esp32_node_lock();
+        if (!s_loc_inited) { on_loc_init(&s_loc); s_loc_inited = true; }
+        if (gw->cfg.loc_demo_mode == 1u) {
+            on_loc_load_demo_preset(&s_loc, node ? node->mac48 : nullptr, dnow);
+            s_loc_demo_running  = true;
+            s_loc_demo_step     = 1u;
+            s_last_demo_step_ms = dnow;
+            Serial.println("[OpenNear Demo] Loaded 4-Room + 2-Geofence + Wi-Fi CSI Showcase Preset (AUTO RUN)");
+        } else if (gw->cfg.loc_demo_mode == 2u) {
+            if (!s_loc_demo_running && s_loc.fences[0].active == false) {
+                on_loc_load_demo_preset(&s_loc, node ? node->mac48 : nullptr, dnow);
+            }
+            on_loc_step_demo(&s_loc, s_loc_demo_step++, dnow);
+            s_last_demo_step_ms = dnow;
+        } else {
+            s_loc_demo_running = false;
+            on_loc_init(&s_loc);
+            load_anchors_from_nvs();
+            load_fences_from_nvs();
+            load_rules_from_nvs();
+            Serial.println("[OpenNear Demo] Showcase stopped -> restored NVS anchors/fences/rules");
+        }
+        on_esp32_node_unlock();
+    }
+
+    /* v7.2: Step interactive showcase trajectory every 2.5 s when demo mode is running */
+    uint32_t loc_now_ms = millis();
+    if (s_loc_demo_running && (loc_now_ms - s_last_demo_step_ms) >= 2500u) {
+        s_last_demo_step_ms = loc_now_ms;
+        on_esp32_node_lock();
+        on_loc_step_demo(&s_loc, s_loc_demo_step++, loc_now_ms);
+        on_esp32_node_unlock();
+    }
+
+    /* v7.2: Evaluate offline edge geofence & Wi-Fi CSI rules every 500 ms (zero cloud / zero HA dependency) */
+    if (s_loc_inited && (loc_now_ms - s_last_rule_eval_ms) >= 500u) {
+        s_last_rule_eval_ms = loc_now_ms;
+        on_esp32_node_lock();
+        on_loc_evaluate_rules(&s_loc, loc_now_ms, esp32_on_rule_fired_cb, node);
+        on_esp32_node_unlock();
     }
 
     if (connected && gw->cfg.ota_pull_requested) {

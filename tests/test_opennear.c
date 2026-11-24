@@ -3014,9 +3014,189 @@ static void test_v71_deep_audit_2hop_anchor_and_stale_gc(void) {
            (unsigned)t8_node->short_id);
 }
 
+typedef struct {
+    uint32_t fired_count;
+    uint8_t  last_rule_id;
+    char     last_tag[20];
+    char     last_cmd[28];
+} test_v72_rule_cb_t;
+
+static void test_v72_rule_cb(void *user_ctx, const on_loc_rule_t *rule) {
+    test_v72_rule_cb_t *st = (test_v72_rule_cb_t *)user_ctx;
+    if (!st || !rule) return;
+    st->fired_count++;
+    st->last_rule_id = rule->id;
+    snprintf(st->last_tag, sizeof(st->last_tag), "%s", rule->cmd_tag);
+    snprintf(st->last_cmd, sizeof(st->last_cmd), "%s", rule->cmd_payload);
+}
+
+typedef struct {
+    uint32_t count;
+    bool     got_1hop_t2;
+    bool     got_2hop_t8;
+    uint16_t t2_id;
+    uint16_t t8_id;
+} test_v72_csi_cb_t;
+
+static void test_v72_csi_cb(void *user_ctx, uint16_t anchor_id,
+                            uint8_t csi_score, const uint8_t subcarrier_bins[16]) {
+    test_v72_csi_cb_t *st = (test_v72_csi_cb_t *)user_ctx;
+    if (!st || !subcarrier_bins) return;
+    st->count++;
+    if (anchor_id == st->t2_id && csi_score == 64u &&
+        subcarrier_bins[0] == 40u && subcarrier_bins[15] == 115u) {
+        st->got_1hop_t2 = true;
+    }
+    if (anchor_id == st->t8_id && csi_score == 82u &&
+        subcarrier_bins[0] == 90u && subcarrier_bins[15] == 165u) {
+        st->got_2hop_t8 = true;
+    }
+}
+
+/* ============================================================================
+ * TEST 42: v7.2 Wi-Fi CSI (IEEE 802.11bf) Radar, 2D Geofences & Offline Rules
+ * ============================================================================ */
+static void test_v72_wifi_csi_geofence_and_offline_rules(void) {
+    printf("[TEST 42] v7.2 Wi-Fi CSI Subcarrier Radar, 2D Geofences & Offline Edge Rule Engine...\n");
+
+    /* Part A: 64-Subcarrier OFDM I/Q Extraction & CSI Presence State Machine */
+    float    ema_base = 0.0f;
+    float    ema_var  = 0.0f;
+    uint8_t  bins[ON_LOC_CSI_BINS] = {0};
+    int8_t   iq_buf[128];
+
+    /* 6 frames of stationary multipath channel -> low motion score (< 15) */
+    uint8_t static_score = 100u;
+    for (int f = 0; f < 6; ++f) {
+        for (int k = 0; k < 64; ++k) {
+            iq_buf[k * 2]     = (int8_t)(24 + (k & 1));
+            iq_buf[k * 2 + 1] = (int8_t)(18 + (k & 1));
+        }
+        static_score = on_csi_extract_iq_score(iq_buf, sizeof(iq_buf), true,
+                                               &ema_base, &ema_var, bins);
+    }
+    EXPECT(static_score < 15u && bins[4] > 0u,
+           "Stationary 64-subcarrier I/Q stream converges to quiet CSI score (<15)");
+
+    /* 4 frames of human walking multipath reflection -> high motion score (>= 45) */
+    uint8_t moving_score = 0u;
+    for (int f = 0; f < 4; ++f) {
+        for (int k = 0; k < 64; ++k) {
+            int swing = ((k + f * 3) & 1) ? 46 : -20;
+            iq_buf[k * 2]     = (int8_t)(24 + swing);
+            iq_buf[k * 2 + 1] = (int8_t)(18 - (swing / 2));
+        }
+        moving_score = on_csi_extract_iq_score(iq_buf, sizeof(iq_buf), true,
+                                               &ema_base, &ema_var, bins);
+    }
+    EXPECT(moving_score >= 45u,
+           "Human walking multipath I/Q perturbation raises CSI motion score (>=45)");
+
+    /* Part B: 4-Room + 2-Geofence + 4-Rule Showcase Preset & Edge-Triggered Offline Automation */
+    on_loc_ctx_t loc;
+    on_loc_init(&loc);
+    on_loc_load_demo_preset(&loc, NULL, 1000u);
+
+    test_v72_rule_cb_t rcb;
+    memset(&rcb, 0, sizeof(rcb));
+
+    /* Stage 0 (loaded by preset): Living CSI = 76 (MOVING) -> fires R#3 (MODE:PULSE) */
+    uint32_t f0 = on_loc_evaluate_rules(&loc, 1000u, test_v72_rule_cb, &rcb);
+    EXPECT(f0 == 1u && rcb.last_rule_id == 3u && strcmp(rcb.last_cmd, "MODE:PULSE") == 0,
+           "Stage 0: Living Wi-Fi CSI motion (>=45) fires offline Rule R#3 -> MODE:PULSE");
+    /* Re-evaluating without state change must not double-fire */
+    EXPECT(on_loc_evaluate_rules(&loc, 1200u, test_v72_rule_cb, &rcb) == 0u,
+           "Edge-triggered rule latch prevents duplicate firing while condition stays true");
+
+    /* Stage 1: Virtual iBeacon enters Study & StudyDesk geofence (460,40 cm) -> fires R#1 (RELAY:1) */
+    on_loc_step_demo(&loc, 1u, 3000u);
+    EXPECT(on_loc_check_geofence(&loc, 460, 40, "StudyDesk"),
+           "Stage 1: 2D circular geofence 'StudyDesk' contains waypoint (460,40 cm)");
+    uint32_t f1 = on_loc_evaluate_rules(&loc, 3000u, test_v72_rule_cb, &rcb);
+    EXPECT(f1 == 1u && rcb.last_rule_id == 1u && strcmp(rcb.last_cmd, "RELAY:1") == 0,
+           "Stage 1: Entering Study fires offline Rule R#1 -> RELAY:1");
+
+    /* Stage 2: Target rests in Bedroom + Living CSI drops to 8 (<15) -> fires R#4 (MODE:SYNC) */
+    on_loc_step_demo(&loc, 2u, 6000u);
+    uint32_t f2 = on_loc_evaluate_rules(&loc, 6000u, test_v72_rule_cb, &rcb);
+    EXPECT(f2 == 1u && rcb.last_rule_id == 4u && strcmp(rcb.last_cmd, "MODE:SYNC") == 0,
+           "Stage 2: Living Wi-Fi CSI quiet (<15) fires offline Rule R#4 -> MODE:SYNC");
+
+    /* Stage 3: Virtual iBeacon enters KitchenZone hazard geofence (40,330 cm) -> fires R#2 (MODE:STROBE) */
+    on_loc_step_demo(&loc, 3u, 9000u);
+    EXPECT(on_loc_check_geofence(&loc, 40, 330, "KitchenZone"),
+           "Stage 3: 2D circular geofence 'KitchenZone' contains waypoint (40,330 cm)");
+    uint32_t f3 = on_loc_evaluate_rules(&loc, 9000u, test_v72_rule_cb, &rcb);
+    EXPECT(f3 >= 1u && loc.rules[1].fire_count == 1u,
+           "Stage 3: Entering KitchenZone geofence fires offline Rule R#2 -> MODE:STROBE");
+
+    char jbuf[3072];
+    size_t jlen = on_loc_format_json(&loc, 9000u, jbuf, sizeof(jbuf));
+    EXPECT(jlen > 0u && strstr(jbuf, "\"fences\":[") != NULL &&
+           strstr(jbuf, "\"rules\":[") != NULL && strstr(jbuf, "\"bins\":[") != NULL &&
+           strstr(jbuf, "\"last_evt\":\"R#") != NULL,
+           "on_loc_format_json exports anchors CSI bins, 2D geofences, rules, and last_evt");
+
+    /* Part C: Gateway Control Commands (FENCE / RULE / LOCDEMO) & 10-Node 1-Hop/2-Hop CSI_REPORT (0x0C) Relay */
+    on_gw_ctx_t gw;
+    on_gw_init(&gw, ON_GW_MODE_WIFI_AND_BLE, NULL);
+    on_gw_set_admin_token(&gw, "CsiSecret72");
+    EXPECT(on_gw_handle_control_text(&gw, "FENCE:StudyDesk|420|0|135", 25u, false) == ON_ERR_DECODE_FAIL,
+           "Unauthenticated FENCE: command rejected when admin_token is set");
+    const char *fcmd = "AUTH:CsiSecret72|FENCE:StudyDesk|420|0|135";
+    EXPECT(on_gw_handle_control_text(&gw, fcmd, strlen(fcmd), false) == ON_OK &&
+           gw.cfg.fence_updated && strcmp(gw.cfg.fence_name, "StudyDesk") == 0 &&
+           gw.cfg.fence_x_cm == 420 && gw.cfg.fence_radius_cm == 135u,
+           "Authenticated FENCE: command parsed cleanly");
+    const char *rcmd = "AUTH:CsiSecret72|RULE:2|3|StudyDesk|40|DeskLamp|RELAY:1";
+    EXPECT(on_gw_handle_control_text(&gw, rcmd, strlen(rcmd), false) == ON_OK &&
+           gw.cfg.rule_updated && gw.cfg.rule_id == 2u && gw.cfg.rule_trig_type == 3u &&
+           strcmp(gw.cfg.rule_zone, "StudyDesk") == 0 && strcmp(gw.cfg.rule_cmd_tag, "DeskLamp") == 0 &&
+           strcmp(gw.cfg.rule_cmd_payload, "RELAY:1") == 0,
+           "Authenticated RULE: command parsed cleanly");
+    const char *dcmd = "AUTH:CsiSecret72|LOCDEMO:1";
+    EXPECT(on_gw_handle_control_text(&gw, dcmd, strlen(dcmd), false) == ON_OK &&
+           gw.cfg.loc_demo_updated && gw.cfg.loc_demo_mode == 1u,
+           "Authenticated LOCDEMO:1 command parsed cleanly");
+
+    sim_world_t w;
+    sim_world_init(&w, 0x72C51026ULL);
+    sim_world_setup_10node_demo(&w, true);
+    sim_world_run_us(&w, 200000, 10);
+
+    on_node_t *g_node  = &w.nodes[0];
+    on_node_t *t2_node = &w.nodes[2]; /* 1-hop Anchor */
+    on_node_t *t8_node = &w.nodes[8]; /* 2-hop Wall-blocked Sub-G Anchor */
+
+    test_v72_csi_cb_t csi_st;
+    memset(&csi_st, 0, sizeof(csi_st));
+    csi_st.t2_id = t2_node->short_id;
+    csi_st.t8_id = t8_node->short_id;
+    on_node_set_csi_observer(g_node, test_v72_csi_cb, &csi_st);
+
+    uint8_t bins_t2[16], bins_t8[16];
+    for (uint8_t i = 0u; i < 16u; ++i) {
+        bins_t2[i] = (uint8_t)(40u + i * 5u);
+        bins_t8[i] = (uint8_t)(90u + i * 5u);
+    }
+    on_node_report_csi(t2_node, 64u, bins_t2);
+    on_node_report_csi(t8_node, 82u, bins_t8);
+    EXPECT(t2_node->csi_obs_pending && t8_node->csi_obs_pending,
+           "Queued Wi-Fi CSI reports on 1-hop Anchor T2 and 2-hop Anchor T8");
+
+    sim_world_run_us(&w, 440000, 10);
+    EXPECT(w.tdma_subg_collisions == 0u && w.cra_collisions == 0u,
+           "Zero RF collisions during 1-hop & 2-hop ON_GW_MSG_CSI_REPORT (0x0C) TDMA relay");
+    EXPECT(csi_st.got_1hop_t2 && csi_st.got_2hop_t8,
+           "Primary G receives and attributes both 1-hop T2 and 2-hop T8 Wi-Fi CSI 16-bin spectra");
+
+    printf("    -> 64-Subcarrier I/Q CSI Score (static=%u -> moving=%u) | 4 Showcase Rules Fired | 1-Hop+2-Hop 0x0C CSI Relay OK (0 coll)\n",
+           (unsigned)static_score, (unsigned)moving_score);
+}
+
 int main(void) {
     printf("============================================================\n");
-    printf("       OpenNear v7.1 Core Protocol Automated Test Suite     \n");
+    printf("       OpenNear v7.2 Core Protocol Automated Test Suite     \n");
     printf("============================================================\n");
 
     test_6byte_header_and_frame();
@@ -3061,6 +3241,7 @@ int main(void) {
     test_v70_indoor_locate_rssi_and_tags();
     test_v71_ble_ibeacon_eddystone_and_relay();
     test_v71_deep_audit_2hop_anchor_and_stale_gc();
+    test_v72_wifi_csi_geofence_and_offline_rules();
 
     printf("\n------------------------------------------------------------\n");
     printf("SUMMARY: %d passed, %d failed\n", g_tests_passed, g_tests_failed);

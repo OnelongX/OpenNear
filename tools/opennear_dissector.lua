@@ -43,8 +43,8 @@ local f_bmac      = ProtoField.bytes("opennear.sync.beacon_mac", "Beacon CBC-MAC
 local f_gw_type   = ProtoField.uint8("opennear.gw.type", "GW Bridge Subtype", base.HEX, {
     [0x01] = "TELEMETRY_UP", [0x02] = "CLOUD_CMD_DOWN", [0x03] = "BLE_NOTIFY_UP",
     [0x04] = "BLE_CMD_DOWN", [0x05] = "WIFI_PROV", [0x06] = "OTA_URL_PULL",
-    [0x07] = "TOPO_REQ",     [0x08] = "TOPO_RESP", [0x09] = "MAC_REPORT",
-    [0x0A] = "RSSI_REPORT",  [0x0B] = "BLE_BEACON_REPORT"
+    [0x07] = "TOPO_REQ",     [0x08] = "TOPO_RESP",         [0x09] = "MAC_REPORT",
+    [0x0A] = "RSSI_REPORT",  [0x0B] = "BLE_BEACON_REPORT", [0x0C] = "CSI_REPORT"
 })
 local f_gw_flags  = ProtoField.uint8("opennear.gw.flags", "GW Flags", base.HEX)
 local f_gw_orig   = ProtoField.uint16("opennear.gw.origin_id", "Origin Short-ID", base.HEX)
@@ -156,6 +156,9 @@ function p_on.dissector(tvbuf, pinfo, tree)
                 sub:add(f_gw_mac, tvbuf(off, 6))
                 off = off + 9
             end
+        elseif gwt == 0x0C and plen >= 17 and pktlen >= 4 + 6 + 7 + 17 + 2 then
+            local sc = tvbuf(17, 1):uint()
+            pt:add(tvbuf(17, 17), string.format("Wi-Fi CSI Motion Score: %d / 100 (16-Bin Subcarrier Profile)", sc))
         end
     elseif ftype == 13 and bit.band(fc, 0x02) == 0 and pktlen >= 4 + 6 + 9 + 2 then
         -- Unencrypted 3~6-hop Hybrid MESH payload (9B header + payload)

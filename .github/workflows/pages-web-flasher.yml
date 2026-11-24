@@ -69,8 +69,8 @@ jobs:
 
             cat > "site/firmware/manifest-${ENV}.json" <<EOF
           {
-            "name": "OpenNear v7.1 (${ENV})",
-            "version": "7.1.0",
+            "name": "OpenNear v7.2 (${ENV})",
+            "version": "7.2.0",
             "new_install_prompt_erase": true,
             "builds": [
               {

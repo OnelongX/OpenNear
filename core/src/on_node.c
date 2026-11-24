@@ -1362,7 +1362,8 @@ void on_node_on_rx_raw_timed_rssi(on_node_t *node, const uint8_t *frame, size_t 
                               msg.bridge_type == ON_GW_MSG_TOPO_REQ ||
                               msg.bridge_type == ON_GW_MSG_MAC_REPORT ||
                               msg.bridge_type == ON_GW_MSG_RSSI_REPORT ||
-                              msg.bridge_type == ON_GW_MSG_BLE_BEACON_REPORT);
+                              msg.bridge_type == ON_GW_MSG_BLE_BEACON_REPORT ||
+                              msg.bridge_type == ON_GW_MSG_CSI_REPORT);
             if (is_uplink) {
                 if (node->role == ON_ROLE_G) {
                     if (msg.bridge_type == ON_GW_MSG_TOPO_REQ) {
@@ -1402,6 +1403,19 @@ void on_node_on_rx_raw_timed_rssi(on_node_t *node, const uint8_t *frame, size_t 
                                                              (int8_t)msg.payload[k + 7u],
                                                              (int8_t)msg.payload[k + 8u]);
                             }
+                        }
+                    } else if (msg.bridge_type == ON_GW_MSG_CSI_REPORT && msg.payload_len >= 17u) {
+                        node->rx_slot_mask_this_sf |= (uint16_t)(1u << (hdr.slot_idx & 0x0Fu));
+                        on_peer_entry_t *pe_cn = find_peer_by_id(node, hdr.src_id);
+                        if (pe_cn) pe_cn->last_seen_sf = node->current_sf_seq;
+                        uint16_t anchor_id = (msg.origin_id != ON_SHORT_ID_UNASSIGNED) ? msg.origin_id : hdr.src_id;
+                        if (anchor_id != hdr.src_id) {
+                            on_cluster_node_t *cn_cs = cluster_find_or_alloc(node, anchor_id);
+                            if (cn_cs) cn_cs->last_seen_sf = node->current_sf_seq;
+                        }
+                        if (node->on_csi_observed) {
+                            node->on_csi_observed(node->csi_obs_ctx, anchor_id,
+                                                  msg.payload[0], &msg.payload[1]);
                         }
                     } else if (msg.bridge_type == ON_GW_MSG_MAC_REPORT && msg.payload_len >= 6u) {
                         node->rx_slot_mask_this_sf |= (uint16_t)(1u << (hdr.slot_idx & 0x0Fu));
@@ -2076,6 +2090,37 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
                     goto tdma_slot_done;
                 }
             }
+            /* v7.2: Anchor periodically flushes IEEE 802.11bf Wi-Fi CSI motion & spectrum in private D-TDMA slot */
+            if (node->rssi_report_enabled && !node->harq_retry_pending &&
+                node->tdma_tx_total > 0u && node->csi_obs_pending &&
+                (node->current_sf_seq - node->last_csi_rep_sf) >= 64u) {
+                on_gw_bridge_msg_t crep;
+                memset(&crep, 0, sizeof(crep));
+                crep.bridge_type = (uint8_t)ON_GW_MSG_CSI_REPORT;
+                crep.origin_id   = node->short_id;
+                crep.seq         = ++node->data_tx_seq;
+                crep.payload[0]  = node->csi_obs_score;
+                memcpy(&crep.payload[1], node->csi_obs_bins, 16u);
+                crep.payload_len = 17u;
+                uint8_t cbuf[ON_GW_BRIDGE_HDR_LEN + 20u];
+                size_t clen = 0u;
+                if (on_gw_bridge_pack(&crep, cbuf, sizeof(cbuf), &clen) == ON_OK) {
+                    on_mac_hdr_t hdr;
+                    memset(&hdr, 0, sizeof(hdr));
+                    hdr.version    = ON_PROTO_VERSION;
+                    hdr.type       = (uint8_t)ON_FRAME_GW_BRIDGE;
+                    hdr.is_sub_g   = false;
+                    hdr.src_id     = node->short_id;
+                    hdr.dst_id     = node->parent_id;
+                    hdr.sf_seq_low = (uint8_t)(node->current_sf_seq & 0x0Fu);
+                    hdr.slot_idx   = node->my_slot;
+                    send_frame(node, &hdr, cbuf, clen, now_local_ns);
+                    node->last_csi_rep_sf = node->current_sf_seq;
+                    node->csi_obs_pending = false;
+                    node->gw_tx_total++;
+                    goto tdma_slot_done;
+                }
+            }
             on_data_payload_t dp;
             if (node->harq_retry_pending) {
                 dp = node->last_tx_data;
@@ -2260,6 +2305,37 @@ tdma_slot_done: ;
                     send_frame(node, &hdr, bbuf, blen, now_local_ns);
                     node->last_ble_rep_sf = node->current_sf_seq;
                     node->ble_obs_count   = 0u;
+                    node->gw_tx_total++;
+                    goto sub_tdma_slot_done;
+                }
+            }
+            if (node->rssi_report_enabled && !node->harq_retry_pending &&
+                node->tdma_tx_total > 0u && node->csi_obs_pending &&
+                (node->current_sf_seq - node->last_csi_rep_sf) >= 64u) {
+                on_gw_bridge_msg_t crep;
+                memset(&crep, 0, sizeof(crep));
+                crep.bridge_type = (uint8_t)ON_GW_MSG_CSI_REPORT;
+                crep.flags       = ON_GW_FLAG_RELAYED_2HOP;
+                crep.origin_id   = node->short_id;
+                crep.seq         = ++node->data_tx_seq;
+                crep.payload[0]  = node->csi_obs_score;
+                memcpy(&crep.payload[1], node->csi_obs_bins, 16u);
+                crep.payload_len = 17u;
+                uint8_t cbuf[ON_GW_BRIDGE_HDR_LEN + 20u];
+                size_t clen = 0u;
+                if (on_gw_bridge_pack(&crep, cbuf, sizeof(cbuf), &clen) == ON_OK) {
+                    on_mac_hdr_t hdr;
+                    memset(&hdr, 0, sizeof(hdr));
+                    hdr.version    = ON_PROTO_VERSION;
+                    hdr.type       = (uint8_t)ON_FRAME_GW_BRIDGE;
+                    hdr.is_sub_g   = true;
+                    hdr.src_id     = node->short_id;
+                    hdr.dst_id     = node->parent_id;
+                    hdr.sf_seq_low = (uint8_t)(node->current_sf_seq & 0x0Fu);
+                    hdr.slot_idx   = node->my_slot;
+                    send_frame(node, &hdr, cbuf, clen, now_local_ns);
+                    node->last_csi_rep_sf = node->current_sf_seq;
+                    node->csi_obs_pending = false;
                     node->gw_tx_total++;
                     goto sub_tdma_slot_done;
                 }
@@ -3137,4 +3213,39 @@ void on_node_report_ble_beacon(on_node_t *node, const uint8_t tag_mac48[6],
     node->ble_obs[idx].source          = source;
     node->ble_obs[idx].tx_power_1m_dbm = tx_power_1m_dbm;
     node->ble_obs[idx].rssi_dbm        = rssi_dbm;
+}
+
+void on_node_set_csi_observer(on_node_t *node,
+                              void (*cb)(void *ctx, uint16_t anchor_id,
+                                         uint8_t motion_score, const uint8_t bins16[16]),
+                              void *user_ctx) {
+    if (!node) return;
+    node->on_csi_observed = cb;
+    node->csi_obs_ctx     = user_ctx;
+}
+
+void on_node_report_csi(on_node_t *node, uint8_t motion_score, const uint8_t bins16[16]) {
+    if (!node) return;
+    if (motion_score > 100u) motion_score = 100u;
+    uint8_t synth[16];
+    const uint8_t *use_bins = bins16;
+    if (!use_bins) {
+        for (uint8_t i = 0u; i < 16u; ++i) {
+            int32_t v = (int32_t)motion_score + (int32_t)((i & 3u) * 4u) - 6;
+            if (v < 2) v = 2;
+            if (v > 100) v = 100;
+            synth[i] = (uint8_t)v;
+        }
+        use_bins = synth;
+    }
+    if (node->role == ON_ROLE_G) {
+        if (node->on_csi_observed) {
+            node->on_csi_observed(node->csi_obs_ctx, node->short_id, motion_score, use_bins);
+        }
+        return;
+    }
+    node->rssi_report_enabled = true;
+    node->csi_obs_score = motion_score;
+    memcpy(node->csi_obs_bins, use_bins, 16u);
+    node->csi_obs_pending = true;
 }

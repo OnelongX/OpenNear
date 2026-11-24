@@ -498,9 +498,424 @@ static void loc_fmt_mac(const uint8_t m[6], char out[18]) {
              (unsigned)m[3], (unsigned)m[4], (unsigned)m[5]);
 }
 
+/* ========================================================================== */
+/* v7.2 IEEE 802.11bf Wi-Fi CSI Subcarrier Analyzer & Passive Presence Radar  */
+/* ========================================================================== */
+
+uint8_t on_csi_extract_iq_score(const int8_t *iq_buf, uint16_t iq_len, bool skip_first_word,
+                                float *inout_baseline, float *inout_var_ema,
+                                uint8_t out_bins16[ON_LOC_CSI_BINS]) {
+    if (out_bins16) memset(out_bins16, 0, ON_LOC_CSI_BINS);
+    if (!iq_buf || iq_len < 12u) return 0u;
+
+    uint16_t off = (skip_first_word && iq_len > 16u) ? 4u : 0u;
+    uint16_t pairs = (uint16_t)((iq_len - off) / 2u);
+    if (pairs < 4u) return 0u;
+
+    float bin_sum[ON_LOC_CSI_BINS];
+    uint16_t bin_cnt[ON_LOC_CSI_BINS];
+    memset(bin_sum, 0, sizeof(bin_sum));
+    memset(bin_cnt, 0, sizeof(bin_cnt));
+
+    float total_amp = 0.0f;
+    float total_sq  = 0.0f;
+    for (uint16_t k = 0u; k < pairs; ++k) {
+        float im = (float)iq_buf[off + k * 2u];
+        float re = (float)iq_buf[off + k * 2u + 1u];
+        float amp = sqrtf(re * re + im * im);
+        total_amp += amp;
+        total_sq  += amp * amp;
+        uint16_t b = (uint16_t)((k * ON_LOC_CSI_BINS) / pairs);
+        if (b >= ON_LOC_CSI_BINS) b = ON_LOC_CSI_BINS - 1u;
+        bin_sum[b] += amp;
+        bin_cnt[b]++;
+    }
+
+    float mean_amp = total_amp / (float)pairs;
+    float spatial_var = (total_sq / (float)pairs) - (mean_amp * mean_amp);
+    if (spatial_var < 0.0f) spatial_var = 0.0f;
+    float spatial_std = sqrtf(spatial_var);
+
+    if (out_bins16) {
+        for (uint16_t b = 0u; b < ON_LOC_CSI_BINS; ++b) {
+            float avg = (bin_cnt[b] > 0u) ? (bin_sum[b] / (float)bin_cnt[b]) : 0.0f;
+            int32_t scaled = (int32_t)lroundf(avg * 2.2f);
+            if (scaled < 0) scaled = 0;
+            if (scaled > 100) scaled = 100;
+            out_bins16[b] = (uint8_t)scaled;
+        }
+    }
+
+    float temporal_delta = 0.0f;
+    if (inout_baseline) {
+        if (*inout_baseline <= 0.01f) {
+            *inout_baseline = mean_amp;
+        } else {
+            temporal_delta = fabsf(mean_amp - *inout_baseline);
+            *inout_baseline = 0.92f * (*inout_baseline) + 0.08f * mean_amp;
+        }
+    }
+
+    /* Combine temporal amplitude drift + frequency-selective subcarrier std dispersion */
+    float raw_metric = temporal_delta * 7.5f + spatial_std * 2.6f;
+    if (inout_var_ema) {
+        if (*inout_var_ema <= 0.01f) {
+            *inout_var_ema = raw_metric;
+        } else {
+            float alpha = (raw_metric > *inout_var_ema) ? 0.45f : 0.18f;
+            *inout_var_ema = (1.0f - alpha) * (*inout_var_ema) + alpha * raw_metric;
+        }
+        raw_metric = *inout_var_ema;
+    }
+
+    int32_t score = (int32_t)lroundf(raw_metric);
+    if (score < 0) score = 0;
+    if (score > 100) score = 100;
+    return (uint8_t)score;
+}
+
+on_err_t on_loc_observe_csi(on_loc_ctx_t *ctx, const uint8_t anchor_mac48[6],
+                            uint16_t anchor_short_id, uint8_t motion_score,
+                            const uint8_t bins16[ON_LOC_CSI_BINS], uint32_t now_ms) {
+    if (!ctx) return ON_ERR_INVALID_ARG;
+    int aidx = -1;
+    if (loc_mac_nonzero(anchor_mac48)) {
+        aidx = find_anchor_idx(ctx, anchor_mac48);
+    }
+    if (aidx < 0 && anchor_short_id != ON_SHORT_ID_UNASSIGNED) {
+        for (uint32_t i = 0u; i < ON_LOC_MAX_ANCHORS; ++i) {
+            if (ctx->anchors[i].active && ctx->anchors[i].short_id == anchor_short_id) {
+                aidx = (int)i;
+                break;
+            }
+        }
+    }
+    if (aidx < 0) return ON_ERR_NOT_READY;
+
+    on_loc_anchor_t *a = &ctx->anchors[aidx];
+    if (anchor_short_id != ON_SHORT_ID_UNASSIGNED) {
+        a->short_id = anchor_short_id & ON_SHORT_ID_MASK;
+    }
+    if (motion_score > 100u) motion_score = 100u;
+
+    /* Fast attack, smooth decay EMA for room motion score */
+    if (a->csi_last_ms == 0u) {
+        a->csi_motion_score = motion_score;
+    } else {
+        uint16_t prev = a->csi_motion_score;
+        if (motion_score >= prev) {
+            a->csi_motion_score = (uint8_t)((prev * 2u + (uint16_t)motion_score * 3u + 2u) / 5u);
+        } else {
+            a->csi_motion_score = (uint8_t)((prev * 3u + (uint16_t)motion_score * 2u + 2u) / 5u);
+        }
+    }
+
+    if (a->csi_motion_score >= 45u) {
+        a->csi_presence = (uint8_t)ON_CSI_STATE_MOVING;
+    } else if (a->csi_motion_score >= 15u) {
+        a->csi_presence = (uint8_t)ON_CSI_STATE_STATIC;
+    } else {
+        a->csi_presence = (uint8_t)ON_CSI_STATE_EMPTY;
+    }
+
+    if (bins16) {
+        for (uint32_t b = 0u; b < ON_LOC_CSI_BINS; ++b) {
+            a->csi_bins[b] = (bins16[b] <= 100u) ? bins16[b] : 100u;
+        }
+    } else {
+        /* Synthesize smooth 16-subcarrier envelope from motion_score when not supplied */
+        for (uint32_t b = 0u; b < ON_LOC_CSI_BINS; ++b) {
+            int32_t wave = (int32_t)a->csi_motion_score + (int32_t)((b & 3u) * 4u) - 6;
+            if (wave < 2) wave = 2;
+            if (wave > 100) wave = 100;
+            a->csi_bins[b] = (uint8_t)wave;
+        }
+    }
+    a->csi_last_ms = now_ms;
+    return ON_OK;
+}
+
+/* ========================================================================== */
+/* v7.2 Offline 2D Circular Geofence & Spatial / CSI Automation Rule Engine   */
+/* ========================================================================== */
+
+on_err_t on_loc_set_geofence(on_loc_ctx_t *ctx, const char *name,
+                             int32_t x_cm, int32_t y_cm, uint16_t radius_cm) {
+    if (!ctx || !name || name[0] == '\0') return ON_ERR_INVALID_ARG;
+    char clean_name[ON_LOC_ROOM_MAX_LEN];
+    copy_room(clean_name, name);
+    if (clean_name[0] == '\0') return ON_ERR_INVALID_ARG;
+
+    int found = -1;
+    int empty = -1;
+    for (uint32_t i = 0u; i < ON_LOC_MAX_GEOFENCES; ++i) {
+        if (ctx->fences[i].active && strcmp(ctx->fences[i].name, clean_name) == 0) {
+            found = (int)i;
+            break;
+        }
+        if (!ctx->fences[i].active && empty < 0) empty = (int)i;
+    }
+
+    if (radius_cm == 0u) {
+        if (found >= 0) memset(&ctx->fences[found], 0, sizeof(ctx->fences[found]));
+        return ON_OK;
+    }
+
+    int slot = (found >= 0) ? found : empty;
+    if (slot < 0) return ON_ERR_NO_MEM;
+    on_loc_geofence_t *f = &ctx->fences[slot];
+    f->active    = true;
+    copy_room(f->name, clean_name);
+    f->x_cm      = x_cm;
+    f->y_cm      = y_cm;
+    f->radius_cm = radius_cm;
+    return ON_OK;
+}
+
+bool on_loc_check_geofence(const on_loc_ctx_t *ctx, int32_t x_cm, int32_t y_cm,
+                           const char *fence_name) {
+    if (!ctx || !fence_name || fence_name[0] == '\0') return false;
+    for (uint32_t i = 0u; i < ON_LOC_MAX_GEOFENCES; ++i) {
+        const on_loc_geofence_t *f = &ctx->fences[i];
+        if (!f->active || strcmp(f->name, fence_name) != 0) continue;
+        int64_t dx = (int64_t)x_cm - (int64_t)f->x_cm;
+        int64_t dy = (int64_t)y_cm - (int64_t)f->y_cm;
+        int64_t r  = (int64_t)f->radius_cm;
+        return (dx * dx + dy * dy) <= (r * r);
+    }
+    return false;
+}
+
+on_err_t on_loc_set_rule(on_loc_ctx_t *ctx, uint8_t rule_id, uint8_t trig_type,
+                         const char *zone, uint8_t csi_threshold,
+                         const char *cmd_tag, const char *cmd_payload) {
+    if (!ctx || rule_id == 0u || rule_id > ON_LOC_MAX_RULES) return ON_ERR_INVALID_ARG;
+    on_loc_rule_t *r = &ctx->rules[rule_id - 1u];
+    if (trig_type == 0u) {
+        memset(r, 0, sizeof(*r));
+        return ON_OK;
+    }
+    if (trig_type > (uint8_t)ON_RULE_TRIG_CSI_QUIET || !zone || zone[0] == '\0' ||
+        !cmd_payload || cmd_payload[0] == '\0') {
+        return ON_ERR_INVALID_ARG;
+    }
+    memset(r, 0, sizeof(*r));
+    r->active        = true;
+    r->id            = rule_id;
+    r->trig_type     = trig_type;
+    copy_room(r->zone, zone);
+    r->csi_threshold = (csi_threshold > 0u && csi_threshold <= 100u) ? csi_threshold : 40u;
+    copy_sanitized(r->cmd_tag, sizeof(r->cmd_tag), (cmd_tag && cmd_tag[0]) ? cmd_tag : "*");
+    copy_sanitized(r->cmd_payload, sizeof(r->cmd_payload), cmd_payload);
+    return ON_OK;
+}
+
+uint32_t on_loc_evaluate_rules(on_loc_ctx_t *ctx, uint32_t now_ms,
+                               void (*on_fire)(void *user_ctx, const on_loc_rule_t *rule),
+                               void *user_ctx) {
+    if (!ctx) return 0u;
+
+    /* Solve all active targets once */
+    on_loc_estimate_t ests[ON_LOC_MAX_TARGETS];
+    uint32_t est_cnt = 0u;
+    for (uint32_t i = 0u; i < ON_LOC_MAX_TARGETS; ++i) {
+        if (!ctx->targets[i].active) continue;
+        if (on_loc_solve(ctx, ctx->targets[i].mac48, now_ms, &ests[est_cnt])) {
+            est_cnt++;
+        }
+    }
+
+    /* Update geofence occupancy flags */
+    for (uint32_t fi = 0u; fi < ON_LOC_MAX_GEOFENCES; ++fi) {
+        on_loc_geofence_t *f = &ctx->fences[fi];
+        if (!f->active) continue;
+        bool inside = false;
+        for (uint32_t ti = 0u; ti < est_cnt; ++ti) {
+            if (on_loc_check_geofence(ctx, ests[ti].x_cm, ests[ti].y_cm, f->name)) {
+                inside = true;
+                break;
+            }
+        }
+        f->occupied = inside;
+    }
+
+    uint32_t fired = 0u;
+    for (uint32_t ri = 0u; ri < ON_LOC_MAX_RULES; ++ri) {
+        on_loc_rule_t *r = &ctx->rules[ri];
+        if (!r->active) continue;
+
+        bool cond = false;
+        switch ((on_loc_rule_trig_t)r->trig_type) {
+            case ON_RULE_TRIG_ENTER_ROOM:
+                for (uint32_t ti = 0u; ti < est_cnt; ++ti) {
+                    if (strcmp(ests[ti].room, r->zone) == 0) { cond = true; break; }
+                }
+                break;
+            case ON_RULE_TRIG_LEAVE_ROOM:
+                if (est_cnt > 0u) {
+                    cond = true;
+                    for (uint32_t ti = 0u; ti < est_cnt; ++ti) {
+                        if (strcmp(ests[ti].room, r->zone) == 0) { cond = false; break; }
+                    }
+                }
+                break;
+            case ON_RULE_TRIG_IN_FENCE:
+                for (uint32_t ti = 0u; ti < est_cnt; ++ti) {
+                    if (on_loc_check_geofence(ctx, ests[ti].x_cm, ests[ti].y_cm, r->zone)) {
+                        cond = true;
+                        break;
+                    }
+                }
+                break;
+            case ON_RULE_TRIG_OUT_FENCE:
+                if (est_cnt > 0u) {
+                    cond = true;
+                    for (uint32_t ti = 0u; ti < est_cnt; ++ti) {
+                        if (on_loc_check_geofence(ctx, ests[ti].x_cm, ests[ti].y_cm, r->zone)) {
+                            cond = false;
+                            break;
+                        }
+                    }
+                }
+                break;
+            case ON_RULE_TRIG_CSI_MOTION:
+                for (uint32_t ai = 0u; ai < ON_LOC_MAX_ANCHORS; ++ai) {
+                    const on_loc_anchor_t *a = &ctx->anchors[ai];
+                    if (!a->active || strcmp(a->room, r->zone) != 0) continue;
+                    if (now_ms >= a->csi_last_ms && (now_ms - a->csi_last_ms) <= ON_LOC_OBS_STALE_MS &&
+                        a->csi_motion_score >= r->csi_threshold) {
+                        cond = true;
+                        break;
+                    }
+                }
+                break;
+            case ON_RULE_TRIG_CSI_QUIET:
+                for (uint32_t ai = 0u; ai < ON_LOC_MAX_ANCHORS; ++ai) {
+                    const on_loc_anchor_t *a = &ctx->anchors[ai];
+                    if (!a->active || strcmp(a->room, r->zone) != 0) continue;
+                    if (a->csi_last_ms > 0u &&
+                        now_ms >= a->csi_last_ms && (now_ms - a->csi_last_ms) <= ON_LOC_OBS_STALE_MS &&
+                        a->csi_motion_score < r->csi_threshold) {
+                        cond = true;
+                        break;
+                    }
+                }
+                break;
+            default:
+                break;
+        }
+
+        if (cond && !r->last_cond_met) {
+            bool cooled = (r->last_fired_ms == 0u) ||
+                          (now_ms >= r->last_fired_ms && (now_ms - r->last_fired_ms) >= ON_LOC_RULE_COOLDOWN_MS);
+            if (cooled) {
+                r->fire_count++;
+                r->last_fired_ms = now_ms;
+                ctx->last_fired_rule_id = r->id;
+                snprintf(ctx->last_fired_summary, sizeof(ctx->last_fired_summary),
+                         "R#%u [%s] -> %s|%s",
+                         (unsigned)r->id, r->zone, r->cmd_tag, r->cmd_payload);
+                if (on_fire) on_fire(user_ctx, r);
+                fired++;
+            }
+        }
+        r->last_cond_met = cond;
+    }
+    return fired;
+}
+
+/* ========================================================================== */
+/* v7.2 Out-of-the-Box 4-Room + Geofence + Wi-Fi CSI Showcase Demo            */
+/* ========================================================================== */
+
+void on_loc_load_demo_preset(on_loc_ctx_t *ctx, const uint8_t gw_mac48[6], uint32_t now_ms) {
+    if (!ctx) return;
+    uint8_t m0[6] = { 0xA4u, 0xCFu, 0x12u, 0x72u, 0x00u, 0x01u };
+    if (loc_mac_nonzero(gw_mac48)) memcpy(m0, gw_mac48, 6u);
+    const uint8_t m1[6] = { 0xA4u, 0xCFu, 0x12u, 0x72u, 0x00u, 0x02u };
+    const uint8_t m2[6] = { 0xA4u, 0xCFu, 0x12u, 0x72u, 0x00u, 0x03u };
+    const uint8_t m3[6] = { 0xA4u, 0xCFu, 0x12u, 0x72u, 0x00u, 0x04u };
+
+    on_loc_set_anchor(ctx, m0, 0x001u, "Living",  0,   0);
+    on_loc_set_anchor(ctx, m1, 0x002u, "Study",   500, 0);
+    on_loc_set_anchor(ctx, m2, 0x003u, "Bedroom", 500, 360);
+    on_loc_set_anchor(ctx, m3, 0x004u, "Kitchen", 0,   360);
+
+    on_loc_set_geofence(ctx, "StudyDesk",   470, 50,  140u);
+    on_loc_set_geofence(ctx, "KitchenZone", 50,  330, 120u);
+
+    on_loc_set_rule(ctx, 1u, (uint8_t)ON_RULE_TRIG_ENTER_ROOM, "Study",       40u, "Study",   "RELAY:1");
+    on_loc_set_rule(ctx, 2u, (uint8_t)ON_RULE_TRIG_IN_FENCE,   "KitchenZone", 40u, "Kitchen", "MODE:STROBE");
+    on_loc_set_rule(ctx, 3u, (uint8_t)ON_RULE_TRIG_CSI_MOTION, "Living",      45u, "Living",  "MODE:PULSE");
+    on_loc_set_rule(ctx, 4u, (uint8_t)ON_RULE_TRIG_CSI_QUIET,  "Living",      15u, "Living",  "MODE:SYNC");
+
+    on_loc_step_demo(ctx, 0u, now_ms);
+}
+
+void on_loc_step_demo(on_loc_ctx_t *ctx, uint32_t step_idx, uint32_t now_ms) {
+    if (!ctx) return;
+    /* Ensure at least 4 active anchors exist */
+    uint32_t acnt = 0u;
+    for (uint32_t i = 0u; i < ON_LOC_MAX_ANCHORS; ++i) {
+        if (ctx->anchors[i].active) acnt++;
+    }
+    if (acnt == 0u) {
+        on_loc_load_demo_preset(ctx, NULL, now_ms);
+        return;
+    }
+
+    /* 4-stage demo trajectory for virtual iBeacon badge & cat collar + Wi-Fi CSI wave */
+    static const int32_t kBadgeWaypoints[4][2] = {
+        { 90,  70  }, /* Stage 0: Living Room (CSI high motion = 72) */
+        { 460, 40  }, /* Stage 1: Study Desk Geofence (triggers Rule #1 RELAY:1) */
+        { 450, 310 }, /* Stage 2: Bedroom (Living CSI quiet = 8 -> triggers Rule #4 MODE:SYNC) */
+        { 40,  330 }  /* Stage 3: Kitchen Forbidden Geofence (triggers Rule #2 MODE:STROBE) */
+    };
+    static const uint8_t kLivingCsi[4] = { 76u, 28u, 8u, 58u };
+    static const uint8_t kStudyCsi[4]  = { 10u, 64u, 22u, 12u };
+
+    uint32_t st = step_idx & 3u;
+    double tx = (double)kBadgeWaypoints[st][0];
+    double ty = (double)kBadgeWaypoints[st][1];
+    const uint8_t badge_mac[6] = { 0x02u, 0xD7u, 0x03u, 0xE9u, 0x00u, 0x58u };
+
+    /* Reset previous demo target smoothing so each stage snaps cleanly to the new room/geofence */
+    for (uint32_t ti = 0u; ti < ON_LOC_MAX_TARGETS; ++ti) {
+        if (ctx->targets[ti].active && memcmp(ctx->targets[ti].mac48, badge_mac, 6u) == 0) {
+            ctx->targets[ti].pos_inited = false;
+            memset(ctx->targets[ti].obs, 0, sizeof(ctx->targets[ti].obs));
+            break;
+        }
+    }
+
+    /* Feed multi-anchor RSSI samples so median+EMA converges smoothly to waypoint */
+    for (uint32_t rep = 0u; rep < 3u; ++rep) {
+        for (uint32_t i = 0u; i < ON_LOC_MAX_ANCHORS; ++i) {
+            on_loc_anchor_t *a = &ctx->anchors[i];
+            if (!a->active) continue;
+            double dx = (tx - (double)a->x_cm) / 100.0;
+            double dy = (ty - (double)a->y_cm) / 100.0;
+            double dm = sqrt(dx * dx + dy * dy);
+            if (dm < 0.25) dm = 0.25;
+            int8_t rssi = (int8_t)lroundf(-59.0f - 10.0f * 2.5f * log10f((float)dm));
+            on_loc_observe_beacon(ctx, a->mac48, badge_mac, ON_LOC_SRC_IBEACON,
+                                  -59, rssi, "iB:DemoBadge", now_ms);
+        }
+    }
+
+    /* Update Wi-Fi CSI scores across anchors */
+    for (uint32_t i = 0u; i < ON_LOC_MAX_ANCHORS; ++i) {
+        on_loc_anchor_t *a = &ctx->anchors[i];
+        if (!a->active) continue;
+        uint8_t csi = (i == 0u) ? kLivingCsi[st] : ((i == 1u) ? kStudyCsi[st] : (uint8_t)(12u + ((st + i) * 14u) % 45u));
+        a->csi_last_ms = 0u;
+        on_loc_observe_csi(ctx, a->mac48, a->short_id, csi, NULL, now_ms);
+    }
+}
+
 size_t on_loc_format_json(on_loc_ctx_t *ctx, uint32_t now_ms,
                           char *out_buf, size_t out_cap) {
-    if (!ctx || !out_buf || out_cap < 64u) return 0u;
+    if (!ctx || !out_buf || out_cap < 128u) return 0u;
     int pos = snprintf(out_buf, out_cap, "{\"anchors\":[");
     if (pos <= 0 || (size_t)pos >= out_cap) return 0u;
 
@@ -510,11 +925,21 @@ size_t on_loc_format_json(on_loc_ctx_t *ctx, uint32_t now_ms,
         if (!a->active) continue;
         char mac_s[18];
         loc_fmt_mac(a->mac48, mac_s);
+        uint8_t csi_val = (a->csi_last_ms > 0u && now_ms >= a->csi_last_ms &&
+                           (now_ms - a->csi_last_ms) <= ON_LOC_OBS_STALE_MS)
+                          ? a->csi_motion_score : 0u;
+        uint8_t csi_st  = (csi_val >= 45u) ? 2u : ((csi_val >= 15u) ? 1u : 0u);
         int n = snprintf(out_buf + pos, out_cap - (size_t)pos,
-                         "%s{\"mac\":\"%s\",\"id\":\"0x%03X\",\"room\":\"%s\",\"x_cm\":%ld,\"y_cm\":%ld}",
+                         "%s{\"mac\":\"%s\",\"id\":\"0x%03X\",\"room\":\"%s\","
+                         "\"x_cm\":%ld,\"y_cm\":%ld,\"csi\":%u,\"csi_st\":%u,\"bins\":[%u,%u,%u,%u,%u,%u,%u,%u]}",
                          first ? "" : ",", mac_s, (unsigned)a->short_id,
-                         a->room, (long)a->x_cm, (long)a->y_cm);
-        if (n <= 0 || (size_t)(pos + n) >= out_cap - 32u) break;
+                         a->room, (long)a->x_cm, (long)a->y_cm,
+                         (unsigned)csi_val, (unsigned)csi_st,
+                         (unsigned)a->csi_bins[0],  (unsigned)a->csi_bins[2],
+                         (unsigned)a->csi_bins[4],  (unsigned)a->csi_bins[6],
+                         (unsigned)a->csi_bins[8],  (unsigned)a->csi_bins[10],
+                         (unsigned)a->csi_bins[12], (unsigned)a->csi_bins[14]);
+        if (n <= 0 || (size_t)(pos + n) >= out_cap - 96u) break;
         pos += n;
         first = false;
     }
@@ -538,12 +963,50 @@ size_t on_loc_format_json(on_loc_ctx_t *ctx, uint32_t now_ms,
                          loc_src_name(est.source), est.label, (int)est.tx_power_1m_dbm,
                          est.room, (long)est.x_cm, (long)est.y_cm, (int)est.best_rssi_dbm,
                          (unsigned)est.anchor_count, (unsigned)est.est_err_cm);
-        if (n <= 0 || (size_t)(pos + n) >= out_cap - 8u) break;
+        if (n <= 0 || (size_t)(pos + n) >= out_cap - 96u) break;
         pos += n;
         first = false;
     }
 
-    int tail = snprintf(out_buf + pos, out_cap - (size_t)pos, "]}");
+    int fm = snprintf(out_buf + pos, out_cap - (size_t)pos, "],\"fences\":[");
+    if (fm <= 0 || (size_t)(pos + fm) >= out_cap) return 0u;
+    pos += fm;
+
+    first = true;
+    for (uint32_t i = 0u; i < ON_LOC_MAX_GEOFENCES; ++i) {
+        const on_loc_geofence_t *f = &ctx->fences[i];
+        if (!f->active) continue;
+        int n = snprintf(out_buf + pos, out_cap - (size_t)pos,
+                         "%s{\"name\":\"%s\",\"x_cm\":%ld,\"y_cm\":%ld,\"r_cm\":%u,\"in\":%u}",
+                         first ? "" : ",", f->name, (long)f->x_cm, (long)f->y_cm,
+                         (unsigned)f->radius_cm, f->occupied ? 1u : 0u);
+        if (n <= 0 || (size_t)(pos + n) >= out_cap - 64u) break;
+        pos += n;
+        first = false;
+    }
+
+    int rm = snprintf(out_buf + pos, out_cap - (size_t)pos, "],\"rules\":[");
+    if (rm <= 0 || (size_t)(pos + rm) >= out_cap) return 0u;
+    pos += rm;
+
+    first = true;
+    for (uint32_t i = 0u; i < ON_LOC_MAX_RULES; ++i) {
+        const on_loc_rule_t *r = &ctx->rules[i];
+        if (!r->active) continue;
+        int n = snprintf(out_buf + pos, out_cap - (size_t)pos,
+                         "%s{\"id\":%u,\"trig\":%u,\"zone\":\"%s\",\"th\":%u,"
+                         "\"tag\":\"%s\",\"cmd\":\"%s\",\"on\":%u,\"fires\":%u}",
+                         first ? "" : ",", (unsigned)r->id, (unsigned)r->trig_type,
+                         r->zone, (unsigned)r->csi_threshold,
+                         r->cmd_tag, r->cmd_payload,
+                         r->last_cond_met ? 1u : 0u, (unsigned)r->fire_count);
+        if (n <= 0 || (size_t)(pos + n) >= out_cap - 48u) break;
+        pos += n;
+        first = false;
+    }
+
+    int tail = snprintf(out_buf + pos, out_cap - (size_t)pos, "],\"last_evt\":\"%s\"}",
+                        ctx->last_fired_summary);
     if (tail <= 0 || (size_t)(pos + tail) >= out_cap) return 0u;
     return (size_t)(pos + tail);
 }

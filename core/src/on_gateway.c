@@ -484,6 +484,86 @@ on_err_t on_gw_handle_control_text(on_gw_ctx_t *gw, const char *text, size_t len
         return ON_OK;
     }
 
+    /* Format 15: FENCE:<name>|<x_cm>|<y_cm>|<radius_cm> (radius_cm == 0 removes fence) */
+    if (clean_len > 6u && memcmp(text, "FENCE:", 6u) == 0) {
+        const char *p1 = text + 6;
+        const char *b1 = find_sep(p1, end, '|');
+        if (!b1 || b1 == p1) return ON_ERR_INVALID_ARG;
+        copy_cstr(gw->cfg.fence_name, sizeof(gw->cfg.fence_name), p1, (size_t)(b1 - p1));
+        gw->cfg.fence_x_cm      = 0;
+        gw->cfg.fence_y_cm      = 0;
+        gw->cfg.fence_radius_cm = 0u;
+        const char *p2 = b1 + 1;
+        const char *b2 = find_sep(p2, end, '|');
+        char nbuf[16];
+        copy_cstr(nbuf, sizeof(nbuf), p2, (size_t)((b2 ? b2 : end) - p2));
+        gw->cfg.fence_x_cm = (int32_t)strtol(nbuf, NULL, 10);
+        if (b2) {
+            const char *p3 = b2 + 1;
+            const char *b3 = find_sep(p3, end, '|');
+            copy_cstr(nbuf, sizeof(nbuf), p3, (size_t)((b3 ? b3 : end) - p3));
+            gw->cfg.fence_y_cm = (int32_t)strtol(nbuf, NULL, 10);
+            if (b3) {
+                copy_cstr(nbuf, sizeof(nbuf), b3 + 1, (size_t)(end - (b3 + 1)));
+                long r = strtol(nbuf, NULL, 10);
+                gw->cfg.fence_radius_cm = (r > 0 && r <= 30000) ? (uint16_t)r : 0u;
+            }
+        }
+        gw->cfg.fence_updated = true;
+        return ON_OK;
+    }
+
+    /* Format 16: RULE:<id>|<trig>|<zone>|<csi_th>|<tag>|<cmd> (trig == 0 removes rule) */
+    if (clean_len > 5u && memcmp(text, "RULE:", 5u) == 0) {
+        const char *p1 = text + 5;
+        const char *b1 = find_sep(p1, end, '|');
+        if (!b1 || b1 == p1) return ON_ERR_INVALID_ARG;
+        char nbuf[16];
+        copy_cstr(nbuf, sizeof(nbuf), p1, (size_t)(b1 - p1));
+        unsigned long rid = strtoul(nbuf, NULL, 10);
+        if (rid == 0u || rid > 8u) return ON_ERR_INVALID_ARG;
+        const char *p2 = b1 + 1;
+        const char *b2 = find_sep(p2, end, '|');
+        copy_cstr(nbuf, sizeof(nbuf), p2, (size_t)((b2 ? b2 : end) - p2));
+        unsigned long trig = strtoul(nbuf, NULL, 10);
+        if (trig > 6u) return ON_ERR_INVALID_ARG;
+        gw->cfg.rule_id           = (uint8_t)rid;
+        gw->cfg.rule_trig_type    = (uint8_t)trig;
+        gw->cfg.rule_zone[0]      = '\0';
+        gw->cfg.rule_csi_thresh   = 40u;
+        gw->cfg.rule_cmd_tag[0]   = '\0';
+        gw->cfg.rule_cmd_payload[0] = '\0';
+        if (trig > 0u) {
+            if (!b2) return ON_ERR_INVALID_ARG;
+            const char *p3 = b2 + 1;
+            const char *b3 = find_sep(p3, end, '|');
+            if (!b3 || b3 == p3) return ON_ERR_INVALID_ARG;
+            copy_cstr(gw->cfg.rule_zone, sizeof(gw->cfg.rule_zone), p3, (size_t)(b3 - p3));
+            const char *p4 = b3 + 1;
+            const char *b4 = find_sep(p4, end, '|');
+            if (!b4) return ON_ERR_INVALID_ARG;
+            copy_cstr(nbuf, sizeof(nbuf), p4, (size_t)(b4 - p4));
+            unsigned long th = strtoul(nbuf, NULL, 10);
+            gw->cfg.rule_csi_thresh = (th > 0u && th <= 100u) ? (uint8_t)th : 40u;
+            const char *p5 = b4 + 1;
+            const char *b5 = find_sep(p5, end, '|');
+            if (!b5 || b5 + 1 >= end) return ON_ERR_INVALID_ARG;
+            copy_cstr(gw->cfg.rule_cmd_tag, sizeof(gw->cfg.rule_cmd_tag), p5, (size_t)(b5 - p5));
+            copy_cstr(gw->cfg.rule_cmd_payload, sizeof(gw->cfg.rule_cmd_payload), b5 + 1, (size_t)(end - (b5 + 1)));
+        }
+        gw->cfg.rule_updated = true;
+        return ON_OK;
+    }
+
+    /* Format 17: LOCDEMO:<0|1|2> -> Start/stop/step 4-Room Geofence + Wi-Fi CSI Showcase Demo */
+    if (clean_len >= 9u && memcmp(text, "LOCDEMO:", 8u) == 0) {
+        char c = text[8];
+        if (c < '0' || c > '2') return ON_ERR_INVALID_ARG;
+        gw->cfg.loc_demo_mode    = (uint8_t)(c - '0');
+        gw->cfg.loc_demo_updated = true;
+        return ON_OK;
+    }
+
     return ON_ERR_INVALID_ARG;
 }
 

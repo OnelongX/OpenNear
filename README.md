@@ -5,14 +5,14 @@
 **零历史包袱、从零设计的开源类星闪（NearLink-Class）确定性无线协议栈与万物互联混合 Mesh 平台**
 
 [![OpenNear CI](https://github.com/OnelongX/OpenNear/actions/workflows/ci.yml/badge.svg)](https://github.com/OnelongX/OpenNear/actions/workflows/ci.yml)
-![Version](https://img.shields.io/badge/version-v7.1-0ea5e9?style=flat)
+![Version](https://img.shields.io/badge/version-v7.2-0ea5e9?style=flat)
 ![Core](https://img.shields.io/badge/core-Pure%20C11%20%7C%20Zero%20Deps-10b981?style=flat)
-![Tests](https://img.shields.io/badge/tests-41%20Suites%20%7C%20488%20Assertions-22c55e?style=flat)
+![Tests](https://img.shields.io/badge/tests-42%20Suites%20%7C%20505%20Assertions-22c55e?style=flat)
 ![Platforms](https://img.shields.io/badge/hardware-ESP32%20%7C%20nRF52840%20%7C%20FPGA%20RTL-8b5cf6?style=flat)
 [![Web Flasher](https://img.shields.io/badge/ESP32%20Web%20Flasher-%E4%B8%80%E9%94%AE%E5%9C%A8%E7%BA%BF%E5%88%B7%E6%9C%BA-f97316?style=flat)](https://onelongx.github.io/OpenNear/)
 ![License](https://img.shields.io/badge/license-MIT-f59e0b?style=flat)
 
-**亚微秒全网同步 · 6 字节极简帧头 · 零投票热备秒切 · 无主冷启动 · 1~6 跳混合 Mesh · 256 节点 Epoch-TDMA · 多锚点 RSSI + BLE iBeacon/Eddystone 室内定位 & 动态 Tag · 多跳加密 OTA · 浏览器一键刷机 · MQTTS/TLS & Home Assistant**
+**亚微秒全网同步 · 6 字节极简帧头 · 零投票热备秒切 · 无主冷启动 · 1~6 跳混合 Mesh · 256 节点 Epoch-TDMA · 多锚点 RSSI + BLE iBeacon/Eddystone 室内定位 · 纯 ESP32 离线电子围栏 & Wi-Fi CSI 隔空感知雷达 · 多跳加密 OTA · 浏览器一键刷机 · MQTTS/TLS & Home Assistant**
 
 > ⚡ **零门槛 30 秒体验**：插上 15 块钱 ESP32-WROOM-32，直接用 Chrome / Edge 打开 **[OpenNear 在线刷机台](https://onelongx.github.io/OpenNear/)**（基于 ESP Web Tools + GitHub Pages 自动构建），无需安装任何编译器即可一键烧录网关与多板同步灯光/遥测演示节点！
 
@@ -26,14 +26,14 @@
 
 **OpenNear** 借鉴星闪（NearLink / SparkLink）核心思想，采用**纯 C11 零外部依赖协议核**从零构建，在同一套极简协议上打通 **L1 抗干扰物理层 → L2 四段式确定性超帧 → L3 亚微秒同步与多跳自愈 → L4 万物互联云边协同**，让几块钱一块的 **ESP32-WROOM-32** 或 **nRF52840** 就能组成高确定性、自组网、自修复、直连 Home Assistant 与公网云平台的无线集群。
 
-| 能力维度 | OpenNear v7.1 | BLE Mesh | Wi-Fi Mesh | Zigbee / Thread |
+| 能力维度 | OpenNear v7.2 | BLE Mesh | Wi-Fi Mesh | Zigbee / Thread |
 |---|---|---|---|---|
 | **同步精度（硬件定时 / 仿真）** | **亚微秒级（实测 90 ns 稳态）** | 10 ~ 100 ms | 1 ~ 20 ms | 1 ~ 10 ms |
 | **MAC 帧头开销** | **6 字节**（含 `Hdr_CRC8`，隐式模式 2 字节） | 29+ 字节 | 24~36 字节 | 15~25 字节 |
 | **主控宕机自愈** | **Backup_ID 零投票热备，第 4 帧无缝接管** | 依赖泛洪 | 秒级重路由 | 数秒重选 |
 | **无主冷启动自组网** | **支持（零预设主控，自动竞选 + 脑裂裁决）** | 需 Provisioner | 需主路由 | 需协调器 |
 | **多跳与大规模容量** | **1~2 跳确定性 Sub-G + 3~6 跳 Mesh + 256 节点 Epoch-TDMA** | 洪泛多跳 | 2~4 跳 | 树/网状多跳 |
-| **室内定位 & 动态分组** | **免预烧录 MAC 动态 Tag 群控 + 多锚点 RSSI & 标准 BLE iBeacon/Eddystone 2D 融合定位 + HA `device_tracker`** | 仅粗略信标 | 需商用控制器 | 无原生定位 |
+| **室内定位 & 离线围栏 & CSI 雷达** | **多锚点 RSSI & BLE iBeacon/Eddystone 2D 融合定位 + 纯 ESP32 离线 2D 电子围栏 (`FENCE:`) + IEEE 802.11bf Wi-Fi CSI 64 子载波隔空感知 (`0x0C`) + 离线自动化规则 (`RULE:`)** | 仅粗略信标 | 需商用控制器 | 无原生定位 |
 | **安全与抗重放** | **AES-128-CCM + Beacon CBC-MAC + X25519 + 32 槽 LRU 防重放** | AES-CCM | WPA2/3 | AES-CCM |
 | **空中固件升级（OTA）** | **多跳广播/中继 + 32 块滑动窗口 NACK + CBC-MAC 鉴权 + 同步切换** | 极慢 | 单点 HTTP | 慢 |
 | **云端与生态接入** | **内置 SoftAP Web 配网页 + BLE GATT + HTTP API + MQTT/MQTTS + HA 自动发现** | 需网关 | 原生 IP | 需边界路由 |
@@ -199,7 +199,7 @@ opennear/
 │   └── on_hal.h                       # 跨平台射频 / 高精定时器 / GPIO 硬件抽象层
 ├── sim/                               # 10 节点多跳物理仿真器（CLI 混沌参数注入 + CSV + PCAP + 仪表盘数据）
 ├── tests/
-│   ├── test_opennear.c                # 38 组全链路自动化单测与集成断言套件（391 项断言）
+│   ├── test_opennear.c                # 42 组全链路自动化单测与集成断言套件（505 项断言）
 │   ├── test_esp32_failover_hw.py      # ESP32 双板主备 RTS 复位长稳回归测试脚本
 │   ├── measure_esp32_gpio_sync.py     # ESP32 MCPWM 双板 GPIO 同步误差测量脚本
 │   ├── capture_esp32_act_trace.py     # ESP32 双板 ACT 全链路追踪抓取脚本
@@ -269,7 +269,7 @@ pio run -d .\ports\esp32_wroom32 -e esp32_node_t -t upload
 3. 在 **Wi-Fi / 云端配网** 页点击「扫描周边 Wi-Fi」，选中路由器输入密码保存——连网成功后 5 秒自动关闭兜底热点，同一管理台继续在局域网 IP（`http://<ESP32_IP>/`）长期在线。
 4. 面板内置 5 大标签页：
    - **集群拓扑与实时数据**：内联 SVG 0~6 跳实时拓扑图、同步偏差、OTA 状态、节点别称/标签快捷编辑与载荷 Hex/ASCII 解码；
-   - **室内定位 / Tag 分组（v7.0 / v7.1）**：免预烧录给任意节点按永久 MAC48 动态打标签（`TAG:`）与按 Tag 批量群发控制（`CMD_TAG:`）；一键将固定节点设为房间/坐标锚点（`ANCHOR:`）；**内置低占空比共存被动扫描器，全网主控与卫星锚点自动发现标准 Apple iBeacon 与 Google Eddystone-UID/URL/TLM 廉价卡片并经私有时隙零碰撞回传主控**（支持防随机 MAC 轮换稳定 ID 与信标自带 `txPower@1m` 校准），在 **2D SVG 室内平面雷达图** 实时解算并自动发布 Home Assistant `device_tracker`（含 `x_cm/y_cm` 坐标属性）；
+   - **室内定位 / 电子围栏 / Wi-Fi CSI 雷达（v7.0 ~ v7.2）**：免预烧录给任意节点按永久 MAC48 动态打标签（`TAG:`）与按 Tag 批量群发控制（`CMD_TAG:`）；一键将固定节点设为房间/坐标锚点（`ANCHOR:`）；**内置低占空比共存被动扫描器，全网主控与卫星锚点自动发现标准 Apple iBeacon 与 Google Eddystone-UID/URL/TLM 廉价卡片并经私有时隙零碰撞回传主控**；**新增 IEEE 802.11bf Wi-Fi CSI 64 子载波 I/Q 隔空无源人体感知雷达（`0x0C` 私有时隙回传 16 频段频谱与走动/微动评分）与纯 ESP32 离线 2D 圆形电子围栏（`FENCE:`）+ 离线空间/CSI 自动化规则引擎（`RULE:`，0 云端/0 HA 依赖本地毫秒级闭环触发）**，并提供 **「🎬 一键运行围栏+CSI 联动演示」**（`LOCDEMO:1`）开箱即用体验；
    - **Wi-Fi / 云端配网**：周边 2.4 GHz 热点扫描、SSID/密码与 HTTP/HTTPS Webhook 配置；
    - **MQTT / MQTTS (TLS) & Home Assistant**：配置 Broker（1883 明文或勾选 8883 MQTTS）与上传 Root CA PEM 证书（`POST /api/tls_ca`）；
    - **节点控制 / 集群 OTA / 安全令牌**：任意 1~6 跳节点下行控制、多跳固件升级与 `Admin Token` 设置/轮换。
@@ -284,6 +284,9 @@ pio run -d .\ports\esp32_wroom32 -e esp32_node_t -t upload
   - `TAG:<MAC>|<tag1,tag2>`（免预烧录按永久 MAC48 动态打标签，自动写入 NVS 持久化）
   - `CMD_TAG:<tag>|<payload>`（按 Tag 自动展开并群发下行控制指令至所有匹配在线节点）
   - `ANCHOR:<MAC>|<room>|<x_cm>|<y_cm>`（将任意固定节点动态注册为室内定位锚点；`<room>` 留空即移除）
+  - `FENCE:<name>|<x_cm>|<y_cm>|<radius_cm>`（v7.2：配置或移除 `<radius_cm>=0` 的 2D 圆形电子围栏，NVS 持久化）
+  - `RULE:<id:1..8>|<trig:0..6>|<zone>|<csi_th>|<tag>|<cmd>`（v7.2：纯 ESP32 离线边缘自动化规则：`1=进入房间`、`2=离开房间`、`3=进入围栏`、`4=离开围栏`、`5=CSI 有人活动 ≥ 阈值`、`6=CSI 安静无人 < 阈值`、`0=删除`，触发后本地毫秒级直驱 `CMD_TAG:` 或板载 LED/继电器）
+  - `LOCDEMO:<0|1|2>`（v7.2：`1`=一键载入 4 房间+2 围栏+4 规则+Wi-Fi CSI 联动演示并自动演进，`2`=单步推进下一幕，`0`=停止演示并恢复 NVS 配置）
   - `BLESCAN:<0|1>`（开关共存被动 BLE iBeacon / Eddystone 信标扫描，写入 NVS 持久化）
   - `OTA:<target_hex>|<ver>|<http_or_https_url>`（`FFF` 为全网广播）
   - `CMD:<target_hex>|<payload>`（1~6 跳自动选路下发）

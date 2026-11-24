@@ -276,6 +276,15 @@ typedef struct {
     void (*on_ble_beacon_observed)(void *ctx, uint16_t anchor_id, const uint8_t tag_mac48[6],
                                    uint8_t source, int8_t tx_power_1m_dbm, int8_t rssi_dbm);
     void             *ble_obs_ctx;
+
+    /* v7.2: IEEE 802.11bf Wi-Fi CSI passive human presence observation queue & callback */
+    uint32_t          last_csi_rep_sf;
+    bool              csi_obs_pending;
+    uint8_t           csi_obs_score;
+    uint8_t           csi_obs_bins[16];
+    void (*on_csi_observed)(void *ctx, uint16_t anchor_id, uint8_t motion_score,
+                            const uint8_t bins16[16]);
+    void             *csi_obs_ctx;
 } on_node_t;
 
 /* Initialize node as Primary G coordinator or Unjoined Terminal */
@@ -375,6 +384,13 @@ void     on_node_set_ble_beacon_observer(on_node_t *node,
                                                     const uint8_t tag_mac48[6], uint8_t source,
                                                     int8_t tx_power_1m_dbm, int8_t rssi_dbm),
                                          void *user_ctx);
+
+/* v7.2: IEEE 802.11bf Wi-Fi CSI passive presence report (Anchor->G relay) & Primary G observer */
+void     on_node_report_csi(on_node_t *node, uint8_t motion_score, const uint8_t bins16[16]);
+void     on_node_set_csi_observer(on_node_t *node,
+                                  void (*cb)(void *ctx, uint16_t anchor_id,
+                                             uint8_t motion_score, const uint8_t bins16[16]),
+                                  void *user_ctx);
 
 /* v6.0: Leaderless Auto-Boot, 256-Node Epoch-TDMA & 3~6-Hop Hybrid Mesh */
 void     on_node_enable_leaderless_boot(on_node_t *node, uint32_t base_timeout_ms);
