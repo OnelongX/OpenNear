@@ -685,8 +685,11 @@ static void esp32_mqtt_poll(on_node_t *node, on_gw_ctx_t *gw) {
         cli->write(ping, 2u);
     }
 
-    /* Periodically publish Home Assistant MQTT Auto-Discovery (MAC + Alias + LWT) every 15 s */
-    if (gw->mqtt_connected && node && (s_last_ha_pub_ms == 0u || (now_ms - s_last_ha_pub_ms) > 15000u)) {
+    /* Periodically publish Home Assistant MQTT Auto-Discovery (MAC + Alias + LWT) every 15 s
+     * (In Dual-Gateway mode, only the active Primary G publishes cluster-wide HA state;
+     *  a standby Backup_ID gateway stays connected to Wi-Fi/MQTT and takes over in 150 ms on failover!) */
+    if (gw->mqtt_connected && node && node->role == ON_ROLE_G &&
+        (s_last_ha_pub_ms == 0u || (now_ms - s_last_ha_pub_ms) > 15000u)) {
         s_last_ha_pub_ms = now_ms;
         on_cluster_snapshot_t snap;
         on_esp32_node_lock();
@@ -1921,7 +1924,8 @@ void on_esp32_net_gw_poll(on_node_t *node, on_gw_ctx_t *gw) {
     }
 
     /* v7.2: Evaluate offline edge geofence & Wi-Fi CSI rules every 500 ms (zero cloud / zero HA dependency) */
-    if (s_loc_inited && (loc_now_ms - s_last_rule_eval_ms) >= 500u) {
+    if (s_loc_inited && (!node || node->role == ON_ROLE_G || s_loc_demo_running) &&
+        (loc_now_ms - s_last_rule_eval_ms) >= 500u) {
         s_last_rule_eval_ms = loc_now_ms;
         on_esp32_node_lock();
         on_loc_evaluate_rules(&s_loc, loc_now_ms, esp32_on_rule_fired_cb, node);

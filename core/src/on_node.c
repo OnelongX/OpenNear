@@ -403,6 +403,17 @@ static void topo_ingest_resp_page(on_node_t *node, const on_gw_bridge_msg_t *msg
 }
 
 static uint16_t select_next_backup_id(const on_node_t *node) {
+    /* First priority: 1-hop peer with Wi-Fi/MQTT Gateway capability (bit 2 = 0x04) + Backup (bit 0 = 0x01) */
+    for (uint32_t i = 0; i < ON_MAX_NODES_TABLE; ++i) {
+        if (node->peers[i].active &&
+            !node->peers[i].is_sub_slot &&
+            node->peers[i].short_id != node->short_id &&
+            node->peers[i].short_id != node->sub_g_id &&
+            (node->peers[i].capabilities & 0x05u) == 0x05u) {
+            return node->peers[i].short_id;
+        }
+    }
+    /* Second priority: any 1-hop peer with Backup capability (bit 0 = 0x01) */
     for (uint32_t i = 0; i < ON_MAX_NODES_TABLE; ++i) {
         if (node->peers[i].active &&
             !node->peers[i].is_sub_slot &&
@@ -736,10 +747,24 @@ static void handle_join_req(on_node_t *node, const on_mac_hdr_t *hdr,
         }
         if (!pe) return;
 
-        /* Auto-elect Backup_ID or Sub-G if Primary G has none assigned yet */
+        /* Auto-elect Backup_ID or Sub-G if Primary G has none assigned yet
+         * (or preempt a plain terminal Backup_ID when a secondary Gateway-capable node joins!) */
         if (as_pri) {
-            if (node->backup_id == ON_SHORT_ID_UNASSIGNED && (req.capabilities & 0x01u)) {
+            bool cur_bk_is_gw = false;
+            if (node->backup_id != ON_SHORT_ID_UNASSIGNED) {
+                const on_peer_entry_t *bk_pe = find_peer_by_id(node, node->backup_id);
+                cur_bk_is_gw = (bk_pe && (bk_pe->capabilities & 0x04u) != 0u);
+            }
+            if ((node->backup_id == ON_SHORT_ID_UNASSIGNED && (req.capabilities & 0x01u)) ||
+                (!cur_bk_is_gw && (req.capabilities & 0x05u) == 0x05u)) {
+                uint16_t old_bk = node->backup_id;
                 node->backup_id = pe->short_id;
+                if (old_bk != ON_SHORT_ID_UNASSIGNED && node->sub_g_id == ON_SHORT_ID_UNASSIGNED) {
+                    const on_peer_entry_t *old_pe = find_peer_by_id(node, old_bk);
+                    if (old_pe && (old_pe->capabilities & 0x02u)) {
+                        node->sub_g_id = old_bk;
+                    }
+                }
             } else if (node->sub_g_id == ON_SHORT_ID_UNASSIGNED && (req.capabilities & 0x02u)) {
                 node->sub_g_id = pe->short_id;
             }
@@ -885,8 +910,9 @@ void on_node_on_rx_raw_timed_rssi(on_node_t *node, const uint8_t *frame, size_t 
     /* Account RX air time */
     node->radio_active_ns += (uint64_t)(8000u + len * 4000u);
 
-    /* Ignore own loopback */
-    if (node->short_id != ON_SHORT_ID_UNASSIGNED && hdr.src_id == node->short_id) {
+    /* Ignore own loopback (except equal-ID Primary G split-brain resolution via session_salt) */
+    if (node->short_id != ON_SHORT_ID_UNASSIGNED && hdr.src_id == node->short_id &&
+        !(node->role == ON_ROLE_G && hdr.type == ON_FRAME_SYNC_MAP && node->leaderless_boot_enabled)) {
         return;
     }
 
@@ -984,8 +1010,12 @@ void on_node_on_rx_raw_timed_rssi(on_node_t *node, const uint8_t *frame, size_t 
                 reset_act_lookahead(node);
             }
             if (yielding_primary) {
-                node->role = ON_ROLE_T;
-                sync_mesh_identity(node);
+                if (hdr.src_id == node->short_id) {
+                    rejoin_primary(node, true);
+                } else {
+                    node->role = ON_ROLE_T;
+                    sync_mesh_identity(node);
+                }
                 emit_event(node, "G_YIELD_TO_PRIMARY", hdr.src_id, (int64_t)node->current_sf_seq);
             }
             if (new_primary_session) {

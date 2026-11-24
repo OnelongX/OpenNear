@@ -178,9 +178,16 @@ void setup() {
 #ifdef OPENNEAR_ACT_TRACE
     if (!on_esp32_hal_trace_init()) Serial.println("[ACTTRACE] queue allocation failed");
 #endif
+#ifdef OPENNEAR_ENABLE_WIFI_GW
+    /* v7.2 Dual-Gateway Hot-Standby: advertise 0x07 (Backup + Sub-G + Gateway Priority)
+     * so a yielding 2nd gateway joins as a 1-hop node and is prioritized as Backup_ID! */
+    const uint8_t node_caps = 0x07u;
+#else
+    const uint8_t node_caps = is_master ? 0x00u : (uint8_t)OPENNEAR_CAPS;
+#endif
     on_node_init(&g_node, &hal,
                  is_master ? ON_ROLE_G : ON_ROLE_UNJOINED,
-                 is_master ? 0x00u : (uint8_t)OPENNEAR_CAPS);
+                 node_caps);
     on_mesh_init(&g_mesh,
                  is_master ? ON_SHORT_ID_G_DEFAULT : ON_SHORT_ID_UNASSIGNED,
                  is_master ? 0u : 0xFFu,
@@ -207,10 +214,8 @@ void setup() {
     Serial.println("[OpenNear ACT] Lookahead GPIO demo enabled");
 #endif
 #ifdef OPENNEAR_LEADERLESS_BOOT
-    if (!is_master) {
-        on_node_enable_leaderless_boot(&g_node, 1500u);
-        Serial.println("[OpenNear Mesh] Leaderless cold-boot auto-election enabled (1500 ms)");
-    }
+    on_node_enable_leaderless_boot(&g_node, 1500u);
+    Serial.println("[OpenNear Mesh] Leaderless cold-boot & dual-gateway split-brain auto-election enabled (1500 ms)");
 #endif
 #ifdef OPENNEAR_ACT_CLOCK_BIAS_US
     g_node.act_clock_enabled = true;

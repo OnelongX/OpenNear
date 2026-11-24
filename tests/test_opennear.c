@@ -3190,7 +3190,59 @@ static void test_v72_wifi_csi_geofence_and_offline_rules(void) {
     EXPECT(csi_st.got_1hop_t2 && csi_st.got_2hop_t8,
            "Primary G receives and attributes both 1-hop T2 and 2-hop T8 Wi-Fi CSI 16-bin spectra");
 
-    printf("    -> 64-Subcarrier I/Q CSI Score (static=%u -> moving=%u) | 4 Showcase Rules Fired | 1-Hop+2-Hop 0x0C CSI Relay OK (0 coll)\n",
+    /* Part D: Dual-Gateway Hot-Standby Priority (2nd Gateway yields & preempts plain T as Backup_ID) */
+    on_node_t gw_a, gw_b, t_plain;
+    static const uint8_t kKey72[16] = {
+        0x4F,0x50,0x45,0x4E,0x4E,0x45,0x41,0x52,0x37,0x32,0x2D,0x4B,0x45,0x59,0x21,0x01
+    };
+    on_node_init(&gw_a, NULL, ON_ROLE_G, 0x07u);
+    on_node_init(&gw_b, NULL, ON_ROLE_G, 0x07u);
+    on_node_init(&t_plain, NULL, ON_ROLE_UNJOINED, 0x03u);
+    gw_a.mac48[0] = 0xAAu; gw_a.mac48[5] = 0x01u;
+    gw_b.mac48[0] = 0xAAu; gw_b.mac48[5] = 0x02u;
+    t_plain.mac48[0] = 0xAAu; t_plain.mac48[5] = 0x03u;
+    on_node_enable_leaderless_boot(&gw_a, 1500u);
+    on_node_enable_leaderless_boot(&gw_b, 1500u);
+    on_node_enable_security(&gw_a, kKey72);
+    on_node_enable_security(&gw_b, kKey72);
+    on_node_enable_security(&t_plain, kKey72);
+    on_node_set_session_salt(&gw_a, 0x10002000u); /* Lower salt wins */
+    on_node_set_session_salt(&gw_b, 0x50006000u); /* Higher salt yields */
+
+    /* 1. Plain terminal joins GW_A first -> temporarily becomes Backup_ID (0x002) */
+    on_join_req_t j_plain;
+    memset(&j_plain, 0, sizeof(j_plain));
+    memcpy(j_plain.mac48, t_plain.mac48, 6u);
+    j_plain.capabilities = 0x03u;
+    uint8_t jpay[32], jraw[64];
+    size_t jplen = 0u, jrlen = 0u;
+    on_join_req_pack(&j_plain, jpay, sizeof(jpay), &jplen);
+    on_mac_hdr_t jhdr;
+    memset(&jhdr, 0, sizeof(jhdr));
+    jhdr.version  = ON_PROTO_VERSION;
+    jhdr.type     = (uint8_t)ON_FRAME_JOIN_REQ;
+    jhdr.src_id   = ON_SHORT_ID_UNASSIGNED;
+    jhdr.dst_id   = ON_SHORT_ID_G_DEFAULT;
+    jhdr.slot_idx = 0u;
+    /* Feed unencrypted JOIN_REQ to GW_A with sec temporarily toggled for direct unit verify */
+    gw_a.sec.enabled = false;
+    on_frame_pack(&jhdr, jpay, jplen, jraw, sizeof(jraw), &jrlen);
+    on_node_on_rx_raw(&gw_a, jraw, jrlen, 100000LL);
+    EXPECT(gw_a.backup_id == 0x002u && gw_a.sub_g_id == ON_SHORT_ID_UNASSIGNED,
+           "Plain terminal initially assigned as Backup_ID (0x002) when no standby gateway is present");
+
+    /* 2. Secondary Gateway GW_B (caps=0x07) joins GW_A -> preempts plain terminal as Backup_ID (0x003)! */
+    on_join_req_t j_gwb;
+    memset(&j_gwb, 0, sizeof(j_gwb));
+    memcpy(j_gwb.mac48, gw_b.mac48, 6u);
+    j_gwb.capabilities = 0x07u;
+    on_join_req_pack(&j_gwb, jpay, sizeof(jpay), &jplen);
+    on_frame_pack(&jhdr, jpay, jplen, jraw, sizeof(jraw), &jrlen);
+    on_node_on_rx_raw(&gw_a, jraw, jrlen, 200000LL);
+    EXPECT(gw_a.backup_id == 0x003u && gw_a.sub_g_id == 0x002u,
+           "Standby Wi-Fi Gateway (caps=0x07) preempts plain terminal as Backup_ID and demotes plain terminal to Sub-G");
+
+    printf("    -> 64-Subcarrier I/Q CSI Score (static=%u -> moving=%u) | 4 Showcase Rules Fired | 1-Hop+2-Hop 0x0C CSI Relay OK (0 coll) | Dual-GW Priority Backup OK\n",
            (unsigned)static_score, (unsigned)moving_score);
 }
 
