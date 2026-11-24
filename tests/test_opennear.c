@@ -2722,9 +2722,196 @@ static void test_v70_indoor_locate_rssi_and_tags(void) {
            (int)est_a.x_cm, (int)est_a.y_cm, (int)err_x, (int)err_y);
 }
 
+/* 40. Test v7.1 Standard BLE iBeacon & Eddystone Parser, Calibrated 2D Positioning & Multi-Anchor Relay */
+typedef struct {
+    uint32_t count;
+    bool     matched;
+    uint16_t expect_anchor;
+    uint8_t  expect_mac[6];
+    uint8_t  expect_src;
+    int8_t   expect_tx1m;
+    int8_t   expect_rssi;
+} test_v71_ble_cb_t;
+
+static void test_v71_ble_cb(void *ctx, uint16_t anchor_id, const uint8_t tag_mac48[6],
+                            uint8_t source, int8_t tx_power_1m_dbm, int8_t rssi_dbm) {
+    test_v71_ble_cb_t *st = (test_v71_ble_cb_t *)ctx;
+    st->count++;
+    if (anchor_id == st->expect_anchor &&
+        memcmp(tag_mac48, st->expect_mac, 6u) == 0 &&
+        source == st->expect_src &&
+        tx_power_1m_dbm == st->expect_tx1m &&
+        rssi_dbm == st->expect_rssi) {
+        st->matched = true;
+    }
+}
+
+static void test_v71_ble_ibeacon_eddystone_and_relay(void) {
+    printf("[TEST 40] v7.1 Standard BLE iBeacon/Eddystone Parser, Calibrated 2D Locate & Multi-Anchor Relay...\n");
+
+    /* Part A: Apple iBeacon standard 30-byte BLE Advertising Data */
+    const uint8_t ib_ad[30] = {
+        0x02, 0x01, 0x06,
+        0x1A, 0xFF, 0x4C, 0x00, 0x02, 0x15,
+        0xE2, 0xC5, 0x6D, 0xB5, 0xDF, 0xFB, 0x48, 0xD2,
+        0xB0, 0x60, 0xD0, 0xF5, 0xA7, 0x10, 0x96, 0xE0,
+        0x03, 0xE9, /* Major = 1001 */
+        0x00, 0x2A, /* Minor = 42 */
+        0xC5        /* txPower@1m = -59 dBm */
+    };
+    on_ble_beacon_t ib;
+    EXPECT(on_ble_beacon_parse(ib_ad, sizeof(ib_ad), &ib) && ib.valid,
+           "Apple iBeacon AD packet parsed cleanly");
+    EXPECT(ib.source == ON_LOC_SRC_IBEACON && ib.major == 1001u && ib.minor == 42u &&
+           ib.tx_power_1m_dbm == -59 && strcmp(ib.label, "iB:1001/42") == 0,
+           "iBeacon UUID, Major/Minor, calibrated txPower@1m (-59 dBm), and label match");
+
+    const uint8_t rand_mac_a[6] = { 0x41, 0x22, 0x33, 0x44, 0x55, 0x66 };
+    const uint8_t rand_mac_b[6] = { 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC };
+    uint8_t ib_mac_a[6], ib_mac_b[6];
+    on_ble_beacon_derive_mac(&ib, rand_mac_a, ib_mac_a);
+    on_ble_beacon_derive_mac(&ib, rand_mac_b, ib_mac_b);
+    EXPECT(memcmp(ib_mac_a, ib_mac_b, 6u) == 0 && ib_mac_a[0] == 0x02u &&
+           ib_mac_a[2] == 0x03u && ib_mac_a[3] == 0xE9u &&
+           ib_mac_a[4] == 0x00u && ib_mac_a[5] == 0x2Au,
+           "iBeacon deterministic MAC48 is immune to iOS/Android BLE random MAC rotation");
+
+    /* Part B: Google Eddystone-UID, Eddystone-TLM & noise rejection */
+    const uint8_t ed_uid_ad[28] = {
+        0x03, 0x03, 0xAA, 0xFE,
+        0x17, 0x16, 0xAA, 0xFE,
+        0x00, /* Frame Type: Eddystone-UID */
+        0xEE, /* txPower@0m = -18 dBm -> txPower@1m = -18 - 41 = -59 dBm */
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0x00, /* 10B Namespace */
+        0x01, 0x02, 0xAA, 0xBB, 0xCC, 0xDD,                         /* 6B Instance */
+        0x00, 0x00
+    };
+    on_ble_beacon_t ed;
+    EXPECT(on_ble_beacon_parse(ed_uid_ad, sizeof(ed_uid_ad), &ed) && ed.valid &&
+           ed.source == ON_LOC_SRC_EDDYSTONE && ed.eddy_frame_type == 0x00u &&
+           ed.tx_power_1m_dbm == -59 && strcmp(ed.label, "Ed:AABBCCDD") == 0,
+           "Google Eddystone-UID parsed with -41 dB 0m->1m txPower conversion");
+    uint8_t ed_mac[6];
+    on_ble_beacon_derive_mac(&ed, rand_mac_a, ed_mac);
+    EXPECT(ed_mac[0] == 0x06u && ed_mac[2] == 0xAAu && ed_mac[5] == 0xDDu,
+           "Eddystone-UID derives deterministic stable 6-byte Trackable ID");
+
+    const uint8_t ed_tlm_ad[18] = {
+        0x11, 0x16, 0xAA, 0xFE,
+        0x20, 0x00, /* Eddystone-TLM v0 */
+        0x0B, 0xEA, /* vbatt = 3050 mV */
+        0x18, 0x80, /* temp = 24.50 C */
+        0x00, 0x00, 0x00, 0x10,
+        0x00, 0x00, 0x00, 0x20
+    };
+    on_ble_beacon_t tlm;
+    EXPECT(on_ble_beacon_parse(ed_tlm_ad, sizeof(ed_tlm_ad), &tlm) && tlm.valid &&
+           tlm.eddy_frame_type == 0x20u && tlm.tlm_batt_mv == 3050u && tlm.tlm_temp_c_x100 == 2450,
+           "Google Eddystone-TLM battery voltage (3050 mV) & temp (24.50 C) parsed");
+
+    const uint8_t noise_ad[10] = { 0x02, 0x01, 0x06, 0x06, 0x09, 'T', 'V', '1', '2', '3' };
+    on_ble_beacon_t nope;
+    EXPECT(!on_ble_beacon_parse(noise_ad, sizeof(noise_ad), &nope),
+           "Non-beacon generic BLE device advertisements ignored cleanly");
+
+    /* Part C: 4-Anchor 2D Trilateration using Beacon's calibrated txPower@1m (-59 dBm vs anchor -45 dBm) */
+    on_loc_ctx_t loc;
+    on_loc_init(&loc);
+    const uint8_t a_mac[4][6] = {
+        { 0xAA, 0x71, 0x00, 0x00, 0x00, 0x01 },
+        { 0xAA, 0x71, 0x00, 0x00, 0x00, 0x02 },
+        { 0xAA, 0x71, 0x00, 0x00, 0x00, 0x03 },
+        { 0xAA, 0x71, 0x00, 0x00, 0x00, 0x04 }
+    };
+    const int32_t ax[4] = { 0, 600, 600, 0 };
+    const int32_t ay[4] = { 0, 0,   400, 400 };
+    const char   *ar[4] = { "Living", "Bedroom", "Study", "Kitchen" };
+    for (int i = 0; i < 4; ++i) {
+        on_loc_set_anchor(&loc, a_mac[i], (uint16_t)(i + 1), ar[i], ax[i], ay[i]);
+    }
+    const double true_x = 380.0, true_y = 260.0; /* Nearest to Study (600,400) */
+    for (uint32_t s = 0u; s < 5u; ++s) {
+        uint32_t now_ms = 2000u + s * 500u;
+        for (int i = 0; i < 4; ++i) {
+            double dx = (true_x - (double)ax[i]) / 100.0;
+            double dy = (true_y - (double)ay[i]) / 100.0;
+            double dm = sqrt(dx * dx + dy * dy);
+            if (dm < 0.25) dm = 0.25;
+            /* Synthesize RSSI using iBeacon's -59 dBm calibrated TX power! */
+            int8_t rssi = (int8_t)llround(-59.0 - 10.0 * 2.5 * log10(dm));
+            EXPECT(on_loc_observe_beacon(&loc, a_mac[i], ib_mac_a, ON_LOC_SRC_IBEACON,
+                                         ib.tx_power_1m_dbm, rssi, ib.label, now_ms) == ON_OK,
+                   "on_loc_observe_beacon records calibrated iBeacon observation");
+        }
+    }
+    on_loc_estimate_t est;
+    EXPECT(on_loc_solve(&loc, ib_mac_a, 4500u, &est) && est.valid &&
+           est.source == ON_LOC_SRC_IBEACON && est.tx_power_1m_dbm == -59 &&
+           strcmp(est.room, "Study") == 0,
+           "2D solver uses iBeacon calibrated txPower@1m (-59 dBm) and classifies room Study");
+    int32_t err_x = est.x_cm - (int32_t)true_x;
+    int32_t err_y = est.y_cm - (int32_t)true_y;
+    if (err_x < 0) err_x = -err_x;
+    if (err_y < 0) err_y = -err_y;
+    EXPECT(err_x <= 35 && err_y <= 35, "Calibrated iBeacon 2D trilateration converges within 35 cm");
+
+    char jbuf[1024];
+    size_t jlen = on_loc_format_json(&loc, 4500u, jbuf, sizeof(jbuf));
+    EXPECT(jlen > 40u &&
+           strstr(jbuf, "\"src\":\"ibeacon\"") != NULL &&
+           strstr(jbuf, "\"label\":\"iB:1001/42\"") != NULL &&
+           strstr(jbuf, "\"tx1m\":-59") != NULL,
+           "on_loc_format_json emits src, label, and calibrated tx1m for BLE beacons");
+
+    /* Part D: Live 10-Node Satellite Anchor -> Primary G zero-collision ON_GW_MSG_BLE_BEACON_REPORT */
+    sim_world_t w;
+    sim_world_init(&w, 0x71B12026ULL);
+    sim_world_setup_10node_demo(&w, true);
+    sim_world_run_us(&w, 160000, 10);
+
+    on_node_t *g_node = &w.nodes[0];
+    on_node_t *a_node = &w.nodes[3]; /* 1-hop satellite Anchor scanning BLE beacons */
+    test_v71_ble_cb_t bcb;
+    memset(&bcb, 0, sizeof(bcb));
+    bcb.expect_anchor = a_node->short_id;
+    memcpy(bcb.expect_mac, ib_mac_a, 6u);
+    bcb.expect_src  = (uint8_t)ON_LOC_SRC_IBEACON;
+    bcb.expect_tx1m = -59;
+    bcb.expect_rssi = -64;
+    on_node_set_ble_beacon_observer(g_node, test_v71_ble_cb, &bcb);
+    on_node_enable_rssi_anchor_report(a_node, true);
+
+    on_node_report_ble_beacon(a_node, ib_mac_a, (uint8_t)ON_LOC_SRC_IBEACON, -59, -64);
+    EXPECT(a_node->ble_obs_count == 1u, "Satellite anchor buffers passive BLE beacon observation");
+
+    sim_world_run_us(&w, 300000, 10); /* 75 SFs so private D-TDMA BLE_BEACON_REPORT fires */
+    EXPECT(w.tdma_subg_collisions == 0u && w.cra_collisions == 0u,
+           "Zero RF collisions during satellite ON_GW_MSG_BLE_BEACON_REPORT");
+    EXPECT(bcb.matched, "Primary G receives satellite anchor iBeacon observation over D-TDMA");
+
+    /* Part E: BLESCAN:<0|1> control command + Admin Token gating */
+    on_gw_ctx_t gw;
+    on_gw_init(&gw, ON_GW_MODE_WIFI_AND_BLE, NULL);
+    on_gw_set_admin_token(&gw, "ble71");
+    EXPECT(on_gw_handle_control_text(&gw, "BLESCAN:0", 9u, false) == ON_ERR_DECODE_FAIL,
+           "Unauthenticated BLESCAN rejected when admin_token active");
+    EXPECT(on_gw_handle_control_text(&gw, "AUTH:ble71|BLESCAN:9", 20u, false) == ON_ERR_INVALID_ARG,
+           "Invalid BLESCAN value rejected");
+    EXPECT(on_gw_handle_control_text(&gw, "AUTH:ble71|BLESCAN:0", 20u, false) == ON_OK &&
+           gw.cfg.ble_scan_updated && !gw.cfg.ble_scan_enabled,
+           "Authenticated BLESCAN:0 disables passive scanner");
+    gw.cfg.ble_scan_updated = false;
+    EXPECT(on_gw_handle_control_text(&gw, "AUTH:ble71|BLESCAN:1", 20u, false) == ON_OK &&
+           gw.cfg.ble_scan_updated && gw.cfg.ble_scan_enabled,
+           "Authenticated BLESCAN:1 enables passive scanner");
+
+    printf("    -> iBeacon(tx1m=-59) 2D est=(%d,%d)cm (err %d,%d cm) | Eddystone UID/TLM OK | Satellite Relay OK (0 coll)\n",
+           (int)est.x_cm, (int)est.y_cm, (int)err_x, (int)err_y);
+}
+
 int main(void) {
     printf("============================================================\n");
-    printf("       OpenNear v7.0 Core Protocol Automated Test Suite     \n");
+    printf("       OpenNear v7.1 Core Protocol Automated Test Suite     \n");
     printf("============================================================\n");
 
     test_6byte_header_and_frame();
@@ -2767,6 +2954,7 @@ int main(void) {
     test_v67_mqtt_lwt_alias_and_netkey();
     test_v68_failover_mac_recovery_and_mac_mqtt_routing();
     test_v70_indoor_locate_rssi_and_tags();
+    test_v71_ble_ibeacon_eddystone_and_relay();
 
     printf("\n------------------------------------------------------------\n");
     printf("SUMMARY: %d passed, %d failed\n", g_tests_passed, g_tests_failed);

@@ -263,6 +263,19 @@ typedef struct {
     } rssi_obs[6];
     void (*on_rssi_observed)(void *ctx, uint16_t anchor_id, uint16_t target_id, int8_t rssi_dbm);
     void             *rssi_obs_ctx;
+
+    /* v7.1: Passive BLE iBeacon/Eddystone multi-anchor observation queue & callback */
+    uint32_t          last_ble_rep_sf;
+    uint8_t           ble_obs_count;
+    struct {
+        uint8_t tag_mac48[6];
+        uint8_t source;
+        int8_t  tx_power_1m_dbm;
+        int8_t  rssi_dbm;
+    } ble_obs[4];
+    void (*on_ble_beacon_observed)(void *ctx, uint16_t anchor_id, const uint8_t tag_mac48[6],
+                                   uint8_t source, int8_t tx_power_1m_dbm, int8_t rssi_dbm);
+    void             *ble_obs_ctx;
 } on_node_t;
 
 /* Initialize node as Primary G coordinator or Unjoined Terminal */
@@ -353,6 +366,15 @@ void     on_node_set_rssi_observer(on_node_t *node,
                                    void (*cb)(void *ctx, uint16_t anchor_id,
                                               uint16_t target_id, int8_t rssi_dbm),
                                    void *user_ctx);
+
+/* v7.1: Standard BLE iBeacon/Eddystone observation queue (Anchor->G relay) & Primary G observer */
+void     on_node_report_ble_beacon(on_node_t *node, const uint8_t tag_mac48[6],
+                                   uint8_t source, int8_t tx_power_1m_dbm, int8_t rssi_dbm);
+void     on_node_set_ble_beacon_observer(on_node_t *node,
+                                         void (*cb)(void *ctx, uint16_t anchor_id,
+                                                    const uint8_t tag_mac48[6], uint8_t source,
+                                                    int8_t tx_power_1m_dbm, int8_t rssi_dbm),
+                                         void *user_ctx);
 
 /* v6.0: Leaderless Auto-Boot, 256-Node Epoch-TDMA & 3~6-Hop Hybrid Mesh */
 void     on_node_enable_leaderless_boot(on_node_t *node, uint32_t base_timeout_ms);

@@ -1361,7 +1361,8 @@ void on_node_on_rx_raw_timed_rssi(on_node_t *node, const uint8_t *frame, size_t 
                               msg.bridge_type == ON_GW_MSG_BLE_NOTIFY_UP ||
                               msg.bridge_type == ON_GW_MSG_TOPO_REQ ||
                               msg.bridge_type == ON_GW_MSG_MAC_REPORT ||
-                              msg.bridge_type == ON_GW_MSG_RSSI_REPORT);
+                              msg.bridge_type == ON_GW_MSG_RSSI_REPORT ||
+                              msg.bridge_type == ON_GW_MSG_BLE_BEACON_REPORT);
             if (is_uplink) {
                 if (node->role == ON_ROLE_G) {
                     if (msg.bridge_type == ON_GW_MSG_TOPO_REQ) {
@@ -1377,6 +1378,19 @@ void on_node_on_rx_raw_timed_rssi(on_node_t *node, const uint8_t *frame, size_t 
                                                           ((uint16_t)msg.payload[k + 1u] << 8)) & ON_SHORT_ID_MASK);
                                 int8_t rdbm = (int8_t)msg.payload[k + 2u];
                                 node->on_rssi_observed(node->rssi_obs_ctx, hdr.src_id, tid, rdbm);
+                            }
+                        }
+                    } else if (msg.bridge_type == ON_GW_MSG_BLE_BEACON_REPORT && msg.payload_len >= 9u) {
+                        node->rx_slot_mask_this_sf |= (uint16_t)(1u << (hdr.slot_idx & 0x0Fu));
+                        on_peer_entry_t *pe_bn = find_peer_by_id(node, hdr.src_id);
+                        if (pe_bn) pe_bn->last_seen_sf = node->current_sf_seq;
+                        if (node->on_ble_beacon_observed) {
+                            for (uint8_t k = 0u; (uint8_t)(k + 9u) <= msg.payload_len; k = (uint8_t)(k + 9u)) {
+                                node->on_ble_beacon_observed(node->ble_obs_ctx, hdr.src_id,
+                                                             &msg.payload[k],
+                                                             msg.payload[k + 6u],
+                                                             (int8_t)msg.payload[k + 7u],
+                                                             (int8_t)msg.payload[k + 8u]);
                             }
                         }
                     } else if (msg.bridge_type == ON_GW_MSG_MAC_REPORT && msg.payload_len >= 6u) {
@@ -2008,6 +2022,43 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
                     send_frame(node, &hdr, rbuf, rlen, now_local_ns);
                     node->last_rssi_rep_sf = node->current_sf_seq;
                     node->rssi_obs_count   = 0u;
+                    node->gw_tx_total++;
+                    goto tdma_slot_done;
+                }
+            }
+            /* v7.1: Anchor periodically flushes passive BLE iBeacon/Eddystone batch in private D-TDMA slot */
+            if (node->rssi_report_enabled && !node->harq_retry_pending &&
+                node->tdma_tx_total > 0u && node->ble_obs_count > 0u &&
+                (node->current_sf_seq - node->last_ble_rep_sf) >= 64u) {
+                on_gw_bridge_msg_t brep;
+                memset(&brep, 0, sizeof(brep));
+                brep.bridge_type = (uint8_t)ON_GW_MSG_BLE_BEACON_REPORT;
+                brep.origin_id   = node->short_id;
+                brep.seq         = ++node->data_tx_seq;
+                uint8_t out_n = 0u;
+                for (uint8_t bi = 0u; bi < node->ble_obs_count && out_n + 9u <= ON_GW_MAX_PAYLOAD_LEN; ++bi) {
+                    memcpy(&brep.payload[out_n], node->ble_obs[bi].tag_mac48, 6u);
+                    brep.payload[out_n + 6u] = node->ble_obs[bi].source;
+                    brep.payload[out_n + 7u] = (uint8_t)node->ble_obs[bi].tx_power_1m_dbm;
+                    brep.payload[out_n + 8u] = (uint8_t)node->ble_obs[bi].rssi_dbm;
+                    out_n = (uint8_t)(out_n + 9u);
+                }
+                brep.payload_len = out_n;
+                uint8_t bbuf[ON_GW_BRIDGE_HDR_LEN + 40u];
+                size_t blen = 0u;
+                if (out_n >= 9u && on_gw_bridge_pack(&brep, bbuf, sizeof(bbuf), &blen) == ON_OK) {
+                    on_mac_hdr_t hdr;
+                    memset(&hdr, 0, sizeof(hdr));
+                    hdr.version    = ON_PROTO_VERSION;
+                    hdr.type       = (uint8_t)ON_FRAME_GW_BRIDGE;
+                    hdr.is_sub_g   = false;
+                    hdr.src_id     = node->short_id;
+                    hdr.dst_id     = node->parent_id;
+                    hdr.sf_seq_low = (uint8_t)(node->current_sf_seq & 0x0Fu);
+                    hdr.slot_idx   = node->my_slot;
+                    send_frame(node, &hdr, bbuf, blen, now_local_ns);
+                    node->last_ble_rep_sf = node->current_sf_seq;
+                    node->ble_obs_count   = 0u;
                     node->gw_tx_total++;
                     goto tdma_slot_done;
                 }
@@ -2959,4 +3010,44 @@ on_err_t on_node_send_mesh_downlink(on_node_t *node, uint16_t target_id,
         node->mesh_tx_pending = true;
     }
     return rc;
+}
+
+void on_node_set_ble_beacon_observer(on_node_t *node,
+                                     void (*cb)(void *ctx, uint16_t anchor_id,
+                                                const uint8_t tag_mac48[6], uint8_t source,
+                                                int8_t tx_power_1m_dbm, int8_t rssi_dbm),
+                                     void *user_ctx) {
+    if (!node) return;
+    node->on_ble_beacon_observed = cb;
+    node->ble_obs_ctx            = user_ctx;
+}
+
+void on_node_report_ble_beacon(on_node_t *node, const uint8_t tag_mac48[6],
+                               uint8_t source, int8_t tx_power_1m_dbm, int8_t rssi_dbm) {
+    if (!node || !tag_mac48 || rssi_dbm >= 0 || rssi_dbm < -120) return;
+    if ((tag_mac48[0] | tag_mac48[1] | tag_mac48[2] |
+         tag_mac48[3] | tag_mac48[4] | tag_mac48[5]) == 0u) {
+        return;
+    }
+    if (node->role == ON_ROLE_G) {
+        if (node->on_ble_beacon_observed) {
+            node->on_ble_beacon_observed(node->ble_obs_ctx, node->short_id,
+                                         tag_mac48, source, tx_power_1m_dbm, rssi_dbm);
+        }
+        return;
+    }
+    if (!node->rssi_report_enabled) return;
+    for (uint8_t i = 0u; i < node->ble_obs_count; ++i) {
+        if (memcmp(node->ble_obs[i].tag_mac48, tag_mac48, 6u) == 0) {
+            node->ble_obs[i].source          = source;
+            node->ble_obs[i].tx_power_1m_dbm = tx_power_1m_dbm;
+            node->ble_obs[i].rssi_dbm        = rssi_dbm;
+            return;
+        }
+    }
+    uint8_t idx = (node->ble_obs_count < 4u) ? node->ble_obs_count++ : 0u;
+    memcpy(node->ble_obs[idx].tag_mac48, tag_mac48, 6u);
+    node->ble_obs[idx].source          = source;
+    node->ble_obs[idx].tx_power_1m_dbm = tx_power_1m_dbm;
+    node->ble_obs[idx].rssi_dbm        = rssi_dbm;
 }

@@ -44,8 +44,9 @@ typedef enum {
     ON_GW_MSG_OTA_TRIGGER    = 0x06, /* Cloud/BLE trigger to pull & push OTA */
     ON_GW_MSG_TOPO_REQ       = 0x07, /* v5.1: Any-node request for cluster topology & data */
     ON_GW_MSG_TOPO_RESP      = 0x08, /* v5.1: Paginated cluster topology & data snapshot from G */
-    ON_GW_MSG_MAC_REPORT     = 0x09, /* v6.5: Sub-G -> G 2-hop child hardware MAC48 registration */
-    ON_GW_MSG_RSSI_REPORT    = 0x0A  /* v7.0: Anchor -> G overheard peer RSSI observation batch */
+    ON_GW_MSG_MAC_REPORT        = 0x09, /* v6.5: Sub-G -> G 2-hop child hardware MAC48 registration */
+    ON_GW_MSG_RSSI_REPORT       = 0x0A, /* v7.0: Anchor -> G overheard peer RSSI observation batch */
+    ON_GW_MSG_BLE_BEACON_REPORT = 0x0B  /* v7.1: Anchor -> G passive BLE iBeacon/Eddystone batch */
 } on_gw_msg_type_t;
 
 #define ON_GW_FLAG_RELAYED_2HOP  0x01u
@@ -101,6 +102,8 @@ typedef struct {
     int32_t  anchor_x_cm;
     int32_t  anchor_y_cm;
     bool     anchor_updated;
+    bool     ble_scan_enabled; /* v7.1 Passive BLE iBeacon/Eddystone scanner toggle (BLESCAN:<0|1>) */
+    bool     ble_scan_updated;
 } on_gw_config_t;
 
 /* Lock-free SPSC ring buffer for cross-core/cross-task decoupling (ON_GW_RING_DEPTH must be power of 2) */

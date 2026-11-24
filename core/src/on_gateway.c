@@ -475,6 +475,15 @@ on_err_t on_gw_handle_control_text(on_gw_ctx_t *gw, const char *text, size_t len
         return ON_OK;
     }
 
+    /* Format 14: BLESCAN:<0|1> -> Toggle passive BLE iBeacon/Eddystone scanner */
+    if (clean_len >= 9u && memcmp(text, "BLESCAN:", 8u) == 0) {
+        char c = text[8];
+        if (c != '0' && c != '1') return ON_ERR_INVALID_ARG;
+        gw->cfg.ble_scan_enabled = (c == '1');
+        gw->cfg.ble_scan_updated = true;
+        return ON_OK;
+    }
+
     return ON_ERR_INVALID_ARG;
 }
 

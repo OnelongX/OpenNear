@@ -23,7 +23,7 @@ body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.5 -apple-system,B
 .brand{display:flex;align-items:center;gap:10px}
 .brand h1{margin:0;font-size:18px;letter-spacing:.3px}
 .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:600;background:#1e293b;color:var(--acc)}
-.badge.ok{background:#052e16;color:var(--ok)}.badge.warn{background:#451a03;color:var(--warn)}.badge.err{background:#450a0a;color:var(--err)}
+.badge.ok{background:#052e16;color:var(--ok)}.badge.warn{background:#451a03;color:var(--warn)}.badge.err{background:#450a0a;color:var(--err)}.badge.purp{background:#3b0764;color:#d8b4fe}
 .pills{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px}
 .tabs{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px}
 .tab{background:var(--card);color:var(--mut);border:1px solid var(--bd);border-radius:8px;padding:8px 14px;cursor:pointer;font-weight:600}
@@ -58,7 +58,7 @@ th{color:var(--mut);font-weight:600;font-size:12px}
     <div class="brand">
       <h1>OpenNear</h1>
       <span class="badge" id="b-role">加载中...</span>
-      <span class="badge" id="b-fw">v7.0</span>
+      <span class="badge" id="b-fw">v7.1</span>
     </div>
     <div class="row">
       <input id="g-token" type="password" placeholder="Admin Token (如已设置)" style="width:185px" onchange="saveLocalToken()">
@@ -97,16 +97,19 @@ th{color:var(--mut);font-weight:600;font-size:12px}
   <section id="p-loc" class="hide">
     <div class="card">
       <div class="row" style="justify-content:space-between;margin-bottom:8px">
-        <h2 style="margin:0">2D 室内定位平面图（多锚点 RSSI 三边解算 + 房间防抖）</h2>
-        <span class="muted mono" id="loc-meta">锚点=0 | 定位目标=0</span>
+        <h2 style="margin:0">2D 室内定位平面图（OpenNear + BLE iBeacon / Eddystone 多锚点融合）</h2>
+        <div class="row">
+          <button class="btn sec sm" id="btn-blescan" onclick="toggleBleScan()">BLE 信标扫描: 开</button>
+          <span class="muted mono" id="loc-meta">锚点=0 | 定位目标=0</span>
+        </div>
       </div>
       <div style="overflow-x:auto;background:#030712;border:1px solid var(--bd);border-radius:10px;padding:6px;margin-bottom:12px">
         <svg id="loc-svg" width="100%" height="260" viewBox="0 0 880 260" style="display:block;min-width:520px"></svg>
       </div>
       <div class="tbl-wrap">
         <table>
-          <thead><tr><th>目标节点</th><th>MAC 地址</th><th>所在房间</th><th>估算坐标 (m)</th><th>最强 RSSI</th><th>参与锚点</th><th>估计误差</th></tr></thead>
-          <tbody id="loc-rows"><tr><td colspan="7" class="muted">先在下方添加 1~4 个固定锚点基站坐标，即可实时解算房间与坐标</td></tr></tbody>
+          <thead><tr><th>目标 / 信标</th><th>来源</th><th>MAC / 标识</th><th>所在房间</th><th>估算坐标 (m)</th><th>RSSI / tx1m</th><th>锚点数</th><th>误差</th><th>操作</th></tr></thead>
+          <tbody id="loc-rows"><tr><td colspan="9" class="muted">先在下方添加 1~4 个固定锚点基站坐标，即可实时解算 OpenNear 节点与周边 BLE iBeacon / Eddystone 卡片</td></tr></tbody>
         </table>
       </div>
     </div>
@@ -307,6 +310,9 @@ async function fetchStatus(){
       ?'<span class="badge ok">TLS 模块已启用'+(s.tls_ca_set?' (CA验签)':' (开发模式)')+'</span>'
       :'<span class="badge">TLS 未编译(精简)</span>');
     pills.push(s.ble_ok?'<span class="badge ok">BLE 已连接</span>':'<span class="badge">BLE 待机</span>');
+    gBleScan=!!s.ble_scan;
+    if($('btn-blescan'))$('btn-blescan').textContent='BLE 信标扫描: '+(gBleScan?'开':'关');
+    if(gBleScan)pills.push('<span class="badge purp">iBeacon/Eddystone 扫描中</span>');
     if(typeof s.free_heap==='number'){
       const fh=(s.free_heap/1024).toFixed(1),mh=((s.min_heap||0)/1024).toFixed(1);
       pills.push('<span class="badge mono '+(s.free_heap<28000?'warn':'')+'">Heap '+fh+'K (min '+mh+'K)</span>');
@@ -391,12 +397,23 @@ async function sendTagCmd(){
     toast('已向标签 ['+tg+'] 下发群控指令: '+pay);
   }
 }
+let gBleScan=true;
+async function toggleBleScan(){
+  const next=gBleScan?0:1;
+  if(await postCmd('BLESCAN:'+next)){
+    gBleScan=!!next;
+    if($('btn-blescan'))$('btn-blescan').textContent='BLE 信标扫描: '+(gBleScan?'开':'关');
+    toast(gBleScan?'已开启 BLE iBeacon/Eddystone 被动扫描':'已暂停 BLE 信标扫描');
+    setTimeout(fetchStatus,300);
+  }
+}
 function renderLocateSvg(d){
   const svg=$('loc-svg');
   if(!svg)return;
   const ancs=(d&&Array.isArray(d.anchors))?d.anchors:[];
   const tgts=(d&&Array.isArray(d.targets))?d.targets:[];
-  $('loc-meta').textContent='锚点='+ancs.length+' | 定位目标='+tgts.length;
+  const bleCnt=tgts.filter(t=>t.src&&t.src!=='opennear').length;
+  $('loc-meta').textContent='锚点='+ancs.length+' | 目标='+tgts.length+' (BLE信标 '+bleCnt+')';
   const ap=$('anchor-pills');
   if(ap){
     ap.innerHTML=ancs.length?ancs.map(a=>
@@ -407,16 +424,23 @@ function renderLocateSvg(d){
   const tb=$('loc-rows');
   if(tb){
     tb.innerHTML=tgts.length?tgts.map(t=>{
-      const nm=(t.mac&&gAliases[t.mac])?gAliases[t.mac]:t.id;
-      return '<tr><td><b>'+esc(nm)+'</b></td><td class="mono muted">'+esc(t.mac)+'</td>'
+      const nm=(t.mac&&gAliases[t.mac])?gAliases[t.mac]:(t.label||t.id);
+      const src=t.src||'opennear';
+      const scls=src==='ibeacon'?'purp':(src==='eddystone'?'warn':'');
+      const slbl=src==='ibeacon'?'iBeacon':(src==='eddystone'?'Eddystone':(src==='ble'?'BLE':'OpenNear'));
+      const txTxt=(t.tx1m&&t.tx1m<0)?('/'+t.tx1m):'';
+      return '<tr><td><b>'+esc(nm)+'</b></td>'
+        +'<td><span class="badge '+scls+'">'+slbl+'</span></td>'
+        +'<td class="mono muted">'+esc(t.mac)+'</td>'
         +'<td><span class="badge ok">'+esc(t.room)+'</span></td>'
         +'<td class="mono">('+(t.x_cm/100).toFixed(2)+', '+(t.y_cm/100).toFixed(2)+')</td>'
-        +'<td class="mono">'+t.rssi+' dBm</td><td>'+t.anchors+'</td>'
-        +'<td class="mono">±'+(t.err_cm/100).toFixed(2)+' m</td></tr>';
-    }).join(''):'<tr><td colspan="7" class="muted">暂无实时定位数据（添加至少 1 个在线节点为锚点后自动开始解算）</td></tr>';
+        +'<td class="mono">'+t.rssi+txTxt+' dBm</td><td>'+t.anchors+'</td>'
+        +'<td class="mono">±'+(t.err_cm/100).toFixed(2)+' m</td>'
+        +'<td><button class="btn sec sm" onclick="editAlias(\''+esc(t.mac)+'\')">改名</button></td></tr>';
+    }).join(''):'<tr><td colspan="9" class="muted">暂无实时定位数据（添加至少 1 个在线节点为锚点后自动开始解算 OpenNear 与 BLE 信标）</td></tr>';
   }
   if(!ancs.length&&!tgts.length){
-    svg.innerHTML='<text x="440" y="135" text-anchor="middle" fill="#64748b" font-size="13">配置 1~4 个固定锚点后，此处实时显示 2D 室内平面定位雷达</text>';
+    svg.innerHTML='<text x="440" y="135" text-anchor="middle" fill="#64748b" font-size="13">配置 1~4 个固定锚点后，此处实时显示 OpenNear 节点与 BLE iBeacon/Eddystone 2D 平面图</text>';
     return;
   }
   const pts=ancs.concat(tgts);
@@ -447,9 +471,15 @@ function renderLocateSvg(d){
   });
   tgts.forEach(t=>{
     const x=sx(t.x_cm),y=sy(t.y_cm);
-    const nm=(t.mac&&gAliases[t.mac])?gAliases[t.mac]:t.id;
-    out.push('<circle cx="'+x+'" cy="'+y+'" r="16" fill="#22c55e" fill-opacity="0.16" stroke="#22c55e" stroke-opacity="0.5" stroke-dasharray="3,2"/>');
-    out.push('<circle cx="'+x+'" cy="'+y+'" r="6" fill="#22c55e" stroke="#fff" stroke-width="1.5"/>');
+    const nm=(t.mac&&gAliases[t.mac])?gAliases[t.mac]:(t.label||t.id);
+    const src=t.src||'opennear';
+    const col=src==='ibeacon'?'#a855f7':(src==='eddystone'?'#f59e0b':'#22c55e');
+    out.push('<circle cx="'+x+'" cy="'+y+'" r="16" fill="'+col+'" fill-opacity="0.16" stroke="'+col+'" stroke-opacity="0.55" stroke-dasharray="3,2"/>');
+    if(src==='opennear'){
+      out.push('<circle cx="'+x+'" cy="'+y+'" r="6" fill="'+col+'" stroke="#fff" stroke-width="1.5"/>');
+    }else{
+      out.push('<polygon points="'+x+','+(y-7)+' '+(x+7)+','+y+' '+x+','+(y+7)+' '+(x-7)+','+y+'" fill="'+col+'" stroke="#fff" stroke-width="1.4"/>');
+    }
     out.push('<text x="'+x+'" y="'+(y-11)+'" text-anchor="middle" fill="#f8fafc" font-size="11" font-weight="600">'+esc(nm)+' ['+esc(t.room)+']</text>');
   });
   svg.innerHTML=out.join('');

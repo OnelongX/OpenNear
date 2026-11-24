@@ -28,6 +28,8 @@
 #ifdef OPENNEAR_ENABLE_BLE_GW
 #include <BLEDevice.h>
 #include <BLEServer.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
 #include "esp_bt.h"
@@ -359,6 +361,28 @@ static void esp32_on_rssi_observed_cb(void *ctx, uint16_t anchor_id,
     on_loc_observe_rssi(&s_loc, amac, tmac, target_id, rssi_dbm, millis());
 }
 
+/* v7.1: Invoked on Core 1 (from Anchor ON_GW_MSG_BLE_BEACON_REPORT) or Core 0 (local scan on G) */
+static void esp32_on_ble_beacon_observed_cb(void *ctx, uint16_t anchor_id,
+                                            const uint8_t tag_mac48[6], uint8_t source,
+                                            int8_t tx_power_1m_dbm, int8_t rssi_dbm) {
+    auto *node = static_cast<on_node_t *>(ctx);
+    if (!node || !s_loc_inited || !tag_mac48) return;
+    uint8_t amac[6] = {0};
+    if (!on_node_find_mac_by_short_id(node, anchor_id, amac)) return;
+    char auto_lbl[ON_LOC_LABEL_MAX_LEN] = {0};
+    if (source == ON_LOC_SRC_IBEACON && tag_mac48[0] == 0x02u) {
+        uint16_t maj = static_cast<uint16_t>((static_cast<uint16_t>(tag_mac48[2]) << 8) | tag_mac48[3]);
+        uint16_t min = static_cast<uint16_t>((static_cast<uint16_t>(tag_mac48[4]) << 8) | tag_mac48[5]);
+        snprintf(auto_lbl, sizeof(auto_lbl), "iB:%u/%u", (unsigned)maj, (unsigned)min);
+    } else if (source == ON_LOC_SRC_EDDYSTONE && tag_mac48[0] == 0x06u) {
+        snprintf(auto_lbl, sizeof(auto_lbl), "Ed:%02X%02X%02X%02X",
+                 (unsigned)tag_mac48[2], (unsigned)tag_mac48[3],
+                 (unsigned)tag_mac48[4], (unsigned)tag_mac48[5]);
+    }
+    on_loc_observe_beacon(&s_loc, amac, tag_mac48, static_cast<on_loc_source_t>(source),
+                          tx_power_1m_dbm, rssi_dbm, auto_lbl[0] ? auto_lbl : nullptr, millis());
+}
+
 static void ensure_gateway_mac_ids(const on_node_t *node) {
     if (s_mqtt_client_id[0] != '\0') return;
     uint8_t mac[6] = {0};
@@ -556,6 +580,42 @@ static void esp32_mqtt_poll(on_node_t *node, on_gw_ctx_t *gw) {
                 }
             }
         }
+        /* v7.1: Publish Home Assistant device_tracker + attributes for passive BLE iBeacon/Eddystone tags */
+        if (s_loc_inited) {
+            on_loc_estimate_t ble_ests[ON_LOC_MAX_TARGETS];
+            uint32_t ble_cnt = 0u;
+            on_esp32_node_lock();
+            for (uint32_t bi = 0u; bi < ON_LOC_MAX_TARGETS; ++bi) {
+                if (!s_loc.targets[bi].active || s_loc.targets[bi].source == ON_LOC_SRC_OPENNEAR) continue;
+                on_loc_estimate_t e;
+                if (on_loc_solve(&s_loc, s_loc.targets[bi].mac48, now_ms, &e) && e.room[0] != '\0') {
+                    ble_ests[ble_cnt++] = e;
+                }
+            }
+            on_esp32_node_unlock();
+            for (uint32_t bi = 0u; bi < ble_cnt; ++bi) {
+                const on_loc_estimate_t &est = ble_ests[bi];
+                const char *alias = lookup_mac_alias(est.mac48);
+                char mhex[13];
+                format_mac_key(est.mac48, mhex);
+                const char *disp = (alias && alias[0]) ? alias : (est.label[0] ? est.label : mhex);
+                snprintf(topic, sizeof(topic), "homeassistant/device_tracker/opennear_loc_%s/config", mhex);
+                snprintf(payload, sizeof(payload),
+                         "{\"name\":\"%s\",\"uniq_id\":\"opennear_loc_%s\","
+                         "\"stat_t\":\"opennear/loc/%s/room\",\"json_attr_t\":\"opennear/loc/%s/attrs\","
+                         "\"source_type\":\"bluetooth_le\",\"dev\":{\"ids\":[\"opennear_ble_%s\"],\"name\":\"%s\"}}",
+                         disp, mhex, mhex, mhex, mhex, disp);
+                esp32_mqtt_publish_cb(gw, topic, payload, true);
+                snprintf(topic, sizeof(topic), "opennear/loc/%s/room", mhex);
+                esp32_mqtt_publish_cb(gw, topic, est.room, false);
+                snprintf(topic, sizeof(topic), "opennear/loc/%s/attrs", mhex);
+                snprintf(payload, sizeof(payload),
+                         "{\"x_cm\":%ld,\"y_cm\":%ld,\"rssi\":%d,\"tx1m\":%d,\"anchors\":%u,\"err_cm\":%u,\"label\":\"%s\"}",
+                         (long)est.x_cm, (long)est.y_cm, (int)est.best_rssi_dbm, (int)est.tx_power_1m_dbm,
+                         (unsigned)est.anchor_count, (unsigned)est.est_err_cm, est.label);
+                esp32_mqtt_publish_cb(gw, topic, payload, false);
+            }
+        }
     }
 
     /* Drain inbound MQTT TCP/TLS stream cleanly across coalesced CONNACK/SUBACK/PINGRESP/PUBLISH packets */
@@ -717,7 +777,7 @@ static void start_local_http_api(void) {
 
         append_cstr(json, sizeof(json), &pos, "{\"role\":\"");
         append_cstr(json, sizeof(json), &pos, role_s);
-        snprintf(num, sizeof(num), "\",\"id\":\"0x%03X\",\"mac\":\"%s\",\"ble_mac\":\"%s\",\"sf\":%u,\"fw_ver\":\"v7.0\",\"uptime_s\":%u",
+        snprintf(num, sizeof(num), "\",\"id\":\"0x%03X\",\"mac\":\"%s\",\"ble_mac\":\"%s\",\"sf\":%u,\"fw_ver\":\"v7.1\",\"uptime_s\":%u",
                  (unsigned)short_id, mac_s, bmac_s, (unsigned)sf_seq, (unsigned)(millis() / 1000u));
         append_cstr(json, sizeof(json), &pos, num);
 
@@ -750,8 +810,9 @@ static void start_local_http_api(void) {
         append_json_escaped(json, sizeof(json), &pos, s_gw_ref ? s_gw_ref->cfg.mqtt_host : "");
 
         ensure_gateway_mac_ids(s_node_ref);
-        snprintf(num, sizeof(num), "\",\"ble_ok\":%s,\"token_set\":%s,\"netkey_custom\":%s,\"tls_compiled\":%s,\"mqtt_tls\":%s,\"tls_ca_set\":%s,\"mqtt_avty\":\"",
+        snprintf(num, sizeof(num), "\",\"ble_ok\":%s,\"ble_scan\":%s,\"token_set\":%s,\"netkey_custom\":%s,\"tls_compiled\":%s,\"mqtt_tls\":%s,\"tls_ca_set\":%s,\"mqtt_avty\":\"",
                  (s_gw_ref && s_gw_ref->ble_connected) ? "true" : "false",
+                 (s_gw_ref && s_gw_ref->cfg.ble_scan_enabled) ? "true" : "false",
                  (s_gw_ref && s_gw_ref->cfg.admin_token[0] != '\0') ? "true" : "false",
                  s_netkey_custom ? "true" : "false",
                  on_esp32_tls_is_compiled() ? "true" : "false",
@@ -1186,10 +1247,61 @@ static constexpr const char *kBleTxUuid   = "0000ffe1-0000-1000-8000-00805f9b34f
 static constexpr const char *kBleCtrlUuid = "0000ffe2-0000-1000-8000-00805f9b34fb";
 
 static BLECharacteristic *s_ble_tx_char = nullptr;
+static BLEScan           *s_ble_scanner = nullptr;
+static volatile bool      s_ble_scan_active  = false;
+static bool               s_ble_scan_enabled = true;
+static uint32_t           s_ble_scan_last_ms = 0u;
+
+/* Lock-free SPSC ring decoupling Bluedroid scan callback from Core-1 node mutex */
+#define ON_BLE_RX_RING_SZ 16u
+typedef struct {
+    uint8_t tag_mac48[6];
+    uint8_t source;
+    int8_t  tx_power_1m_dbm;
+    int8_t  rssi_dbm;
+    char    label[ON_LOC_LABEL_MAX_LEN];
+} on_ble_rx_evt_t;
+static on_ble_rx_evt_t  s_ble_rx_ring[ON_BLE_RX_RING_SZ];
+static volatile uint8_t s_ble_rx_head = 0u;
+static volatile uint8_t s_ble_rx_tail = 0u;
+
+class OpenNearBleBeaconScanCb : public BLEAdvertisedDeviceCallbacks {
+    void onResult(BLEAdvertisedDevice dev) override {
+        const uint8_t *pay = dev.getPayload();
+        size_t plen = dev.getPayloadLength();
+        if (!pay || plen < 4u) return;
+        on_ble_beacon_t b;
+        if (!on_ble_beacon_parse(pay, plen, &b) || !b.valid) return;
+        int rssi = dev.getRSSI();
+        if (rssi >= 0 || rssi < -120) return;
+        uint8_t next = static_cast<uint8_t>((s_ble_rx_tail + 1u) & (ON_BLE_RX_RING_SZ - 1u));
+        if (next == s_ble_rx_head) return; /* ring full: drop newest cleanly */
+        const uint8_t *raw_mac = reinterpret_cast<const uint8_t *>(dev.getAddress().getNative());
+        on_ble_rx_evt_t &e = s_ble_rx_ring[s_ble_rx_tail];
+        on_ble_beacon_derive_mac(&b, raw_mac, e.tag_mac48);
+        e.source          = static_cast<uint8_t>(b.source);
+        e.tx_power_1m_dbm = b.tx_power_1m_dbm;
+        e.rssi_dbm        = static_cast<int8_t>(rssi);
+        memcpy(e.label, b.label, sizeof(e.label));
+        __sync_synchronize();
+        s_ble_rx_tail = next;
+    }
+};
+
+static void on_ble_scan_done_cb(BLEScanResults res) {
+    (void)res;
+    if (s_ble_scanner) s_ble_scanner->clearResults();
+    s_ble_scan_active  = false;
+    s_ble_scan_last_ms = millis();
+}
 
 class OpenNearBleServerCb : public BLEServerCallbacks {
     void onConnect(BLEServer *srv) override {
         (void)srv;
+        if (s_ble_scanner && s_ble_scan_active) {
+            s_ble_scanner->stop();
+            s_ble_scan_active = false;
+        }
         if (s_gw_ref) on_gw_on_ble_state(s_gw_ref, true, 185u);
         Serial.println("[OpenNear BLE] Mobile/PC client connected");
     }
@@ -1337,9 +1449,15 @@ void on_esp32_net_gw_start(on_node_t *node, on_gw_ctx_t *gw, const char *ble_nam
     load_anchors_from_nvs();
     if (node) {
         on_node_set_rssi_observer(node, esp32_on_rssi_observed_cb, node);
+        on_node_set_ble_beacon_observer(node, esp32_on_ble_beacon_observed_cb, node);
     }
 #endif
 #ifdef OPENNEAR_ENABLE_BLE_GW
+    if (s_prefs.begin("opennear_gw", true)) {
+        s_ble_scan_enabled = s_prefs.getBool("blescan", true);
+        s_prefs.end();
+    }
+    if (gw) gw->cfg.ble_scan_enabled = s_ble_scan_enabled;
     /* Guarantee Wi-Fi modem sleep is enabled before starting BT controller under ESP-IDF SW coexist */
 #ifdef OPENNEAR_ENABLE_WIFI_GW
     apply_wifi_coex_ps();
@@ -1380,7 +1498,18 @@ void on_esp32_net_gw_start(on_node_t *node, on_gw_ctx_t *gw, const char *ble_nam
     adv->addServiceUUID(kBleSvcUuid);
     adv->setScanResponse(true);
     adv->start();
-    Serial.printf("[OpenNear BLE] GATT Bridge advertising as '%s' (Svc 0xFFE0, heap=%u B)\n",
+
+    /* v7.1: Low-duty passive BLE iBeacon/Eddystone scanner (25% duty, shouldParse=false -> 0 heap churn) */
+    s_ble_scanner = BLEDevice::getScan();
+    if (s_ble_scanner) {
+        s_ble_scanner->setAdvertisedDeviceCallbacks(new OpenNearBleBeaconScanCb(), true, false);
+        s_ble_scanner->setActiveScan(false);
+        s_ble_scanner->setInterval(100);
+        s_ble_scanner->setWindow(25);
+        s_ble_scan_last_ms = millis();
+    }
+    Serial.printf("[OpenNear BLE] GATT Bridge + Passive iBeacon/Eddystone Scanner (%s) as '%s' (heap=%u B)\n",
+                  s_ble_scan_enabled ? "ON" : "OFF",
                   ble_name && ble_name[0] ? ble_name : "OpenNear-GW",
                   (unsigned)ESP.getFreeHeap());
 #else
@@ -1601,6 +1730,56 @@ void on_esp32_net_gw_poll(on_node_t *node, on_gw_ctx_t *gw) {
 #endif
 
 #if defined(OPENNEAR_ENABLE_WIFI_GW) || defined(OPENNEAR_ENABLE_BLE_GW)
+#ifdef OPENNEAR_ENABLE_BLE_GW
+    if (gw->cfg.ble_scan_updated) {
+        gw->cfg.ble_scan_updated = false;
+        s_ble_scan_enabled = gw->cfg.ble_scan_enabled;
+        if (s_prefs.begin("opennear_gw", false)) {
+            s_prefs.putBool("blescan", s_ble_scan_enabled);
+            s_prefs.end();
+        }
+        if (!s_ble_scan_enabled && s_ble_scanner && s_ble_scan_active) {
+            s_ble_scanner->stop();
+            s_ble_scan_active = false;
+        }
+        Serial.printf("[OpenNear BLE] Passive iBeacon/Eddystone scanner -> %s\n",
+                      s_ble_scan_enabled ? "ENABLED" : "DISABLED");
+    }
+
+    /* Drain lock-free passive BLE beacon ring into OpenNear cluster / local locator */
+    while (s_ble_rx_head != s_ble_rx_tail) {
+        on_ble_rx_evt_t ev = s_ble_rx_ring[s_ble_rx_head];
+        __sync_synchronize();
+        s_ble_rx_head = static_cast<uint8_t>((s_ble_rx_head + 1u) & (ON_BLE_RX_RING_SZ - 1u));
+        if (node) {
+            on_esp32_node_lock();
+#ifdef OPENNEAR_ENABLE_WIFI_GW
+            if (node->role == ON_ROLE_G && s_loc_inited) {
+                on_loc_observe_beacon(&s_loc, node->mac48, ev.tag_mac48,
+                                      static_cast<on_loc_source_t>(ev.source),
+                                      ev.tx_power_1m_dbm, ev.rssi_dbm,
+                                      ev.label[0] ? ev.label : nullptr, millis());
+            } else
+#endif
+            {
+                on_node_report_ble_beacon(node, ev.tag_mac48, ev.source,
+                                          ev.tx_power_1m_dbm, ev.rssi_dbm);
+            }
+            on_esp32_node_unlock();
+        }
+    }
+
+    /* Non-blocking 2 s passive scan every 6 s (auto-paused during active phone GATT connection) */
+    uint32_t ble_now_ms = millis();
+    if (s_ble_scan_enabled && s_ble_scanner && !s_ble_scan_active && !gw->ble_connected &&
+        (ble_now_ms - s_ble_scan_last_ms) >= 6000u) {
+        s_ble_scan_active = s_ble_scanner->start(2u, on_ble_scan_done_cb, false);
+        if (!s_ble_scan_active) {
+            s_ble_scan_last_ms = ble_now_ms;
+        }
+    }
+#endif
+
     if (gw->cfg.net_key_updated) {
         gw->cfg.net_key_updated = false;
         static const uint8_t kFallbackKey[16] = {

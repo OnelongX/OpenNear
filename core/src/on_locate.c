@@ -24,10 +24,11 @@ static float rssi_to_dist_cm(float rssi_dbm, int8_t tx_1m_dbm, float n_exp) {
     return d_m * 100.0f;
 }
 
-static void copy_room(char dst[ON_LOC_ROOM_MAX_LEN], const char *src) {
+static void copy_sanitized(char *dst, size_t cap, const char *src) {
+    if (!dst || cap == 0u) return;
     size_t j = 0u;
     if (src) {
-        for (size_t i = 0u; src[i] != '\0' && j + 1u < ON_LOC_ROOM_MAX_LEN; ++i) {
+        for (size_t i = 0u; src[i] != '\0' && j + 1u < cap; ++i) {
             unsigned char c = (unsigned char)src[i];
             if (c >= 0x20u && c != '"' && c != '\\') {
                 dst[j++] = (char)c;
@@ -35,6 +36,131 @@ static void copy_room(char dst[ON_LOC_ROOM_MAX_LEN], const char *src) {
         }
     }
     dst[j] = '\0';
+}
+
+static void copy_room(char dst[ON_LOC_ROOM_MAX_LEN], const char *src) {
+    copy_sanitized(dst, ON_LOC_ROOM_MAX_LEN, src);
+}
+
+static uint8_t fnv1a_8(const uint8_t *data, size_t len) {
+    uint32_t h = 2166136261u;
+    for (size_t i = 0u; i < len; ++i) {
+        h ^= (uint32_t)data[i];
+        h *= 16777619u;
+    }
+    return (uint8_t)((h ^ (h >> 8) ^ (h >> 16) ^ (h >> 24)) & 0xFFu);
+}
+
+static int8_t clamp_tx1m(int32_t v) {
+    if (v < -100) return -100;
+    if (v > -20)  return -20;
+    return (int8_t)v;
+}
+
+bool on_ble_beacon_parse(const uint8_t *ad_data, size_t ad_len, on_ble_beacon_t *out) {
+    if (!ad_data || ad_len < 4u || !out) return false;
+    memset(out, 0, sizeof(*out));
+
+    size_t pos = 0u;
+    while (pos < ad_len) {
+        uint8_t flen = ad_data[pos];
+        if (flen == 0u) break;
+        if (pos + 1u + (size_t)flen > ad_len) break;
+        uint8_t ftype = ad_data[pos + 1u];
+        const uint8_t *val = ad_data + pos + 2u;
+        size_t vlen = (size_t)flen - 1u;
+
+        /* 1. Apple iBeacon: AD Type 0xFF (Manufacturer Specific), Company=0x004C, 0x02, 0x15 */
+        if (ftype == 0xFFu && vlen >= 25u &&
+            val[0] == 0x4Cu && val[1] == 0x00u &&
+            val[2] == 0x02u && val[3] == 0x15u) {
+            out->valid           = true;
+            out->source          = ON_LOC_SRC_IBEACON;
+            memcpy(out->uuid16, val + 4u, 16u);
+            out->major           = (uint16_t)(((uint16_t)val[20] << 8) | (uint16_t)val[21]);
+            out->minor           = (uint16_t)(((uint16_t)val[22] << 8) | (uint16_t)val[23]);
+            out->tx_power_1m_dbm = clamp_tx1m((int8_t)val[24]);
+            snprintf(out->label, sizeof(out->label), "iB:%u/%u",
+                     (unsigned)out->major, (unsigned)out->minor);
+            return true;
+        }
+
+        /* 2. Google Eddystone: AD Type 0x16 (16-bit Service Data), UUID=0xFEAA (LE: AA FE) */
+        if (ftype == 0x16u && vlen >= 4u &&
+            val[0] == 0xAAu && val[1] == 0xFEu) {
+            uint8_t frame_type = val[2];
+            if (frame_type == 0x00u && vlen >= 20u) {
+                /* Eddystone-UID: [2]=0x00, [3]=tx_0m, [4..13]=namespace(10), [14..19]=instance(6) */
+                out->valid           = true;
+                out->source          = ON_LOC_SRC_EDDYSTONE;
+                out->eddy_frame_type = 0x00u;
+                out->tx_power_1m_dbm = clamp_tx1m((int32_t)(int8_t)val[3] - 41);
+                memcpy(out->eddy_ns, val + 4u, 10u);
+                memcpy(out->eddy_inst, val + 14u, 6u);
+                snprintf(out->label, sizeof(out->label), "Ed:%02X%02X%02X%02X",
+                         (unsigned)out->eddy_inst[2], (unsigned)out->eddy_inst[3],
+                         (unsigned)out->eddy_inst[4], (unsigned)out->eddy_inst[5]);
+                return true;
+            }
+            if (frame_type == 0x10u && vlen >= 5u) {
+                /* Eddystone-URL: [2]=0x10, [3]=tx_0m, [4]=scheme, [5..]=encoded URL */
+                out->valid           = true;
+                out->source          = ON_LOC_SRC_EDDYSTONE;
+                out->eddy_frame_type = 0x10u;
+                out->tx_power_1m_dbm = clamp_tx1m((int32_t)(int8_t)val[3] - 41);
+                snprintf(out->label, sizeof(out->label), "EdURL:%02X", (unsigned)val[4]);
+                return true;
+            }
+            if (frame_type == 0x20u && vlen >= 16u && val[3] == 0x00u) {
+                /* Eddystone-TLM (unencrypted v0): [4..5]=vbatt_mv, [6..7]=temp 8.8 signed */
+                out->valid           = true;
+                out->source          = ON_LOC_SRC_BLE_RAW;
+                out->eddy_frame_type = 0x20u;
+                out->tx_power_1m_dbm = 0; /* TLM carries no txPower -> use anchor/previous */
+                out->tlm_batt_mv     = (uint16_t)(((uint16_t)val[4] << 8) | (uint16_t)val[5]);
+                int8_t  t_int        = (int8_t)val[6];
+                uint8_t t_frac       = val[7];
+                out->tlm_temp_c_x100 = (int16_t)((int32_t)t_int * 100 + ((int32_t)t_frac * 100) / 256);
+                snprintf(out->label, sizeof(out->label), "TLM:%umV", (unsigned)out->tlm_batt_mv);
+                return true;
+            }
+        }
+
+        pos += 1u + (size_t)flen;
+    }
+    return false;
+}
+
+void on_ble_beacon_derive_mac(const on_ble_beacon_t *b, const uint8_t fallback_ble_mac[6],
+                              uint8_t out_mac[6]) {
+    if (!out_mac) return;
+    memset(out_mac, 0, 6u);
+    if (!b || !b->valid) {
+        if (fallback_ble_mac) memcpy(out_mac, fallback_ble_mac, 6u);
+        return;
+    }
+    if (b->source == ON_LOC_SRC_IBEACON) {
+        /* Deterministic locally-administered MAC48 immune to iOS/Android MAC rotation */
+        out_mac[0] = 0x02u; /* LAA unicast marker for iBeacon */
+        out_mac[1] = fnv1a_8(b->uuid16, 16u);
+        out_mac[2] = (uint8_t)((b->major >> 8) & 0xFFu);
+        out_mac[3] = (uint8_t)(b->major & 0xFFu);
+        out_mac[4] = (uint8_t)((b->minor >> 8) & 0xFFu);
+        out_mac[5] = (uint8_t)(b->minor & 0xFFu);
+        return;
+    }
+    if (b->source == ON_LOC_SRC_EDDYSTONE && b->eddy_frame_type == 0x00u) {
+        out_mac[0] = 0x06u; /* LAA unicast marker for Eddystone-UID */
+        out_mac[1] = (uint8_t)(fnv1a_8(b->eddy_ns, 10u) ^ b->eddy_inst[0] ^ b->eddy_inst[1]);
+        out_mac[2] = b->eddy_inst[2];
+        out_mac[3] = b->eddy_inst[3];
+        out_mac[4] = b->eddy_inst[4];
+        out_mac[5] = b->eddy_inst[5];
+        return;
+    }
+    if (fallback_ble_mac) {
+        memcpy(out_mac, fallback_ble_mac, 6u);
+    }
 }
 
 void on_loc_init(on_loc_ctx_t *ctx) {
@@ -122,9 +248,10 @@ static on_loc_target_t *find_or_alloc_target(on_loc_ctx_t *ctx, const uint8_t ma
     return slot;
 }
 
-on_err_t on_loc_observe_rssi(on_loc_ctx_t *ctx, const uint8_t anchor_mac48[6],
-                             const uint8_t target_mac48[6], uint16_t target_short_id,
-                             int8_t rssi_dbm, uint32_t now_ms) {
+static on_err_t observe_common(on_loc_ctx_t *ctx, const uint8_t anchor_mac48[6],
+                               const uint8_t target_mac48[6], uint16_t target_short_id,
+                               on_loc_source_t source, int8_t tx_power_1m_dbm,
+                               const char *label, int8_t rssi_dbm, uint32_t now_ms) {
     if (!ctx || !loc_mac_nonzero(anchor_mac48) || !loc_mac_nonzero(target_mac48)) {
         return ON_ERR_INVALID_ARG;
     }
@@ -136,6 +263,13 @@ on_err_t on_loc_observe_rssi(on_loc_ctx_t *ctx, const uint8_t anchor_mac48[6],
     if (!t) return ON_ERR_NO_MEM;
     if (target_short_id != ON_SHORT_ID_UNASSIGNED) {
         t->short_id = target_short_id & ON_SHORT_ID_MASK;
+    }
+    t->source = (uint8_t)source;
+    if (tx_power_1m_dbm < 0 && tx_power_1m_dbm >= -100) {
+        t->tx_power_1m_dbm = tx_power_1m_dbm;
+    }
+    if (label && label[0] != '\0') {
+        copy_sanitized(t->label, sizeof(t->label), label);
     }
     t->last_seen_ms = now_ms;
 
@@ -180,6 +314,21 @@ on_err_t on_loc_observe_rssi(on_loc_ctx_t *ctx, const uint8_t anchor_mac48[6],
     return ON_OK;
 }
 
+on_err_t on_loc_observe_rssi(on_loc_ctx_t *ctx, const uint8_t anchor_mac48[6],
+                             const uint8_t target_mac48[6], uint16_t target_short_id,
+                             int8_t rssi_dbm, uint32_t now_ms) {
+    return observe_common(ctx, anchor_mac48, target_mac48, target_short_id,
+                          ON_LOC_SRC_OPENNEAR, 0, NULL, rssi_dbm, now_ms);
+}
+
+on_err_t on_loc_observe_beacon(on_loc_ctx_t *ctx, const uint8_t anchor_mac48[6],
+                               const uint8_t target_mac48[6], on_loc_source_t source,
+                               int8_t tx_power_1m_dbm, int8_t rssi_dbm,
+                               const char *label, uint32_t now_ms) {
+    return observe_common(ctx, anchor_mac48, target_mac48, ON_SHORT_ID_UNASSIGNED,
+                          source, tx_power_1m_dbm, label, rssi_dbm, now_ms);
+}
+
 bool on_loc_solve(on_loc_ctx_t *ctx, const uint8_t target_mac48[6],
                   uint32_t now_ms, on_loc_estimate_t *out_est) {
     if (!ctx || !out_est || !loc_mac_nonzero(target_mac48)) return false;
@@ -214,7 +363,8 @@ bool on_loc_solve(on_loc_ctx_t *ctx, const uint8_t target_mac48[6],
         if (o->anchor_idx >= ON_LOC_MAX_ANCHORS || !ctx->anchors[o->anchor_idx].active) continue;
 
         const on_loc_anchor_t *a = &ctx->anchors[o->anchor_idx];
-        float d = rssi_to_dist_cm(o->smooth_rssi, a->tx_power_1m_dbm, a->path_loss_n);
+        int8_t tx_ref = (t->tx_power_1m_dbm < 0) ? t->tx_power_1m_dbm : a->tx_power_1m_dbm;
+        float d = rssi_to_dist_cm(o->smooth_rssi, tx_ref, a->path_loss_n);
         ax[cnt]        = (float)a->x_cm;
         ay[cnt]        = (float)a->y_cm;
         dist_cm[cnt]   = d;
@@ -313,16 +463,28 @@ bool on_loc_solve(on_loc_ctx_t *ctx, const uint8_t target_mac48[6],
     if (cnt == 1u) rms = dist_cm[0];
     if (rms > 3000.0f) rms = 3000.0f;
 
-    out_est->valid         = true;
+    out_est->valid           = true;
     memcpy(out_est->mac48, t->mac48, 6u);
-    out_est->short_id      = t->short_id;
+    out_est->short_id        = t->short_id;
+    out_est->source          = t->source;
+    out_est->tx_power_1m_dbm = t->tx_power_1m_dbm;
+    copy_sanitized(out_est->label, sizeof(out_est->label), t->label);
     copy_room(out_est->room, t->cur_room);
-    out_est->x_cm          = (int32_t)lroundf(t->smooth_x_cm);
-    out_est->y_cm          = (int32_t)lroundf(t->smooth_y_cm);
-    out_est->best_rssi_dbm = (int8_t)lroundf(best_rssi);
-    out_est->anchor_count  = cnt;
-    out_est->est_err_cm    = (uint16_t)lroundf(rms);
+    out_est->x_cm            = (int32_t)lroundf(t->smooth_x_cm);
+    out_est->y_cm            = (int32_t)lroundf(t->smooth_y_cm);
+    out_est->best_rssi_dbm   = (int8_t)lroundf(best_rssi);
+    out_est->anchor_count    = cnt;
+    out_est->est_err_cm      = (uint16_t)lroundf(rms);
     return true;
+}
+
+static const char *loc_src_name(uint8_t s) {
+    switch (s) {
+        case ON_LOC_SRC_IBEACON:   return "ibeacon";
+        case ON_LOC_SRC_EDDYSTONE: return "eddystone";
+        case ON_LOC_SRC_BLE_RAW:   return "ble";
+        default:                   return "opennear";
+    }
 }
 
 static void loc_fmt_mac(const uint8_t m[6], char out[18]) {
@@ -364,10 +526,12 @@ size_t on_loc_format_json(on_loc_ctx_t *ctx, uint32_t now_ms,
         char mac_s[18];
         loc_fmt_mac(est.mac48, mac_s);
         int n = snprintf(out_buf + pos, out_cap - (size_t)pos,
-                         "%s{\"mac\":\"%s\",\"id\":\"0x%03X\",\"room\":\"%s\","
+                         "%s{\"mac\":\"%s\",\"id\":\"0x%03X\",\"src\":\"%s\",\"label\":\"%s\","
+                         "\"tx1m\":%d,\"room\":\"%s\","
                          "\"x_cm\":%ld,\"y_cm\":%ld,\"rssi\":%d,\"anchors\":%u,\"err_cm\":%u}",
-                         first ? "" : ",", mac_s, (unsigned)est.short_id, est.room,
-                         (long)est.x_cm, (long)est.y_cm, (int)est.best_rssi_dbm,
+                         first ? "" : ",", mac_s, (unsigned)est.short_id,
+                         loc_src_name(est.source), est.label, (int)est.tx_power_1m_dbm,
+                         est.room, (long)est.x_cm, (long)est.y_cm, (int)est.best_rssi_dbm,
                          (unsigned)est.anchor_count, (unsigned)est.est_err_cm);
         if (n <= 0 || (size_t)(pos + n) >= out_cap - 8u) break;
         pos += n;

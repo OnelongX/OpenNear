@@ -27,8 +27,33 @@ extern "C" {
 #define ON_LOC_MAX_TARGETS         24u
 #define ON_LOC_MAX_OBS_PER_TARGET  8u
 #define ON_LOC_ROOM_MAX_LEN        20u
-#define ON_LOC_OBS_STALE_MS        15000u
+#define ON_LOC_LABEL_MAX_LEN       20u
+#define ON_LOC_OBS_STALE_MS        20000u
 #define ON_LOC_HYSTERESIS_DB       4
+
+/* v7.1: Target radio / beacon standard origin */
+typedef enum {
+    ON_LOC_SRC_OPENNEAR  = 0, /* Native OpenNear 802.11 Action / Sub-G node */
+    ON_LOC_SRC_IBEACON   = 1, /* Apple iBeacon (AD 0xFF, Company 0x004C, 0x02 0x15) */
+    ON_LOC_SRC_EDDYSTONE = 2, /* Google Eddystone-UID / URL (AD 0x16, UUID 0xFEAA) */
+    ON_LOC_SRC_BLE_RAW   = 3  /* Generic BLE advertisement / Eddystone-TLM */
+} on_loc_source_t;
+
+/* v7.1: Decoded standard BLE beacon (iBeacon or Eddystone) */
+typedef struct {
+    bool            valid;
+    on_loc_source_t source;
+    uint8_t         eddy_frame_type;  /* 0x00=UID, 0x10=URL, 0x20=TLM (when Eddystone) */
+    int8_t          tx_power_1m_dbm;  /* Calibrated RSSI @ 1 m (Eddystone 0m converted via -41 dB) */
+    uint8_t         uuid16[16];       /* iBeacon Proximity UUID */
+    uint16_t        major;            /* iBeacon Major */
+    uint16_t        minor;            /* iBeacon Minor */
+    uint8_t         eddy_ns[10];      /* Eddystone-UID 10-byte Namespace */
+    uint8_t         eddy_inst[6];     /* Eddystone-UID 6-byte Instance */
+    uint16_t        tlm_batt_mv;      /* Eddystone-TLM Battery mV */
+    int16_t         tlm_temp_c_x100;  /* Eddystone-TLM Temperature in 0.01 C */
+    char            label[ON_LOC_LABEL_MAX_LEN]; /* Human-readable auto-label */
+} on_ble_beacon_t;
 
 typedef struct {
     bool     active;
@@ -55,6 +80,9 @@ typedef struct {
     bool         active;
     uint8_t      mac48[6];
     uint16_t     short_id;
+    uint8_t      source;          /* on_loc_source_t */
+    int8_t       tx_power_1m_dbm; /* 0 = use anchor default; <0 = beacon calibrated txPower@1m */
+    char         label[ON_LOC_LABEL_MAX_LEN];
     on_loc_obs_t obs[ON_LOC_MAX_OBS_PER_TARGET];
     char         cur_room[ON_LOC_ROOM_MAX_LEN];
     int8_t       cur_room_anchor_idx;
@@ -68,6 +96,9 @@ typedef struct {
     bool     valid;
     uint8_t  mac48[6];
     uint16_t short_id;
+    uint8_t  source;
+    int8_t   tx_power_1m_dbm;
+    char     label[ON_LOC_LABEL_MAX_LEN];
     char     room[ON_LOC_ROOM_MAX_LEN];
     int32_t  x_cm;
     int32_t  y_cm;
@@ -91,10 +122,24 @@ on_err_t on_loc_set_anchor(on_loc_ctx_t *ctx, const uint8_t mac48[6], uint16_t s
 on_err_t on_loc_calibrate_anchor(on_loc_ctx_t *ctx, const uint8_t mac48[6],
                                  int8_t tx_power_1m_dbm, float path_loss_n);
 
-/* Ingest a real-time RSSI observation (dBm, e.g. -62) of target heard by anchor */
+/* Ingest a real-time RSSI observation (dBm, e.g. -62) of an OpenNear node heard by anchor */
 on_err_t on_loc_observe_rssi(on_loc_ctx_t *ctx, const uint8_t anchor_mac48[6],
                              const uint8_t target_mac48[6], uint16_t target_short_id,
                              int8_t rssi_dbm, uint32_t now_ms);
+
+/* v7.1: Ingest a standard BLE iBeacon / Eddystone observation with calibrated txPower@1m */
+on_err_t on_loc_observe_beacon(on_loc_ctx_t *ctx, const uint8_t anchor_mac48[6],
+                               const uint8_t target_mac48[6], on_loc_source_t source,
+                               int8_t tx_power_1m_dbm, int8_t rssi_dbm,
+                               const char *label, uint32_t now_ms);
+
+/* v7.1: Pure C11 zero-heap parser for standard BLE Advertising Data (Apple iBeacon & Google Eddystone) */
+bool     on_ble_beacon_parse(const uint8_t *ad_data, size_t ad_len, on_ble_beacon_t *out);
+
+/* v7.1: Derive stable 6-byte identity MAC48 from iBeacon UUID/Major/Minor or Eddystone-UID
+ *       (immune to iOS/Android BLE random MAC rotation across all cluster anchors) */
+void     on_ble_beacon_derive_mac(const on_ble_beacon_t *b, const uint8_t fallback_ble_mac[6],
+                                  uint8_t out_mac[6]);
 
 /* Solve room + 2D (x_cm, y_cm) estimate for a specific target MAC48 */
 bool     on_loc_solve(on_loc_ctx_t *ctx, const uint8_t target_mac48[6],
