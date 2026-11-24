@@ -944,10 +944,12 @@ void on_node_on_rx_raw_timed_rssi(on_node_t *node, const uint8_t *frame, size_t 
         record_overheard_rssi(node, hdr.src_id, rssi_dbm);
     }
 
-    /* Fast L2 destination filter: skip unicast frames not addressed to us (except Backup_ID passive mirror) */
+    /* Fast L2 destination filter: skip unicast frames not addressed to us (except Backup_ID / Standby Gateway passive mirror) */
+    bool is_standby_mirror = (node->short_id != ON_SHORT_ID_UNASSIGNED &&
+                              (node->short_id == node->backup_id || (node->capabilities & 0x04u) != 0u));
     bool is_for_me = (hdr.dst_id == ON_SHORT_ID_BROADCAST) ||
                      (node->short_id != ON_SHORT_ID_UNASSIGNED && hdr.dst_id == node->short_id) ||
-                     (node->short_id != ON_SHORT_ID_UNASSIGNED && node->short_id == node->backup_id &&
+                     (is_standby_mirror &&
                       (hdr.type == ON_FRAME_TDMA_DATA || hdr.type == ON_FRAME_GW_BRIDGE) && !hdr.is_sub_g);
     if (!is_for_me) {
         return;
@@ -1294,8 +1296,8 @@ void on_node_on_rx_raw_timed_rssi(on_node_t *node, const uint8_t *frame, size_t 
                     node->relay_tail = (uint8_t)((node->relay_tail + 1u) % ON_DEFAULT_SUBG_MAX_SLOTS);
                     node->relay_count++;
                 }
-            } else if (node->short_id == node->backup_id && !hdr.is_sub_g) {
-                /* Hot-standby Backup_ID passively mirrors active 1-hop peer table, capabilities & cluster_tbl */
+            } else if ((node->short_id == node->backup_id || (node->capabilities & 0x04u) != 0u) && !hdr.is_sub_g) {
+                /* Hot-standby Backup_ID & all Standby Gateways passively mirror active 1-hop peer table & cluster_tbl */
                 uint8_t peer_caps = (uint8_t)((dp.flags >> 6) & 0x03u);
                 if (peer_caps == 0u) peer_caps = 0x01u;
                 on_peer_entry_t *pe = find_peer_by_id(node, hdr.src_id);
@@ -1422,7 +1424,8 @@ void on_node_on_rx_raw_timed_rssi(on_node_t *node, const uint8_t *frame, size_t 
             if (is_uplink) {
                 bool is_pri_g = (node->role == ON_ROLE_G);
                 bool is_bk_mirror = (!is_pri_g && node->short_id != ON_SHORT_ID_UNASSIGNED &&
-                                     node->short_id == node->backup_id && !hdr.is_sub_g);
+                                     (node->short_id == node->backup_id || (node->capabilities & 0x04u) != 0u) &&
+                                     !hdr.is_sub_g);
                 if (is_pri_g || is_bk_mirror) {
                     if (msg.bridge_type == ON_GW_MSG_TOPO_REQ) {
                         if (is_pri_g) {

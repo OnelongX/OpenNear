@@ -237,12 +237,12 @@ static uint32_t       s_last_rule_eval_ms = 0u;
 static on_role_t      s_last_obs_role     = ON_ROLE_UNJOINED;
 static uint16_t       s_last_synced_bk_id = ON_SHORT_ID_UNASSIGNED;
 
-/* v7.2: Push a provisioning/config command over AES-128-CCM air link to Standby Backup_ID Gateway */
+/* v7.2: Broadcast a provisioning/config command over AES-128-CCM air link to all Standby Gateways */
 static void sync_prov_to_standby_gw(on_node_t *node, const char *cmd_str, size_t cmd_len) {
     if (!node || !cmd_str || cmd_len == 0u || cmd_len > ON_GW_MAX_PAYLOAD_LEN) return;
     on_esp32_node_lock();
-    if (node->role == ON_ROLE_G && node->backup_id != ON_SHORT_ID_UNASSIGNED) {
-        on_node_send_gw_downlink(node, node->backup_id, ON_GW_MSG_WIFI_PROV,
+    if (node->role == ON_ROLE_G && node->tdma_bitmap != 0u) {
+        on_node_send_gw_downlink(node, ON_SHORT_ID_BROADCAST, ON_GW_MSG_WIFI_PROV,
                                  reinterpret_cast<const uint8_t *>(cmd_str),
                                  static_cast<uint8_t>(cmd_len));
     }
