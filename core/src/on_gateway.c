@@ -567,6 +567,31 @@ on_err_t on_gw_handle_control_text(on_gw_ctx_t *gw, const char *text, size_t len
     return ON_ERR_INVALID_ARG;
 }
 
+size_t on_gw_format_wifi_prov(const on_gw_ctx_t *gw, char *out_buf, size_t out_cap) {
+    if (!gw || !out_buf || out_cap < 16u || gw->cfg.wifi_ssid[0] == '\0') return 0u;
+    int n = 0;
+    if (gw->cfg.cloud_url[0] != '\0') {
+        n = snprintf(out_buf, out_cap, "WIFI:%s|%s|%s",
+                     gw->cfg.wifi_ssid, gw->cfg.wifi_pass, gw->cfg.cloud_url);
+    } else {
+        n = snprintf(out_buf, out_cap, "WIFI:%s|%s",
+                     gw->cfg.wifi_ssid, gw->cfg.wifi_pass);
+    }
+    if (n <= 0 || (size_t)n >= out_cap || (size_t)n > ON_GW_MAX_PAYLOAD_LEN) return 0u;
+    return (size_t)n;
+}
+
+size_t on_gw_format_mqtt_prov(const on_gw_ctx_t *gw, char *out_buf, size_t out_cap) {
+    if (!gw || !out_buf || out_cap < 16u || gw->cfg.mqtt_host[0] == '\0') return 0u;
+    uint16_t port = gw->cfg.mqtt_port ? gw->cfg.mqtt_port : (gw->cfg.mqtt_use_tls ? 8883u : 1883u);
+    int n = snprintf(out_buf, out_cap, "MQTT:%s|%u|%s|%s|%u",
+                     gw->cfg.mqtt_host, (unsigned)port,
+                     gw->cfg.mqtt_user, gw->cfg.mqtt_pass,
+                     gw->cfg.mqtt_use_tls ? 1u : 0u);
+    if (n <= 0 || (size_t)n >= out_cap || (size_t)n > ON_GW_MAX_PAYLOAD_LEN) return 0u;
+    return (size_t)n;
+}
+
 /* ========================================================================== */
 /* Cloud JSON Formatter & Network Poller                                      */
 /* ========================================================================== */

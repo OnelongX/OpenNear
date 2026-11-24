@@ -3231,7 +3231,22 @@ static void test_v72_wifi_csi_geofence_and_offline_rules(void) {
     EXPECT(gw_a.backup_id == 0x002u && gw_a.sub_g_id == ON_SHORT_ID_UNASSIGNED,
            "Plain terminal initially assigned as Backup_ID (0x002) when no standby gateway is present");
 
-    /* 2. Secondary Gateway GW_B (caps=0x07) joins GW_A -> preempts plain terminal as Backup_ID (0x003)! */
+    /* 2. Secondary Gateway GW_B (caps=0x07) joins GW_A -> preempts plain terminal as Backup_ID (0x003)!
+     *    Attach on_gw_ctx_t to GW_A (pre-configured with Wi-Fi + MQTTS + Admin Token) and GW_B (blank)
+     *    to verify Zero-Touch Dual-Gateway Over-the-Air Config Sync (ON_GW_MSG_WIFI_PROV = 0x05)! */
+    on_gw_ctx_t gw_a_ctx, gw_b_ctx;
+    on_gw_init(&gw_a_ctx, ON_GW_MODE_WIFI_AND_BLE, NULL);
+    on_gw_init(&gw_b_ctx, ON_GW_MODE_WIFI_AND_BLE, NULL);
+    on_gw_set_wifi_creds(&gw_a_ctx, "OpenNear_Home", "WifiPass2026", "http://192.168.1.50/hook");
+    strncpy(gw_a_ctx.cfg.mqtt_host, "192.168.1.10", sizeof(gw_a_ctx.cfg.mqtt_host) - 1u);
+    gw_a_ctx.cfg.mqtt_port    = 8883u;
+    gw_a_ctx.cfg.mqtt_use_tls = true;
+    strncpy(gw_a_ctx.cfg.mqtt_user, "ha_user", sizeof(gw_a_ctx.cfg.mqtt_user) - 1u);
+    strncpy(gw_a_ctx.cfg.mqtt_pass, "ha_pass", sizeof(gw_a_ctx.cfg.mqtt_pass) - 1u);
+    on_gw_set_admin_token(&gw_a_ctx, "GwMasterPin");
+    on_node_attach_gateway(&gw_a, &gw_a_ctx);
+    on_node_attach_gateway(&gw_b, &gw_b_ctx);
+
     on_join_req_t j_gwb;
     memset(&j_gwb, 0, sizeof(j_gwb));
     memcpy(j_gwb.mac48, gw_b.mac48, 6u);
@@ -3241,13 +3256,44 @@ static void test_v72_wifi_csi_geofence_and_offline_rules(void) {
     on_node_on_rx_raw(&gw_a, jraw, jrlen, 200000LL);
     EXPECT(gw_a.backup_id == 0x003u && gw_a.sub_g_id == 0x002u,
            "Standby Wi-Fi Gateway (caps=0x07) preempts plain terminal as Backup_ID and demotes plain terminal to Sub-G");
+    EXPECT(on_gw_ring_count(&gw_a_ctx.downlink_q) == 3u,
+           "Primary Gateway GW_A automatically queues WIFI + MQTT + TOKEN air-sync frames when Standby Gateway joins");
 
-    /* 3. Verify Standby Backup_ID (GW_B = 0x003) passively mirrors 1-hop/2-hop MAC_REPORT & CSI_REPORT */
+    /* 3. Deliver queued ON_GW_MSG_WIFI_PROV (0x05) frames over the air to Standby Gateway GW_B (0x003) */
     gw_b.role      = ON_ROLE_T;
     gw_b.short_id  = 0x003u;
     gw_b.backup_id = 0x003u;
     gw_b.parent_id = 0x001u;
     gw_b.sec.enabled = false;
+    on_gw_bridge_msg_t prov_msg;
+    while (on_gw_pop_downlink(&gw_a_ctx, &prov_msg)) {
+        uint8_t ppay[ON_MAX_PAYLOAD_LEN], praw[ON_MAX_FRAME_LEN];
+        size_t pplen = 0u, prlen = 0u;
+        on_gw_bridge_pack(&prov_msg, ppay, sizeof(ppay), &pplen);
+        on_mac_hdr_t phdr;
+        memset(&phdr, 0, sizeof(phdr));
+        phdr.version  = ON_PROTO_VERSION;
+        phdr.type     = (uint8_t)ON_FRAME_GW_BRIDGE;
+        phdr.src_id   = 0x001u;
+        phdr.dst_id   = 0x003u;
+        phdr.slot_idx = 14u;
+        on_frame_pack(&phdr, ppay, pplen, praw, sizeof(praw), &prlen);
+        on_node_on_rx_raw(&gw_b, praw, prlen, 250000LL);
+    }
+    EXPECT(gw_b_ctx.cfg.wifi_creds_updated &&
+           strcmp(gw_b_ctx.cfg.wifi_ssid, "OpenNear_Home") == 0 &&
+           strcmp(gw_b_ctx.cfg.wifi_pass, "WifiPass2026") == 0 &&
+           strcmp(gw_b_ctx.cfg.cloud_url, "http://192.168.1.50/hook") == 0,
+           "Standby Gateway GW_B automatically clones Wi-Fi SSID, password & webhook URL over air link");
+    EXPECT(gw_b_ctx.cfg.mqtt_creds_updated &&
+           strcmp(gw_b_ctx.cfg.mqtt_host, "192.168.1.10") == 0 &&
+           gw_b_ctx.cfg.mqtt_port == 8883u && gw_b_ctx.cfg.mqtt_use_tls &&
+           strcmp(gw_b_ctx.cfg.mqtt_user, "ha_user") == 0 &&
+           strcmp(gw_b_ctx.cfg.mqtt_pass, "ha_pass") == 0 &&
+           strcmp(gw_b_ctx.cfg.admin_token, "GwMasterPin") == 0,
+           "Standby Gateway GW_B automatically clones MQTTS Broker credentials & Admin Token over air link");
+
+    /* 4. Verify Standby Backup_ID (GW_B = 0x003) passively mirrors 1-hop/2-hop MAC_REPORT & CSI_REPORT */
     test_v72_csi_cb_t bk_csi;
     memset(&bk_csi, 0, sizeof(bk_csi));
     bk_csi.t2_id = 0x002u;

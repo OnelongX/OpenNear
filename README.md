@@ -7,7 +7,7 @@
 [![OpenNear CI](https://github.com/OnelongX/OpenNear/actions/workflows/ci.yml/badge.svg)](https://github.com/OnelongX/OpenNear/actions/workflows/ci.yml)
 ![Version](https://img.shields.io/badge/version-v7.2-0ea5e9?style=flat)
 ![Core](https://img.shields.io/badge/core-Pure%20C11%20%7C%20Zero%20Deps-10b981?style=flat)
-![Tests](https://img.shields.io/badge/tests-42%20Suites%20%7C%20509%20Assertions-22c55e?style=flat)
+![Tests](https://img.shields.io/badge/tests-42%20Suites%20%7C%20512%20Assertions-22c55e?style=flat)
 ![Platforms](https://img.shields.io/badge/hardware-ESP32%20%7C%20nRF52840%20%7C%20FPGA%20RTL-8b5cf6?style=flat)
 [![Web Flasher](https://img.shields.io/badge/ESP32%20Web%20Flasher-%E4%B8%80%E9%94%AE%E5%9C%A8%E7%BA%BF%E5%88%B7%E6%9C%BA-f97316?style=flat)](https://onelongx.github.io/OpenNear/)
 ![License](https://img.shields.io/badge/license-MIT-f59e0b?style=flat)
@@ -199,7 +199,7 @@ opennear/
 │   └── on_hal.h                       # 跨平台射频 / 高精定时器 / GPIO 硬件抽象层
 ├── sim/                               # 10 节点多跳物理仿真器（CLI 混沌参数注入 + CSV + PCAP + 仪表盘数据）
 ├── tests/
-│   ├── test_opennear.c                # 42 组全链路自动化单测与集成断言套件（509 项断言）
+│   ├── test_opennear.c                # 42 组全链路自动化单测与集成断言套件（512 项断言）
 │   ├── test_esp32_failover_hw.py      # ESP32 双板主备 RTS 复位长稳回归测试脚本
 │   ├── measure_esp32_gpio_sync.py     # ESP32 MCPWM 双板 GPIO 同步误差测量脚本
 │   ├── capture_esp32_act_trace.py     # ESP32 双板 ACT 全链路追踪抓取脚本

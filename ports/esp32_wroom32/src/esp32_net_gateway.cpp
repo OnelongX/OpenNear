@@ -235,6 +235,19 @@ static uint32_t       s_loc_demo_step     = 0u;
 static uint32_t       s_last_demo_step_ms = 0u;
 static uint32_t       s_last_rule_eval_ms = 0u;
 static on_role_t      s_last_obs_role     = ON_ROLE_UNJOINED;
+static uint16_t       s_last_synced_bk_id = ON_SHORT_ID_UNASSIGNED;
+
+/* v7.2: Push a provisioning/config command over AES-128-CCM air link to Standby Backup_ID Gateway */
+static void sync_prov_to_standby_gw(on_node_t *node, const char *cmd_str, size_t cmd_len) {
+    if (!node || !cmd_str || cmd_len == 0u || cmd_len > ON_GW_MAX_PAYLOAD_LEN) return;
+    on_esp32_node_lock();
+    if (node->role == ON_ROLE_G && node->backup_id != ON_SHORT_ID_UNASSIGNED) {
+        on_node_send_gw_downlink(node, node->backup_id, ON_GW_MSG_WIFI_PROV,
+                                 reinterpret_cast<const uint8_t *>(cmd_str),
+                                 static_cast<uint8_t>(cmd_len));
+    }
+    on_esp32_node_unlock();
+}
 
 static const char *lookup_mac_tags(const uint8_t mac[6]) {
     if (!mac || (mac[0] | mac[1] | mac[2] | mac[3] | mac[4] | mac[5]) == 0u) return nullptr;
@@ -616,10 +629,7 @@ static on_err_t esp32_mqtt_publish_cb(void *ctx, const char *topic,
 }
 
 static void esp32_mqtt_poll(on_node_t *node, on_gw_ctx_t *gw) {
-    if (!gw || WiFi.status() != WL_CONNECTED || gw->cfg.mqtt_host[0] == '\0') {
-        if (gw) gw->mqtt_connected = false;
-        return;
-    }
+    if (!gw) return;
     if (gw->cfg.mqtt_creds_updated) {
         gw->cfg.mqtt_creds_updated = false;
         on_esp32_tls_stop_mqtt_clients();
@@ -636,6 +646,13 @@ static void esp32_mqtt_poll(on_node_t *node, on_gw_ctx_t *gw) {
             s_prefs.putBool("mtls", gw->cfg.mqtt_use_tls);
             s_prefs.end();
         }
+        char pbuf[ON_GW_MAX_PAYLOAD_LEN + 1u];
+        size_t mlen = on_gw_format_mqtt_prov(gw, pbuf, sizeof(pbuf));
+        if (mlen > 0u) sync_prov_to_standby_gw(node, pbuf, mlen);
+    }
+    if (WiFi.status() != WL_CONNECTED || gw->cfg.mqtt_host[0] == '\0') {
+        gw->mqtt_connected = false;
+        return;
     }
 
     Client *cli = on_esp32_tls_get_mqtt_client(gw->cfg.mqtt_use_tls);
@@ -1279,15 +1296,12 @@ static void save_wifi_nvs(const char *ssid, const char *pass, const char *url) {
 }
 
 static on_err_t esp32_wifi_connect_cb(void *ctx, const char *ssid, const char *pass) {
-    auto *gw = static_cast<on_gw_ctx_t *>(ctx);
+    (void)ctx;
+    (void)ssid;
+    (void)pass;
     if (!ssid || !ssid[0]) return ON_ERR_INVALID_ARG;
-    save_wifi_nvs(ssid, pass ? pass : "", gw ? gw->cfg.cloud_url : "");
-    /* Keep SoftAP alive while connecting so the phone portal receives HTTP 200 & live STA status */
-    WiFi.mode(s_ap_active ? WIFI_AP_STA : WIFI_STA);
-    apply_wifi_coex_ps();
-    WiFi.begin(ssid, pass ? pass : "");
-    s_sta_start_ms = millis();
-    Serial.printf("[OpenNear GW] Connecting to public Wi-Fi SSID='%s'...\n", ssid);
+    /* Actual NVS save, WiFi.begin() & Standby Gateway air-sync run on Core 0 in on_esp32_net_gw_poll()
+     * via gw->cfg.wifi_creds_updated so Core 1 real-time RX (ON_GW_MSG_WIFI_PROV) never blocks! */
     return ON_OK;
 }
 
@@ -1542,6 +1556,12 @@ static on_err_t esp32_ble_notify_cb(void *ctx, const uint8_t *data, size_t len) 
 static on_err_t esp32_downlink_cb(void *ctx, const on_gw_bridge_msg_t *msg) {
     (void)ctx;
     if (!msg) return ON_ERR_INVALID_ARG;
+    if (msg->bridge_type == ON_GW_MSG_WIFI_PROV) {
+        Serial.printf("[OpenNear Sync] Encrypted air-sync config applied (%u B): %.*s\n",
+                      (unsigned)msg->payload_len, (int)msg->payload_len,
+                      reinterpret_cast<const char *>(msg->payload));
+        return ON_OK;
+    }
     on_esp32_demo_on_cmd(msg->payload, msg->payload_len);
     Serial.printf("[OpenNear GW] Downlink cmd seq=%u type=%u len=%u: %.*s\n",
                   (unsigned)msg->seq, (unsigned)msg->bridge_type,
@@ -1615,6 +1635,7 @@ void on_esp32_net_gw_preinit_wifi(on_gw_ctx_t *gw, const char *default_ssid,
 #endif
 
     on_gw_set_wifi_creds(gw, ssid.c_str(), pass.c_str(), url.c_str());
+    gw->cfg.wifi_creds_updated = false;
     s_sta_start_ms = millis();
     if (ssid.length() > 0) {
         WiFi.mode(WIFI_STA);
@@ -1791,6 +1812,20 @@ void on_esp32_net_gw_poll(on_node_t *node, on_gw_ctx_t *gw) {
     if (s_http_srv_started) {
         s_http_srv.handleClient();
     }
+    if (gw->cfg.wifi_creds_updated) {
+        gw->cfg.wifi_creds_updated = false;
+        if (gw->cfg.wifi_ssid[0] != '\0') {
+            save_wifi_nvs(gw->cfg.wifi_ssid, gw->cfg.wifi_pass, gw->cfg.cloud_url);
+            WiFi.mode(s_ap_active ? WIFI_AP_STA : WIFI_STA);
+            apply_wifi_coex_ps();
+            WiFi.begin(gw->cfg.wifi_ssid, gw->cfg.wifi_pass);
+            s_sta_start_ms = millis();
+            Serial.printf("[OpenNear GW] Connecting to public Wi-Fi SSID='%s'...\n", gw->cfg.wifi_ssid);
+            char pbuf[ON_GW_MAX_PAYLOAD_LEN + 1u];
+            size_t wlen = on_gw_format_wifi_prov(gw, pbuf, sizeof(pbuf));
+            if (wlen > 0u) sync_prov_to_standby_gw(node, pbuf, wlen);
+        }
+    }
     esp32_mqtt_poll(node, gw);
 
     if (gw->cfg.wifi_reset_requested) {
@@ -1829,6 +1864,9 @@ void on_esp32_net_gw_poll(on_node_t *node, on_gw_ctx_t *gw) {
             s_prefs.putString("atoken", gw->cfg.admin_token);
             s_prefs.end();
         }
+        char pbuf[64];
+        int tn = snprintf(pbuf, sizeof(pbuf), "TOKEN:%s", gw->cfg.admin_token);
+        if (tn >= 6) sync_prov_to_standby_gw(node, pbuf, static_cast<size_t>(tn));
         Serial.printf("[OpenNear GW] Admin token %s in NVS\n",
                       gw->cfg.admin_token[0] ? "updated & saved" : "cleared");
     }
@@ -1837,6 +1875,10 @@ void on_esp32_net_gw_poll(on_node_t *node, on_gw_ctx_t *gw) {
         gw->cfg.alias_updated = false;
         save_mac_alias(gw->cfg.alias_mac, gw->cfg.alias_name);
         s_last_ha_pub_ms = 0u; /* Republish HA Discovery immediately with new friendly name */
+        char mhex[13], pbuf[64];
+        format_mac_key(gw->cfg.alias_mac, mhex);
+        int an = snprintf(pbuf, sizeof(pbuf), "ALIAS:%s|%s", mhex, gw->cfg.alias_name);
+        if (an > 6) sync_prov_to_standby_gw(node, pbuf, static_cast<size_t>(an));
         Serial.printf("[OpenNear GW] Alias updated for %02X:%02X:%02X:%02X:%02X:%02X -> '%s'\n",
                       (unsigned)gw->cfg.alias_mac[0], (unsigned)gw->cfg.alias_mac[1],
                       (unsigned)gw->cfg.alias_mac[2], (unsigned)gw->cfg.alias_mac[3],
@@ -1847,6 +1889,10 @@ void on_esp32_net_gw_poll(on_node_t *node, on_gw_ctx_t *gw) {
     if (gw->cfg.tag_updated) {
         gw->cfg.tag_updated = false;
         save_mac_tags(gw->cfg.tag_mac, gw->cfg.tag_list);
+        char mhex[13], pbuf[64];
+        format_mac_key(gw->cfg.tag_mac, mhex);
+        int gn = snprintf(pbuf, sizeof(pbuf), "TAG:%s|%s", mhex, gw->cfg.tag_list);
+        if (gn > 4) sync_prov_to_standby_gw(node, pbuf, static_cast<size_t>(gn));
         Serial.printf("[OpenNear Tag] Tags updated for %02X:%02X:%02X:%02X:%02X:%02X -> '%s'\n",
                       (unsigned)gw->cfg.tag_mac[0], (unsigned)gw->cfg.tag_mac[1],
                       (unsigned)gw->cfg.tag_mac[2], (unsigned)gw->cfg.tag_mac[3],
@@ -1863,6 +1909,12 @@ void on_esp32_net_gw_poll(on_node_t *node, on_gw_ctx_t *gw) {
                           gw->cfg.anchor_room, gw->cfg.anchor_x_cm, gw->cfg.anchor_y_cm);
         on_esp32_node_unlock();
         save_anchors_to_nvs();
+        char mhex[13], pbuf[80];
+        format_mac_key(gw->cfg.anchor_mac, mhex);
+        int an = snprintf(pbuf, sizeof(pbuf), "ANCHOR:%s|%s|%ld|%ld",
+                          mhex, gw->cfg.anchor_room,
+                          (long)gw->cfg.anchor_x_cm, (long)gw->cfg.anchor_y_cm);
+        if (an > 7) sync_prov_to_standby_gw(node, pbuf, static_cast<size_t>(an));
         Serial.printf("[OpenNear Locate] Anchor %02X:%02X:%02X:%02X:%02X:%02X -> room='%s' (%ld,%ld cm)\n",
                       (unsigned)gw->cfg.anchor_mac[0], (unsigned)gw->cfg.anchor_mac[1],
                       (unsigned)gw->cfg.anchor_mac[2], (unsigned)gw->cfg.anchor_mac[3],
@@ -1887,6 +1939,11 @@ void on_esp32_net_gw_poll(on_node_t *node, on_gw_ctx_t *gw) {
                             gw->cfg.fence_x_cm, gw->cfg.fence_y_cm, gw->cfg.fence_radius_cm);
         on_esp32_node_unlock();
         if (!s_loc_demo_running) save_fences_to_nvs();
+        char pbuf[80];
+        int fn = snprintf(pbuf, sizeof(pbuf), "FENCE:%s|%ld|%ld|%u",
+                          gw->cfg.fence_name, (long)gw->cfg.fence_x_cm,
+                          (long)gw->cfg.fence_y_cm, (unsigned)gw->cfg.fence_radius_cm);
+        if (fn > 6) sync_prov_to_standby_gw(node, pbuf, static_cast<size_t>(fn));
         Serial.printf("[OpenNear Fence] Geofence '%s' (%ld,%ld cm, r=%u cm)\n",
                       gw->cfg.fence_name, (long)gw->cfg.fence_x_cm,
                       (long)gw->cfg.fence_y_cm, (unsigned)gw->cfg.fence_radius_cm);
@@ -1901,10 +1958,53 @@ void on_esp32_net_gw_poll(on_node_t *node, on_gw_ctx_t *gw) {
                         gw->cfg.rule_cmd_tag, gw->cfg.rule_cmd_payload);
         on_esp32_node_unlock();
         if (!s_loc_demo_running) save_rules_to_nvs();
+        char pbuf[96];
+        int rn = snprintf(pbuf, sizeof(pbuf), "RULE:%u|%u|%s|%u|%s|%s",
+                          (unsigned)gw->cfg.rule_id, (unsigned)gw->cfg.rule_trig_type,
+                          gw->cfg.rule_zone, (unsigned)gw->cfg.rule_csi_thresh,
+                          gw->cfg.rule_cmd_tag, gw->cfg.rule_cmd_payload);
+        if (rn > 5) sync_prov_to_standby_gw(node, pbuf, static_cast<size_t>(rn));
         Serial.printf("[OpenNear Rule] Rule R#%u trig=%u zone='%s' th=%u -> tag='%s' cmd='%s'\n",
                       (unsigned)gw->cfg.rule_id, (unsigned)gw->cfg.rule_trig_type,
                       gw->cfg.rule_zone, (unsigned)gw->cfg.rule_csi_thresh,
                       gw->cfg.rule_cmd_tag, gw->cfg.rule_cmd_payload);
+    }
+
+    /* v7.2: When a new Standby Backup_ID joins Primary G, bulk-clone saved Anchors, Geofences & Rules */
+    if (node && s_loc_inited && !s_loc_demo_running) {
+        uint16_t cur_bk = ON_SHORT_ID_UNASSIGNED;
+        on_esp32_node_lock();
+        if (node->role == ON_ROLE_G) cur_bk = node->backup_id;
+        on_esp32_node_unlock();
+        if (cur_bk != ON_SHORT_ID_UNASSIGNED && cur_bk != s_last_synced_bk_id) {
+            s_last_synced_bk_id = cur_bk;
+            char pbuf[96], mhex[13];
+            for (uint32_t i = 0u; i < ON_LOC_MAX_ANCHORS; ++i) {
+                if (!s_loc.anchors[i].active) continue;
+                format_mac_key(s_loc.anchors[i].mac48, mhex);
+                int n = snprintf(pbuf, sizeof(pbuf), "ANCHOR:%s|%s|%ld|%ld",
+                                 mhex, s_loc.anchors[i].room,
+                                 (long)s_loc.anchors[i].x_cm, (long)s_loc.anchors[i].y_cm);
+                if (n > 7) sync_prov_to_standby_gw(node, pbuf, static_cast<size_t>(n));
+            }
+            for (uint32_t i = 0u; i < ON_LOC_MAX_GEOFENCES; ++i) {
+                if (!s_loc.fences[i].active) continue;
+                int n = snprintf(pbuf, sizeof(pbuf), "FENCE:%s|%ld|%ld|%u",
+                                 s_loc.fences[i].name, (long)s_loc.fences[i].x_cm,
+                                 (long)s_loc.fences[i].y_cm, (unsigned)s_loc.fences[i].radius_cm);
+                if (n > 6) sync_prov_to_standby_gw(node, pbuf, static_cast<size_t>(n));
+            }
+            for (uint32_t i = 0u; i < ON_LOC_MAX_RULES; ++i) {
+                if (!s_loc.rules[i].active) continue;
+                int n = snprintf(pbuf, sizeof(pbuf), "RULE:%u|%u|%s|%u|%s|%s",
+                                 (unsigned)s_loc.rules[i].id, (unsigned)s_loc.rules[i].trig_type,
+                                 s_loc.rules[i].zone, (unsigned)s_loc.rules[i].csi_threshold,
+                                 s_loc.rules[i].cmd_tag, s_loc.rules[i].cmd_payload);
+                if (n > 5) sync_prov_to_standby_gw(node, pbuf, static_cast<size_t>(n));
+            }
+        } else if (cur_bk == ON_SHORT_ID_UNASSIGNED) {
+            s_last_synced_bk_id = ON_SHORT_ID_UNASSIGNED;
+        }
     }
 
     if (gw->cfg.loc_demo_updated) {

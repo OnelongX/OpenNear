@@ -197,6 +197,10 @@ bool     on_gw_pop_downlink(on_gw_ctx_t *gw, on_gw_bridge_msg_t *out);
 /* Parse BLE GATT / Cloud text command ("WIFI:...", "OTA:...", "CMD:...") */
 on_err_t on_gw_handle_control_text(on_gw_ctx_t *gw, const char *text, size_t len, bool from_ble);
 
+/* v7.2: Format current Wi-Fi / MQTT provisioning commands for Dual-Gateway encrypted air sync */
+size_t   on_gw_format_wifi_prov(const on_gw_ctx_t *gw, char *out_buf, size_t out_cap);
+size_t   on_gw_format_mqtt_prov(const on_gw_ctx_t *gw, char *out_buf, size_t out_cap);
+
 /* Format an uplink bridge message as JSON for public HTTP/MQTT cloud POST */
 size_t   on_gw_format_uplink_json(const on_gw_ctx_t *gw, const on_gw_bridge_msg_t *msg,
                                   int16_t skew_ns, char *out_buf, size_t out_cap);

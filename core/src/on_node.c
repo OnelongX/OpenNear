@@ -771,6 +771,29 @@ static void handle_join_req(on_node_t *node, const on_mac_hdr_t *hdr,
         }
     }
 
+    /* v7.2 Zero-Touch Dual-Gateway Config Sync: when a Standby Gateway (caps & 0x04) joins Primary G,
+     * automatically push Wi-Fi SSID/password, MQTT Broker credentials & Admin Token over AES-128-CCM! */
+    if (as_pri && node->gw && (req.capabilities & 0x04u) != 0u) {
+        char pbuf[ON_GW_MAX_PAYLOAD_LEN + 1u];
+        size_t wlen = on_gw_format_wifi_prov(node->gw, pbuf, sizeof(pbuf));
+        if (wlen > 0u) {
+            on_node_send_gw_downlink(node, pe->short_id, ON_GW_MSG_WIFI_PROV,
+                                     (const uint8_t *)pbuf, (uint8_t)wlen);
+        }
+        size_t mlen = on_gw_format_mqtt_prov(node->gw, pbuf, sizeof(pbuf));
+        if (mlen > 0u) {
+            on_node_send_gw_downlink(node, pe->short_id, ON_GW_MSG_WIFI_PROV,
+                                     (const uint8_t *)pbuf, (uint8_t)mlen);
+        }
+        if (node->gw->cfg.admin_token[0] != '\0') {
+            int tlen = snprintf(pbuf, sizeof(pbuf), "TOKEN:%s", node->gw->cfg.admin_token);
+            if (tlen > 6 && (size_t)tlen <= ON_GW_MAX_PAYLOAD_LEN) {
+                on_node_send_gw_downlink(node, pe->short_id, ON_GW_MSG_WIFI_PROV,
+                                         (const uint8_t *)pbuf, (uint8_t)tlen);
+            }
+        }
+    }
+
     pe->last_seen_sf = node->current_sf_seq;
     if (as_pri) {
         on_cluster_node_t *cn = cluster_find_or_alloc(node, pe->short_id);
@@ -1497,11 +1520,27 @@ void on_node_on_rx_raw_timed_rssi(on_node_t *node, const uint8_t *frame, size_t 
                     }
                 }
             } else {
-                /* Downlink command or cluster topology snapshot response */
+                /* Downlink command, Dual-Gateway encrypted config sync, or cluster topology snapshot response */
                 bool for_self = (msg.origin_id == node->short_id || msg.origin_id == ON_SHORT_ID_BROADCAST);
                 if (for_self) {
                     if (msg.bridge_type == ON_GW_MSG_TOPO_RESP) {
                         topo_ingest_resp_page(node, &msg);
+                    } else if (msg.bridge_type == ON_GW_MSG_WIFI_PROV) {
+                        if (node->gw && msg.payload_len > 0u) {
+                            char saved_tok[32];
+                            memcpy(saved_tok, node->gw->cfg.admin_token, sizeof(saved_tok));
+                            node->gw->cfg.admin_token[0] = '\0';
+                            (void)on_gw_handle_control_text(node->gw,
+                                                            (const char *)msg.payload,
+                                                            msg.payload_len, false);
+                            if (!node->gw->cfg.admin_token_updated) {
+                                memcpy(node->gw->cfg.admin_token, saved_tok, sizeof(saved_tok));
+                            }
+                        }
+                        if (node->gw && node->gw->ops.on_downlink_delivered) {
+                            node->gw->ops.on_downlink_delivered(node->gw->ops.user_ctx, &msg);
+                        }
+                        emit_event(node, "GW_PROV_SYNC_RX", msg.origin_id, (int64_t)msg.seq);
                     } else {
                         if (node->gw && node->gw->ops.on_downlink_delivered) {
                             node->gw->ops.on_downlink_delivered(node->gw->ops.user_ctx, &msg);
