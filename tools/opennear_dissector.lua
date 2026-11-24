@@ -1,4 +1,4 @@
--- OpenNear v6.7 Wireshark Lua Dissector (DLT_USER0 = 147)
+-- OpenNear v7.1 Wireshark Lua Dissector (DLT_USER0 = 147)
 -- Install: Copy to Wireshark Personal Lua Plugins folder, then Edit -> Preferences -> Protocols -> DLT_USER -> User 0 -> "opennear"
 
 local p_on = Proto("opennear", "OpenNear Clean-Slate NearLink-Class Protocol")
@@ -39,11 +39,12 @@ local f_ack_map   = ProtoField.uint16("opennear.sync.ack_bitmap", "Piggyback Gro
 local f_salt      = ProtoField.uint32("opennear.sync.session_salt", "Session Salt", base.HEX)
 local f_epoch     = ProtoField.uint8("opennear.sync.key_epoch", "Key Epoch", base.DEC)
 local f_bmac      = ProtoField.bytes("opennear.sync.beacon_mac", "Beacon CBC-MAC (4B)")
--- v6.7 GW_BRIDGE & MESH deep fields
+-- v6.7 / v7.1 GW_BRIDGE & MESH deep fields
 local f_gw_type   = ProtoField.uint8("opennear.gw.type", "GW Bridge Subtype", base.HEX, {
     [0x01] = "TELEMETRY_UP", [0x02] = "CLOUD_CMD_DOWN", [0x03] = "BLE_NOTIFY_UP",
     [0x04] = "BLE_CMD_DOWN", [0x05] = "WIFI_PROV", [0x06] = "OTA_URL_PULL",
-    [0x07] = "TOPO_REQ",     [0x08] = "TOPO_RESP", [0x09] = "MAC_REPORT"
+    [0x07] = "TOPO_REQ",     [0x08] = "TOPO_RESP", [0x09] = "MAC_REPORT",
+    [0x0A] = "RSSI_REPORT",  [0x0B] = "BLE_BEACON_REPORT"
 })
 local f_gw_flags  = ProtoField.uint8("opennear.gw.flags", "GW Flags", base.HEX)
 local f_gw_orig   = ProtoField.uint16("opennear.gw.origin_id", "Origin Short-ID", base.HEX)
@@ -135,6 +136,26 @@ function p_on.dissector(tvbuf, pinfo, tree)
         pt:add(f_gw_plen,    tvbuf(16, 1))
         if gwt == 0x09 and plen >= 6 and pktlen >= 4 + 6 + 13 + 2 then
             pt:add(f_gw_mac, tvbuf(17, 6))
+        elseif gwt == 0x0A and plen >= 3 then
+            local off = 17
+            while off + 3 <= pktlen - 2 and off < 17 + plen do
+                local tid = bit.band(tvbuf(off, 2):le_uint(), 0x0FFF)
+                local rssi = tvbuf(off + 2, 1):int()
+                pt:add(tvbuf(off, 3), string.format("Overheard Peer 0x%03X: RSSI = %d dBm", tid, rssi))
+                off = off + 3
+            end
+        elseif gwt == 0x0B and plen >= 9 then
+            local off = 17
+            local src_names = { [1]="iBeacon", [2]="Eddystone", [3]="BLE" }
+            while off + 9 <= pktlen - 2 and off < 17 + plen do
+                local bsrc = tvbuf(off + 6, 1):uint()
+                local tx1m = tvbuf(off + 7, 1):int()
+                local rssi = tvbuf(off + 8, 1):int()
+                local sub = pt:add(tvbuf(off, 9), string.format("%s Beacon: RSSI=%d dBm (tx1m=%d dBm)",
+                                   src_names[bsrc] or "BLE", rssi, tx1m))
+                sub:add(f_gw_mac, tvbuf(off, 6))
+                off = off + 9
+            end
         end
     elseif ftype == 13 and bit.band(fc, 0x02) == 0 and pktlen >= 4 + 6 + 9 + 2 then
         -- Unencrypted 3~6-hop Hybrid MESH payload (9B header + payload)

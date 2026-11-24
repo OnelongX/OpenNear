@@ -2909,6 +2909,111 @@ static void test_v71_ble_ibeacon_eddystone_and_relay(void) {
            (int)est.x_cm, (int)est.y_cm, (int)err_x, (int)err_y);
 }
 
+/* 41. Test v7.1 Deep Audit: 2-Hop Wall-Blocked Edge Anchor Relay, Stale Target GC & Eddystone-URL */
+static void test_v71_deep_audit_2hop_anchor_and_stale_gc(void) {
+    printf("[TEST 41] v7.1 Deep Audit: 2-Hop Wall-Blocked Edge Anchor Relay, Stale Target GC & Eddystone-URL...\n");
+
+    /* Part A: Wall-blocked 2-hop Edge Node T8 acting as positioning Anchor via Sub-G relay */
+    sim_world_t w;
+    sim_world_init(&w, 0x71D42026ULL);
+    sim_world_setup_10node_demo(&w, true);
+    sim_world_run_us(&w, 200000, 10); /* 50 SFs so 2-hop T8 & T9 join and register MAC48s */
+
+    on_node_t *g_node  = &w.nodes[0];
+    on_node_t *t8_node = &w.nodes[8]; /* 2-hop wall-blocked edge node */
+    on_node_t *t9_node = &w.nodes[9]; /* 2-hop sibling heard by T8 */
+    EXPECT(t8_node->role == ON_ROLE_T && t8_node->is_sub_node && t8_node->short_id >= 0x100u,
+           "2-hop edge node T8 joined Sub-G sub-superframe");
+
+    const uint8_t ib_mac[6] = { 0x02, 0xA9, 0x03, 0xE9, 0x00, 0x55 };
+    test_v71_ble_cb_t bcb;
+    memset(&bcb, 0, sizeof(bcb));
+    bcb.expect_anchor = t8_node->short_id; /* Must be attributed to 2-hop T8 (0x100), NOT Sub-G! */
+    memcpy(bcb.expect_mac, ib_mac, 6u);
+    bcb.expect_src  = (uint8_t)ON_LOC_SRC_IBEACON;
+    bcb.expect_tx1m = -59;
+    bcb.expect_rssi = -67;
+    on_node_set_ble_beacon_observer(g_node, test_v71_ble_cb, &bcb);
+    on_node_enable_rssi_anchor_report(t8_node, true);
+
+    on_node_report_ble_beacon(t8_node, ib_mac, (uint8_t)ON_LOC_SRC_IBEACON, -59, -67);
+    EXPECT(t8_node->ble_obs_count == 1u, "2-hop edge anchor T8 buffers BLE beacon observation");
+
+    /* Run 110 SFs so 2-hop T8 sends in Sub-TDMA slot and Sub-G relays to Primary G with 0 collisions */
+    sim_world_run_us(&w, 440000, 10);
+    EXPECT(w.tdma_subg_collisions == 0u && w.cra_collisions == 0u,
+           "Zero RF collisions during 2-hop T8 -> Sub-G -> Primary G BLE_BEACON_REPORT relay");
+    EXPECT(bcb.matched,
+           "Primary G attributes 2-hop relayed BLE_BEACON_REPORT to true 2-hop Anchor T8 (origin_id)");
+
+    /* Now verify 2-hop Edge Anchor T8 overhearing sibling T9's RSSI and relaying via Sub-G */
+    test_v70_rssi_cb_t rcb;
+    memset(&rcb, 0, sizeof(rcb));
+    rcb.expect_anchor_id = t8_node->short_id;
+    rcb.expect_target_id = t9_node->short_id;
+    rcb.expect_rssi_dbm  = -61;
+    on_node_set_rssi_observer(g_node, test_v70_rssi_cb, &rcb);
+
+    on_mac_hdr_t oh;
+    memset(&oh, 0, sizeof(oh));
+    oh.version    = ON_PROTO_VERSION;
+    oh.type       = (uint8_t)ON_FRAME_TDMA_DATA;
+    oh.is_sub_g   = true;
+    oh.src_id     = t9_node->short_id;
+    oh.dst_id     = t8_node->parent_id;
+    oh.sf_seq_low = (uint8_t)(t8_node->current_sf_seq & 0x0Fu);
+    oh.slot_idx   = t9_node->my_slot;
+    uint8_t dpay[2] = { 0xE9u, 0x01u };
+    uint8_t raw_oh[ON_MAX_FRAME_LEN];
+    size_t  raw_len = 0u;
+    EXPECT(on_frame_pack(&oh, dpay, sizeof(dpay), raw_oh, sizeof(raw_oh), &raw_len) == ON_OK,
+           "Packed 2-hop sibling frame for RSSI overhearing");
+    on_node_on_rx_raw_rssi(t8_node, raw_oh, raw_len,
+                           sim_phys_to_local_ns(&w, 8u, w.phys_now_ns), -61);
+    sim_world_run_us(&w, 440000, 10);
+    EXPECT(w.tdma_subg_collisions == 0u && w.cra_collisions == 0u,
+           "Zero RF collisions during 2-hop T8 -> Sub-G -> Primary G RSSI_REPORT relay");
+    EXPECT(rcb.matched_expected,
+           "Primary G attributes 2-hop relayed RSSI_REPORT to true 2-hop Anchor T8");
+
+    /* Part B: Stale Target Auto-GC & Out-of-Order Timestamp Immunity */
+    on_loc_ctx_t loc;
+    on_loc_init(&loc);
+    const uint8_t amac[6] = { 0xAA, 0x88, 0x00, 0x00, 0x00, 0x01 };
+    const uint8_t tmac[6] = { 0x02, 0xBB, 0x00, 0x01, 0x00, 0x02 };
+    on_loc_set_anchor(&loc, amac, 1u, "Garage", 0, 0);
+    on_loc_observe_beacon(&loc, amac, tmac, ON_LOC_SRC_IBEACON, -59, -62, "iB:1/2", 5000u);
+
+    on_loc_estimate_t est;
+    /* Out-of-order earlier timestamp (4000 < 5000) must not underflow unsigned subtraction */
+    EXPECT(on_loc_solve(&loc, tmac, 4000u, &est) && est.valid,
+           "on_loc_solve handles out-of-order timestamp without unsigned underflow");
+    /* After > 2 * ON_LOC_OBS_STALE_MS (50000 ms), stale target slot is automatically garbage-collected */
+    EXPECT(!on_loc_solve(&loc, tmac, 50000u, &est) && !loc.targets[0].active,
+           "Stale target (>2x stale window) automatically garbage-collected from target table");
+
+    /* Part C: Eddystone-URL (frame_type = 0x10) parsing & fallback BLE MAC derivation */
+    const uint8_t ed_url_ad[14] = {
+        0x0D, 0x16, 0xAA, 0xFE,
+        0x10,       /* Eddystone-URL */
+        0xEC,       /* txPower@0m = -20 dBm -> txPower@1m = -61 dBm */
+        0x03,       /* https:// */
+        'o', 'p', 'e', 'n', '.', 'i', 'o'
+    };
+    on_ble_beacon_t url_b;
+    EXPECT(on_ble_beacon_parse(ed_url_ad, sizeof(ed_url_ad), &url_b) && url_b.valid &&
+           url_b.source == ON_LOC_SRC_EDDYSTONE && url_b.eddy_frame_type == 0x10u &&
+           url_b.tx_power_1m_dbm == -61 && strcmp(url_b.label, "EdURL:03") == 0,
+           "Google Eddystone-URL frame parsed with -41 dB 0m->1m calibration");
+    const uint8_t fb_mac[6] = { 0xC4, 0x55, 0x66, 0x77, 0x88, 0x99 };
+    uint8_t url_mac[6];
+    on_ble_beacon_derive_mac(&url_b, fb_mac, url_mac);
+    EXPECT(memcmp(url_mac, fb_mac, 6u) == 0, "Eddystone-URL preserves fallback BLE MAC48");
+
+    printf("    -> 2-Hop Edge Anchor T8(0x%03X) BLE+RSSI Relay OK (0 coll) | Stale Target GC OK | Eddystone-URL OK\n",
+           (unsigned)t8_node->short_id);
+}
+
 int main(void) {
     printf("============================================================\n");
     printf("       OpenNear v7.1 Core Protocol Automated Test Suite     \n");
@@ -2955,6 +3060,7 @@ int main(void) {
     test_v68_failover_mac_recovery_and_mac_mqtt_routing();
     test_v70_indoor_locate_rssi_and_tags();
     test_v71_ble_ibeacon_eddystone_and_relay();
+    test_v71_deep_audit_2hop_anchor_and_stale_gc();
 
     printf("\n------------------------------------------------------------\n");
     printf("SUMMARY: %d passed, %d failed\n", g_tests_passed, g_tests_failed);

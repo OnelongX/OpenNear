@@ -359,7 +359,7 @@ bool on_loc_solve(on_loc_ctx_t *ctx, const uint8_t target_mac48[6],
     for (uint32_t i = 0u; i < ON_LOC_MAX_OBS_PER_TARGET; ++i) {
         const on_loc_obs_t *o = &t->obs[i];
         if (!o->used) continue;
-        if ((now_ms - o->last_ms) > ON_LOC_OBS_STALE_MS) continue;
+        if (now_ms >= o->last_ms && (now_ms - o->last_ms) > ON_LOC_OBS_STALE_MS) continue;
         if (o->anchor_idx >= ON_LOC_MAX_ANCHORS || !ctx->anchors[o->anchor_idx].active) continue;
 
         const on_loc_anchor_t *a = &ctx->anchors[o->anchor_idx];
@@ -380,7 +380,12 @@ bool on_loc_solve(on_loc_ctx_t *ctx, const uint8_t target_mac48[6],
         }
         cnt++;
     }
-    if (cnt == 0u || best_i < 0) return false;
+    if (cnt == 0u || best_i < 0) {
+        if (now_ms >= t->last_seen_ms && (now_ms - t->last_seen_ms) > (ON_LOC_OBS_STALE_MS * 2u)) {
+            t->active = false;
+        }
+        return false;
+    }
 
     /* 1. Room classification with +4 dB hysteresis anti-ping-pong */
     int chosen_aidx = aidx_list[best_i];

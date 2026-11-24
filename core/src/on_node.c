@@ -1372,21 +1372,31 @@ void on_node_on_rx_raw_timed_rssi(on_node_t *node, const uint8_t *frame, size_t 
                         node->rx_slot_mask_this_sf |= (uint16_t)(1u << (hdr.slot_idx & 0x0Fu));
                         on_peer_entry_t *pe_an = find_peer_by_id(node, hdr.src_id);
                         if (pe_an) pe_an->last_seen_sf = node->current_sf_seq;
+                        uint16_t anchor_id = (msg.origin_id != ON_SHORT_ID_UNASSIGNED) ? msg.origin_id : hdr.src_id;
+                        if (anchor_id != hdr.src_id) {
+                            on_cluster_node_t *cn_an = cluster_find_or_alloc(node, anchor_id);
+                            if (cn_an) cn_an->last_seen_sf = node->current_sf_seq;
+                        }
                         if (node->on_rssi_observed) {
                             for (uint8_t k = 0u; (uint8_t)(k + 3u) <= msg.payload_len; k = (uint8_t)(k + 3u)) {
                                 uint16_t tid = (uint16_t)(((uint16_t)msg.payload[k] |
                                                           ((uint16_t)msg.payload[k + 1u] << 8)) & ON_SHORT_ID_MASK);
                                 int8_t rdbm = (int8_t)msg.payload[k + 2u];
-                                node->on_rssi_observed(node->rssi_obs_ctx, hdr.src_id, tid, rdbm);
+                                node->on_rssi_observed(node->rssi_obs_ctx, anchor_id, tid, rdbm);
                             }
                         }
                     } else if (msg.bridge_type == ON_GW_MSG_BLE_BEACON_REPORT && msg.payload_len >= 9u) {
                         node->rx_slot_mask_this_sf |= (uint16_t)(1u << (hdr.slot_idx & 0x0Fu));
                         on_peer_entry_t *pe_bn = find_peer_by_id(node, hdr.src_id);
                         if (pe_bn) pe_bn->last_seen_sf = node->current_sf_seq;
+                        uint16_t anchor_id = (msg.origin_id != ON_SHORT_ID_UNASSIGNED) ? msg.origin_id : hdr.src_id;
+                        if (anchor_id != hdr.src_id) {
+                            on_cluster_node_t *cn_bn = cluster_find_or_alloc(node, anchor_id);
+                            if (cn_bn) cn_bn->last_seen_sf = node->current_sf_seq;
+                        }
                         if (node->on_ble_beacon_observed) {
                             for (uint8_t k = 0u; (uint8_t)(k + 9u) <= msg.payload_len; k = (uint8_t)(k + 9u)) {
-                                node->on_ble_beacon_observed(node->ble_obs_ctx, hdr.src_id,
+                                node->on_ble_beacon_observed(node->ble_obs_ctx, anchor_id,
                                                              &msg.payload[k],
                                                              msg.payload[k + 6u],
                                                              (int8_t)msg.payload[k + 7u],
@@ -1423,6 +1433,9 @@ void on_node_on_rx_raw_timed_rssi(on_node_t *node, const uint8_t *frame, size_t 
                         emit_event(node, "GW_UPLINK_RX", msg.origin_id, (int64_t)msg.seq);
                     }
                 } else if (node->role == ON_ROLE_SUB_G && hdr.is_sub_g) {
+                    node->sub_rx_slot_mask_this_sf |= (uint16_t)(1u << (hdr.slot_idx & 0x0Fu));
+                    on_peer_entry_t *pe_ch = find_peer_by_id(node, hdr.src_id);
+                    if (pe_ch) pe_ch->last_seen_sf = node->current_sf_seq;
                     msg.flags |= ON_GW_FLAG_RELAYED_2HOP;
                     size_t rlen = 0u;
                     if (on_gw_bridge_pack(&msg, node->sub_ul_payload, sizeof(node->sub_ul_payload), &rlen) == ON_OK) {
@@ -2178,6 +2191,79 @@ tdma_slot_done: ;
         int64_t sub_slot_ns = (int64_t)on_sf_subg_slot_start_us(&node->sf_cfg, node->my_slot) * 1000LL;
         if (elapsed_ns >= sub_slot_ns && elapsed_ns < sub_slot_ns + 80000LL) {
             node->tdma_tx_done_this_sf = true;
+            /* v7.1: 2-hop Edge Anchor zero-collision overheard RSSI & BLE beacon batch reporting via Sub-G */
+            if (node->rssi_report_enabled && !node->harq_retry_pending &&
+                node->tdma_tx_total > 0u && node->rssi_obs_count > 0u &&
+                (node->current_sf_seq - node->last_rssi_rep_sf) >= 64u) {
+                on_gw_bridge_msg_t rrep;
+                memset(&rrep, 0, sizeof(rrep));
+                rrep.bridge_type = (uint8_t)ON_GW_MSG_RSSI_REPORT;
+                rrep.flags       = ON_GW_FLAG_RELAYED_2HOP;
+                rrep.origin_id   = node->short_id;
+                rrep.seq         = ++node->data_tx_seq;
+                uint8_t out_n = 0u;
+                for (uint8_t ri = 0u; ri < node->rssi_obs_count && out_n + 3u <= ON_GW_MAX_PAYLOAD_LEN; ++ri) {
+                    rrep.payload[out_n++] = (uint8_t)(node->rssi_obs[ri].short_id & 0xFFu);
+                    rrep.payload[out_n++] = (uint8_t)((node->rssi_obs[ri].short_id >> 8) & 0x0Fu);
+                    rrep.payload[out_n++] = (uint8_t)node->rssi_obs[ri].rssi_dbm;
+                }
+                rrep.payload_len = out_n;
+                uint8_t rbuf[ON_GW_BRIDGE_HDR_LEN + 24u];
+                size_t rlen = 0u;
+                if (out_n >= 3u && on_gw_bridge_pack(&rrep, rbuf, sizeof(rbuf), &rlen) == ON_OK) {
+                    on_mac_hdr_t hdr;
+                    memset(&hdr, 0, sizeof(hdr));
+                    hdr.version    = ON_PROTO_VERSION;
+                    hdr.type       = (uint8_t)ON_FRAME_GW_BRIDGE;
+                    hdr.is_sub_g   = true;
+                    hdr.src_id     = node->short_id;
+                    hdr.dst_id     = node->parent_id;
+                    hdr.sf_seq_low = (uint8_t)(node->current_sf_seq & 0x0Fu);
+                    hdr.slot_idx   = node->my_slot;
+                    send_frame(node, &hdr, rbuf, rlen, now_local_ns);
+                    node->last_rssi_rep_sf = node->current_sf_seq;
+                    node->rssi_obs_count   = 0u;
+                    node->gw_tx_total++;
+                    goto sub_tdma_slot_done;
+                }
+            }
+            if (node->rssi_report_enabled && !node->harq_retry_pending &&
+                node->tdma_tx_total > 0u && node->ble_obs_count > 0u &&
+                (node->current_sf_seq - node->last_ble_rep_sf) >= 64u) {
+                on_gw_bridge_msg_t brep;
+                memset(&brep, 0, sizeof(brep));
+                brep.bridge_type = (uint8_t)ON_GW_MSG_BLE_BEACON_REPORT;
+                brep.flags       = ON_GW_FLAG_RELAYED_2HOP;
+                brep.origin_id   = node->short_id;
+                brep.seq         = ++node->data_tx_seq;
+                uint8_t out_n = 0u;
+                for (uint8_t bi = 0u; bi < node->ble_obs_count && out_n + 9u <= ON_GW_MAX_PAYLOAD_LEN; ++bi) {
+                    memcpy(&brep.payload[out_n], node->ble_obs[bi].tag_mac48, 6u);
+                    brep.payload[out_n + 6u] = node->ble_obs[bi].source;
+                    brep.payload[out_n + 7u] = (uint8_t)node->ble_obs[bi].tx_power_1m_dbm;
+                    brep.payload[out_n + 8u] = (uint8_t)node->ble_obs[bi].rssi_dbm;
+                    out_n = (uint8_t)(out_n + 9u);
+                }
+                brep.payload_len = out_n;
+                uint8_t bbuf[ON_GW_BRIDGE_HDR_LEN + 40u];
+                size_t blen = 0u;
+                if (out_n >= 9u && on_gw_bridge_pack(&brep, bbuf, sizeof(bbuf), &blen) == ON_OK) {
+                    on_mac_hdr_t hdr;
+                    memset(&hdr, 0, sizeof(hdr));
+                    hdr.version    = ON_PROTO_VERSION;
+                    hdr.type       = (uint8_t)ON_FRAME_GW_BRIDGE;
+                    hdr.is_sub_g   = true;
+                    hdr.src_id     = node->short_id;
+                    hdr.dst_id     = node->parent_id;
+                    hdr.sf_seq_low = (uint8_t)(node->current_sf_seq & 0x0Fu);
+                    hdr.slot_idx   = node->my_slot;
+                    send_frame(node, &hdr, bbuf, blen, now_local_ns);
+                    node->last_ble_rep_sf = node->current_sf_seq;
+                    node->ble_obs_count   = 0u;
+                    node->gw_tx_total++;
+                    goto sub_tdma_slot_done;
+                }
+            }
             on_data_payload_t dp;
             if (node->harq_retry_pending) {
                 dp = node->last_tx_data;
@@ -2220,6 +2306,7 @@ tdma_slot_done: ;
 
             send_frame(node, &hdr, dbuf, dlen, now_local_ns);
             node->tdma_tx_total++;
+sub_tdma_slot_done: ;
         }
     }
 

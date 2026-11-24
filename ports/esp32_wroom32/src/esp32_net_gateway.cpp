@@ -905,6 +905,11 @@ static void start_local_http_api(void) {
             on_cluster_snapshot_t snap;
             on_esp32_node_lock();
             on_node_get_cluster_snapshot(s_node_ref, &snap);
+            if (s_loc_inited) {
+                for (uint32_t i = 0u; i < ON_LOC_MAX_TARGETS; ++i) {
+                    if (s_loc.targets[i].active) lookup_mac_alias(s_loc.targets[i].mac48);
+                }
+            }
             on_esp32_node_unlock();
             for (uint8_t i = 0u; i < snap.active_count; ++i) {
                 lookup_mac_alias(snap.nodes[i].mac48);
@@ -938,6 +943,11 @@ static void start_local_http_api(void) {
             on_cluster_snapshot_t snap;
             on_esp32_node_lock();
             on_node_get_cluster_snapshot(s_node_ref, &snap);
+            if (s_loc_inited) {
+                for (uint32_t i = 0u; i < ON_LOC_MAX_TARGETS; ++i) {
+                    if (s_loc.targets[i].active) lookup_mac_tags(s_loc.targets[i].mac48);
+                }
+            }
             on_esp32_node_unlock();
             for (uint8_t i = 0u; i < snap.active_count; ++i) {
                 lookup_mac_tags(snap.nodes[i].mac48);
@@ -969,6 +979,13 @@ static void start_local_http_api(void) {
             return;
         }
         on_esp32_node_lock();
+        if (s_node_ref) {
+            for (uint32_t i = 0u; i < ON_LOC_MAX_ANCHORS; ++i) {
+                if (!s_loc.anchors[i].active) continue;
+                uint16_t sid = on_node_find_short_id_by_mac(s_node_ref, s_loc.anchors[i].mac48);
+                if (sid != ON_SHORT_ID_UNASSIGNED) s_loc.anchors[i].short_id = sid;
+            }
+        }
         size_t n = on_loc_format_json(&s_loc, millis(), json, sizeof(json));
         on_esp32_node_unlock();
         s_http_srv.send(200, "application/json", (n > 0u) ? json : "{\"anchors\":[],\"targets\":[]}");

@@ -7,7 +7,7 @@
 [![OpenNear CI](https://github.com/OnelongX/OpenNear/actions/workflows/ci.yml/badge.svg)](https://github.com/OnelongX/OpenNear/actions/workflows/ci.yml)
 ![Version](https://img.shields.io/badge/version-v7.1-0ea5e9?style=flat)
 ![Core](https://img.shields.io/badge/core-Pure%20C11%20%7C%20Zero%20Deps-10b981?style=flat)
-![Tests](https://img.shields.io/badge/tests-40%20Suites%20%7C%20477%20Assertions-22c55e?style=flat)
+![Tests](https://img.shields.io/badge/tests-41%20Suites%20%7C%20488%20Assertions-22c55e?style=flat)
 ![Platforms](https://img.shields.io/badge/hardware-ESP32%20%7C%20nRF52840%20%7C%20FPGA%20RTL-8b5cf6?style=flat)
 [![Web Flasher](https://img.shields.io/badge/ESP32%20Web%20Flasher-%E4%B8%80%E9%94%AE%E5%9C%A8%E7%BA%BF%E5%88%B7%E6%9C%BA-f97316?style=flat)](https://onelongx.github.io/OpenNear/)
 ![License](https://img.shields.io/badge/license-MIT-f59e0b?style=flat)
