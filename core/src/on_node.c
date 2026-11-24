@@ -925,7 +925,7 @@ void on_node_on_rx_raw_timed_rssi(on_node_t *node, const uint8_t *frame, size_t 
     bool is_for_me = (hdr.dst_id == ON_SHORT_ID_BROADCAST) ||
                      (node->short_id != ON_SHORT_ID_UNASSIGNED && hdr.dst_id == node->short_id) ||
                      (node->short_id != ON_SHORT_ID_UNASSIGNED && node->short_id == node->backup_id &&
-                      hdr.type == ON_FRAME_TDMA_DATA && !hdr.is_sub_g);
+                      (hdr.type == ON_FRAME_TDMA_DATA || hdr.type == ON_FRAME_GW_BRIDGE) && !hdr.is_sub_g);
     if (!is_for_me) {
         return;
     }
@@ -1010,7 +1010,7 @@ void on_node_on_rx_raw_timed_rssi(on_node_t *node, const uint8_t *frame, size_t 
                 reset_act_lookahead(node);
             }
             if (yielding_primary) {
-                if (hdr.src_id == node->short_id) {
+                if (hdr.src_id == node->short_id && !new_primary_session) {
                     rejoin_primary(node, true);
                 } else {
                     node->role = ON_ROLE_T;
@@ -1272,19 +1272,20 @@ void on_node_on_rx_raw_timed_rssi(on_node_t *node, const uint8_t *frame, size_t 
                     node->relay_count++;
                 }
             } else if (node->short_id == node->backup_id && !hdr.is_sub_g) {
-                /* Hot-standby Backup_ID passively mirrors active 1-hop peer table & capabilities */
+                /* Hot-standby Backup_ID passively mirrors active 1-hop peer table, capabilities & cluster_tbl */
                 uint8_t peer_caps = (uint8_t)((dp.flags >> 6) & 0x03u);
                 if (peer_caps == 0u) peer_caps = 0x01u;
                 on_peer_entry_t *pe = find_peer_by_id(node, hdr.src_id);
                 if (!pe) {
                     for (uint32_t i = 0; i < ON_MAX_NODES_TABLE; ++i) {
                         if (!node->peers[i].active) {
-                            node->peers[i].active       = true;
-                            node->peers[i].short_id     = hdr.src_id;
-                            node->peers[i].slot_idx     = hdr.slot_idx;
-                            node->peers[i].is_sub_slot  = false;
-                            node->peers[i].capabilities = peer_caps;
-                            node->peers[i].last_seen_sf = node->current_sf_seq;
+                            pe = &node->peers[i];
+                            pe->active       = true;
+                            pe->short_id     = hdr.src_id;
+                            pe->slot_idx     = hdr.slot_idx;
+                            pe->is_sub_slot  = false;
+                            pe->capabilities = peer_caps;
+                            pe->last_seen_sf = node->current_sf_seq;
                             break;
                         }
                     }
@@ -1292,6 +1293,7 @@ void on_node_on_rx_raw_timed_rssi(on_node_t *node, const uint8_t *frame, size_t 
                     pe->capabilities = peer_caps;
                     pe->last_seen_sf = node->current_sf_seq;
                 }
+                cluster_record_tdma(node, &hdr, &dp, pe);
             }
             break;
         }
@@ -1395,12 +1397,17 @@ void on_node_on_rx_raw_timed_rssi(on_node_t *node, const uint8_t *frame, size_t 
                               msg.bridge_type == ON_GW_MSG_BLE_BEACON_REPORT ||
                               msg.bridge_type == ON_GW_MSG_CSI_REPORT);
             if (is_uplink) {
-                if (node->role == ON_ROLE_G) {
+                bool is_pri_g = (node->role == ON_ROLE_G);
+                bool is_bk_mirror = (!is_pri_g && node->short_id != ON_SHORT_ID_UNASSIGNED &&
+                                     node->short_id == node->backup_id && !hdr.is_sub_g);
+                if (is_pri_g || is_bk_mirror) {
                     if (msg.bridge_type == ON_GW_MSG_TOPO_REQ) {
-                        topo_queue_resp_pages(node, msg.origin_id);
-                        emit_event(node, "TOPO_REQ_RX", msg.origin_id, (int64_t)node->current_sf_seq);
+                        if (is_pri_g) {
+                            topo_queue_resp_pages(node, msg.origin_id);
+                            emit_event(node, "TOPO_REQ_RX", msg.origin_id, (int64_t)node->current_sf_seq);
+                        }
                     } else if (msg.bridge_type == ON_GW_MSG_RSSI_REPORT && msg.payload_len >= 3u) {
-                        node->rx_slot_mask_this_sf |= (uint16_t)(1u << (hdr.slot_idx & 0x0Fu));
+                        if (is_pri_g) node->rx_slot_mask_this_sf |= (uint16_t)(1u << (hdr.slot_idx & 0x0Fu));
                         on_peer_entry_t *pe_an = find_peer_by_id(node, hdr.src_id);
                         if (pe_an) pe_an->last_seen_sf = node->current_sf_seq;
                         uint16_t anchor_id = (msg.origin_id != ON_SHORT_ID_UNASSIGNED) ? msg.origin_id : hdr.src_id;
@@ -1417,7 +1424,7 @@ void on_node_on_rx_raw_timed_rssi(on_node_t *node, const uint8_t *frame, size_t 
                             }
                         }
                     } else if (msg.bridge_type == ON_GW_MSG_BLE_BEACON_REPORT && msg.payload_len >= 9u) {
-                        node->rx_slot_mask_this_sf |= (uint16_t)(1u << (hdr.slot_idx & 0x0Fu));
+                        if (is_pri_g) node->rx_slot_mask_this_sf |= (uint16_t)(1u << (hdr.slot_idx & 0x0Fu));
                         on_peer_entry_t *pe_bn = find_peer_by_id(node, hdr.src_id);
                         if (pe_bn) pe_bn->last_seen_sf = node->current_sf_seq;
                         uint16_t anchor_id = (msg.origin_id != ON_SHORT_ID_UNASSIGNED) ? msg.origin_id : hdr.src_id;
@@ -1435,7 +1442,7 @@ void on_node_on_rx_raw_timed_rssi(on_node_t *node, const uint8_t *frame, size_t 
                             }
                         }
                     } else if (msg.bridge_type == ON_GW_MSG_CSI_REPORT && msg.payload_len >= 17u) {
-                        node->rx_slot_mask_this_sf |= (uint16_t)(1u << (hdr.slot_idx & 0x0Fu));
+                        if (is_pri_g) node->rx_slot_mask_this_sf |= (uint16_t)(1u << (hdr.slot_idx & 0x0Fu));
                         on_peer_entry_t *pe_cn = find_peer_by_id(node, hdr.src_id);
                         if (pe_cn) pe_cn->last_seen_sf = node->current_sf_seq;
                         uint16_t anchor_id = (msg.origin_id != ON_SHORT_ID_UNASSIGNED) ? msg.origin_id : hdr.src_id;
@@ -1448,7 +1455,7 @@ void on_node_on_rx_raw_timed_rssi(on_node_t *node, const uint8_t *frame, size_t 
                                                   msg.payload[0], &msg.payload[1]);
                         }
                     } else if (msg.bridge_type == ON_GW_MSG_MAC_REPORT && msg.payload_len >= 6u) {
-                        node->rx_slot_mask_this_sf |= (uint16_t)(1u << (hdr.slot_idx & 0x0Fu));
+                        if (is_pri_g) node->rx_slot_mask_this_sf |= (uint16_t)(1u << (hdr.slot_idx & 0x0Fu));
                         on_peer_entry_t *pe_sg = find_peer_by_id(node, hdr.src_id);
                         if (pe_sg) {
                             pe_sg->last_seen_sf = node->current_sf_seq;
@@ -1460,7 +1467,7 @@ void on_node_on_rx_raw_timed_rssi(on_node_t *node, const uint8_t *frame, size_t 
                         if (cn) {
                             memcpy(cn->mac48, msg.payload, 6u);
                             if (msg.origin_id == hdr.src_id) {
-                                cn->parent_id = node->short_id;
+                                cn->parent_id = is_pri_g ? node->short_id : hdr.dst_id;
                                 cn->hop_depth = 1u;
                                 cn->slot_idx  = pe_sg ? pe_sg->slot_idx : hdr.slot_idx;
                                 cn->role      = (hdr.src_id == node->sub_g_id || hdr.src_id == node->sub_g_id_2)
@@ -1472,7 +1479,7 @@ void on_node_on_rx_raw_timed_rssi(on_node_t *node, const uint8_t *frame, size_t 
                             }
                             cn->last_seen_sf = node->current_sf_seq;
                         }
-                    } else if (node->gw) {
+                    } else if (is_pri_g && node->gw) {
                         on_gw_push_uplink(node->gw, &msg);
                         emit_event(node, "GW_UPLINK_RX", msg.origin_id, (int64_t)msg.seq);
                     }

@@ -3242,7 +3242,57 @@ static void test_v72_wifi_csi_geofence_and_offline_rules(void) {
     EXPECT(gw_a.backup_id == 0x003u && gw_a.sub_g_id == 0x002u,
            "Standby Wi-Fi Gateway (caps=0x07) preempts plain terminal as Backup_ID and demotes plain terminal to Sub-G");
 
-    printf("    -> 64-Subcarrier I/Q CSI Score (static=%u -> moving=%u) | 4 Showcase Rules Fired | 1-Hop+2-Hop 0x0C CSI Relay OK (0 coll) | Dual-GW Priority Backup OK\n",
+    /* 3. Verify Standby Backup_ID (GW_B = 0x003) passively mirrors 1-hop/2-hop MAC_REPORT & CSI_REPORT */
+    gw_b.role      = ON_ROLE_T;
+    gw_b.short_id  = 0x003u;
+    gw_b.backup_id = 0x003u;
+    gw_b.parent_id = 0x001u;
+    gw_b.sec.enabled = false;
+    test_v72_csi_cb_t bk_csi;
+    memset(&bk_csi, 0, sizeof(bk_csi));
+    bk_csi.t2_id = 0x002u;
+    on_node_set_csi_observer(&gw_b, test_v72_csi_cb, &bk_csi);
+
+    on_gw_bridge_msg_t m_rep;
+    memset(&m_rep, 0, sizeof(m_rep));
+    m_rep.bridge_type = (uint8_t)ON_GW_MSG_MAC_REPORT;
+    m_rep.origin_id   = 0x002u;
+    m_rep.seq         = 1u;
+    m_rep.payload_len = 6u;
+    memcpy(m_rep.payload, t_plain.mac48, 6u);
+    uint8_t bpay[32], braw[64];
+    size_t bplen = 0u, brlen = 0u;
+    on_gw_bridge_pack(&m_rep, bpay, sizeof(bpay), &bplen);
+    on_mac_hdr_t bhdr;
+    memset(&bhdr, 0, sizeof(bhdr));
+    bhdr.version  = ON_PROTO_VERSION;
+    bhdr.type     = (uint8_t)ON_FRAME_GW_BRIDGE;
+    bhdr.src_id   = 0x002u;
+    bhdr.dst_id   = 0x001u; /* Addressed to Primary GW_A (0x001), overheard by Standby GW_B (0x003) */
+    bhdr.slot_idx = 0u;
+    on_frame_pack(&bhdr, bpay, bplen, braw, sizeof(braw), &brlen);
+    on_node_on_rx_raw(&gw_b, braw, brlen, 300000LL);
+
+    uint8_t mirrored_mac[6] = {0};
+    EXPECT(on_node_find_mac_by_short_id(&gw_b, 0x002u, mirrored_mac) &&
+           memcmp(mirrored_mac, t_plain.mac48, 6u) == 0,
+           "Standby Backup_ID Gateway passively mirrors peer MAC_REPORT (0x09) with 0 ms cold-cache lag");
+
+    on_gw_bridge_msg_t c_rep;
+    memset(&c_rep, 0, sizeof(c_rep));
+    c_rep.bridge_type = (uint8_t)ON_GW_MSG_CSI_REPORT;
+    c_rep.origin_id   = 0x002u;
+    c_rep.seq         = 2u;
+    c_rep.payload_len = 17u;
+    c_rep.payload[0]  = 64u;
+    memcpy(&c_rep.payload[1], bins_t2, 16u);
+    on_gw_bridge_pack(&c_rep, bpay, sizeof(bpay), &bplen);
+    on_frame_pack(&bhdr, bpay, bplen, braw, sizeof(braw), &brlen);
+    on_node_on_rx_raw(&gw_b, braw, brlen, 400000LL);
+    EXPECT(bk_csi.got_1hop_t2,
+           "Standby Backup_ID Gateway passively mirrors peer Wi-Fi CSI_REPORT (0x0C) in real time");
+
+    printf("    -> 64-Subcarrier I/Q CSI Score (static=%u -> moving=%u) | 4 Showcase Rules Fired | 1-Hop+2-Hop 0x0C CSI Relay OK (0 coll) | Dual-GW Priority & Hot-Mirror OK\n",
            (unsigned)static_score, (unsigned)moving_score);
 }
 

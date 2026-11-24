@@ -234,6 +234,7 @@ static bool           s_loc_demo_running  = false;
 static uint32_t       s_loc_demo_step     = 0u;
 static uint32_t       s_last_demo_step_ms = 0u;
 static uint32_t       s_last_rule_eval_ms = 0u;
+static on_role_t      s_last_obs_role     = ON_ROLE_UNJOINED;
 
 static const char *lookup_mac_tags(const uint8_t mac[6]) {
     if (!mac || (mac[0] | mac[1] | mac[2] | mac[3] | mac[4] | mac[5]) == 0u) return nullptr;
@@ -513,9 +514,15 @@ static uint32_t dispatch_tag_or_local_cmd(on_node_t *node, const char *tag,
             }
         }
     }
-    /* When running on a single standalone board (or wildcard '*'), also trigger local demo LED/Relay */
+    /* When running on a single standalone board, wildcard '*', or showcase demo mode without manual tags,
+     * also trigger local demo LED/Relay AND broadcast over OpenNear so all demo boards actuate in sync! */
     if (sent_cnt == 0u) {
         on_esp32_demo_on_cmd(pay, plen);
+        if (node && (all_tags || s_loc_demo_running)) {
+            on_esp32_node_lock();
+            on_node_send_gw_downlink(node, ON_SHORT_ID_BROADCAST, ON_GW_MSG_CLOUD_CMD_DOWN, pay, plen);
+            on_esp32_node_unlock();
+        }
         sent_cnt = 1u;
     }
     return sent_cnt;
@@ -683,6 +690,20 @@ static void esp32_mqtt_poll(on_node_t *node, on_gw_ctx_t *gw) {
         uint8_t ping[2];
         on_mqtt_encode_pingreq(ping);
         cli->write(ping, 2u);
+    }
+
+    /* v7.2 Dual-Gateway HA: detect instant role promotion to Primary G -> trigger immediate HA publish */
+    if (node) {
+        on_esp32_node_lock();
+        on_role_t cur_role = node->role;
+        on_esp32_node_unlock();
+        if (cur_role != s_last_obs_role) {
+            if (cur_role == ON_ROLE_G && s_last_obs_role != ON_ROLE_UNJOINED) {
+                s_last_ha_pub_ms = 0u;
+                Serial.println("[OpenNear HA] Standby Gateway promoted to Primary G -> immediate MQTT/HA & Rule takeover!");
+            }
+            s_last_obs_role = cur_role;
+        }
     }
 
     /* Periodically publish Home Assistant MQTT Auto-Discovery (MAC + Alias + LWT) every 15 s

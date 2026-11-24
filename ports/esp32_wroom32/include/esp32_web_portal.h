@@ -167,8 +167,8 @@ th{color:var(--mut);font-weight:600;font-size:12px}
         </div>
         <div class="tbl-wrap" style="margin-top:10px">
           <table>
-            <thead><tr><th>ID</th><th>触发类型</th><th>监控区域/围栏</th><th>CSI 阈值</th><th>目标 Tag</th><th>执行指令</th><th>状态</th><th>触发次数</th></tr></thead>
-            <tbody id="rule-rows"><tr><td colspan="8" class="muted">暂未配置离线规则（点击上方「🎬 一键运行围栏+CSI 联动演示」可自动载入 4 条典型规则）</td></tr></tbody>
+            <thead><tr><th>ID</th><th>触发类型</th><th>监控区域/围栏</th><th>CSI 阈值</th><th>目标 Tag</th><th>执行指令</th><th>状态</th><th>触发次数</th><th>操作</th></tr></thead>
+            <tbody id="rule-rows"><tr><td colspan="9" class="muted">暂未配置离线规则（点击上方「🎬 一键运行围栏+CSI 联动演示」可自动载入 4 条典型规则）</td></tr></tbody>
           </table>
         </div>
       </div>
@@ -522,6 +522,12 @@ async function saveRule(){
     setTimeout(fetchLocate,250);
   }
 }
+async function delRule(id){
+  if(await postCmd('RULE:'+id+'|0')){
+    toast('已删除规则 R#'+id);
+    setTimeout(fetchLocate,250);
+  }
+}
 function renderLocateSvg(d){
   const svg=$('loc-svg');
   if(!svg)return;
@@ -576,7 +582,7 @@ function renderLocateSvg(d){
   }
   const rtb=$('rule-rows');
   if(rtb){
-    const tNames=['--','进入房间','离开房间','进入围栏','离开围栏','CSI 有人活动 ≥','CSI 安静无人 ≤'];
+    const tNames=['--','进入房间','离开房间','进入围栏','离开围栏','CSI 有人活动 ≥','CSI 安静无人 <'];
     rtb.innerHTML=rls.length?rls.map(r=>
       '<tr><td class="mono"><b>R#'+r.id+'</b></td>'
       +'<td><span class="badge">'+(tNames[r.trig]||r.trig)+'</span></td>'
@@ -585,8 +591,9 @@ function renderLocateSvg(d){
       +'<td><span class="badge purp">'+esc(r.tag)+'</span></td>'
       +'<td class="mono">'+esc(r.cmd)+'</td>'
       +'<td><span class="badge '+(r.on?'ok':'')+'">'+(r.on?'⚡ 触发中':'监听中')+'</span></td>'
-      +'<td class="mono">'+r.fires+' 次</td></tr>'
-    ).join(''):'<tr><td colspan="8" class="muted">暂未配置离线规则（点击上方「🎬 一键运行围栏+CSI 联动演示」可自动载入 4 条典型规则）</td></tr>';
+      +'<td class="mono">'+r.fires+' 次</td>'
+      +'<td><button class="btn sec sm" onclick="delRule('+r.id+')">删除</button></td></tr>'
+    ).join(''):'<tr><td colspan="9" class="muted">暂未配置离线规则（点击上方「🎬 一键运行围栏+CSI 联动演示」可自动载入 4 条典型规则）</td></tr>';
   }
   const tb=$('loc-rows');
   if(tb){

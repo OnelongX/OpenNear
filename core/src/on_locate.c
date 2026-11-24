@@ -781,9 +781,9 @@ uint32_t on_loc_evaluate_rules(on_loc_ctx_t *ctx, uint32_t now_ms,
             case ON_RULE_TRIG_CSI_MOTION:
                 for (uint32_t ai = 0u; ai < ON_LOC_MAX_ANCHORS; ++ai) {
                     const on_loc_anchor_t *a = &ctx->anchors[ai];
-                    if (!a->active || strcmp(a->room, r->zone) != 0) continue;
-                    if (now_ms >= a->csi_last_ms && (now_ms - a->csi_last_ms) <= ON_LOC_OBS_STALE_MS &&
-                        a->csi_motion_score >= r->csi_threshold) {
+                    if (!a->active || strcmp(a->room, r->zone) != 0 || a->csi_last_ms == 0u) continue;
+                    uint32_t age = (now_ms >= a->csi_last_ms) ? (now_ms - a->csi_last_ms) : 0u;
+                    if (age <= ON_LOC_OBS_STALE_MS && a->csi_motion_score >= r->csi_threshold) {
                         cond = true;
                         break;
                     }
@@ -792,10 +792,9 @@ uint32_t on_loc_evaluate_rules(on_loc_ctx_t *ctx, uint32_t now_ms,
             case ON_RULE_TRIG_CSI_QUIET:
                 for (uint32_t ai = 0u; ai < ON_LOC_MAX_ANCHORS; ++ai) {
                     const on_loc_anchor_t *a = &ctx->anchors[ai];
-                    if (!a->active || strcmp(a->room, r->zone) != 0) continue;
-                    if (a->csi_last_ms > 0u &&
-                        now_ms >= a->csi_last_ms && (now_ms - a->csi_last_ms) <= ON_LOC_OBS_STALE_MS &&
-                        a->csi_motion_score < r->csi_threshold) {
+                    if (!a->active || strcmp(a->room, r->zone) != 0 || a->csi_last_ms == 0u) continue;
+                    uint32_t age = (now_ms >= a->csi_last_ms) ? (now_ms - a->csi_last_ms) : 0u;
+                    if (age <= ON_LOC_OBS_STALE_MS && a->csi_motion_score < r->csi_threshold) {
                         cond = true;
                         break;
                     }
@@ -806,8 +805,9 @@ uint32_t on_loc_evaluate_rules(on_loc_ctx_t *ctx, uint32_t now_ms,
         }
 
         if (cond && !r->last_cond_met) {
-            bool cooled = (r->last_fired_ms == 0u) ||
-                          (now_ms >= r->last_fired_ms && (now_ms - r->last_fired_ms) >= ON_LOC_RULE_COOLDOWN_MS);
+            uint32_t since_fire = (now_ms >= r->last_fired_ms)
+                                  ? (now_ms - r->last_fired_ms) : ON_LOC_RULE_COOLDOWN_MS;
+            bool cooled = (r->last_fired_ms == 0u) || (since_fire >= ON_LOC_RULE_COOLDOWN_MS);
             if (cooled) {
                 r->fire_count++;
                 r->last_fired_ms = now_ms;
@@ -925,8 +925,8 @@ size_t on_loc_format_json(on_loc_ctx_t *ctx, uint32_t now_ms,
         if (!a->active) continue;
         char mac_s[18];
         loc_fmt_mac(a->mac48, mac_s);
-        uint8_t csi_val = (a->csi_last_ms > 0u && now_ms >= a->csi_last_ms &&
-                           (now_ms - a->csi_last_ms) <= ON_LOC_OBS_STALE_MS)
+        uint32_t csi_age = (now_ms >= a->csi_last_ms) ? (now_ms - a->csi_last_ms) : 0u;
+        uint8_t csi_val = (a->csi_last_ms > 0u && csi_age <= ON_LOC_OBS_STALE_MS)
                           ? a->csi_motion_score : 0u;
         uint8_t csi_st  = (csi_val >= 45u) ? 2u : ((csi_val >= 15u) ? 1u : 0u);
         int n = snprintf(out_buf + pos, out_cap - (size_t)pos,
