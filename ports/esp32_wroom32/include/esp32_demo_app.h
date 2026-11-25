@@ -1,6 +1,7 @@
 #ifndef OPENNEAR_ESP32_DEMO_APP_H
 #define OPENNEAR_ESP32_DEMO_APP_H
 
+#include "opennear_config.h"
 #include "on_node.h"
 #include <stdint.h>
 #include <stddef.h>

@@ -132,9 +132,9 @@ test("OpenNear JS SDK control commands, token rotation, TLS CA & validation", as
     await client.setWifi("MySSID", "MyPass", "https://hook.local/ingest");
     await client.setMqtt("broker.local", { port: 8883, user: "u1", password: "p1", tls: true });
     await client.setNetKey("0123456789abcdef0123456789abcdef");
-    await client.setAlias("0x1002", "Lamp");
-    await client.setTags("0x1002", ["lights", "living_room"]);
-    await client.sendCmd(0x1002, "LED_ON");
+    await client.setAlias("AA-BB-CC-DD-EE-02", "Lamp");
+    await client.setTags("AABBCCDDEE02", ["lights", "living_room"]);
+    await client.sendCmd(0x002, "LED_ON");
     await client.sendTag("lights", "BLINK");
     await client.setAnchor("AA:BB:CC:DD:EE:01", "living_room", 100, 200);
     await client.removeAnchor("AA:BB:CC:DD:EE:01");
@@ -151,7 +151,7 @@ test("OpenNear JS SDK control commands, token rotation, TLS CA & validation", as
     await client.startDemo();
     await client.stepDemo();
     await client.stopDemo();
-    await client.triggerOta(0xffff, "7.3.1", "http://192.168.1.2/fw.bin");
+    await client.triggerOta(0xfff, "7.3.1", "http://192.168.1.2/fw.bin");
     await client.resetWifi();
     await client.reboot();
 
@@ -159,21 +159,21 @@ test("OpenNear JS SDK control commands, token rotation, TLS CA & validation", as
       "WIFI:MySSID|MyPass|https://hook.local/ingest",
       "MQTT:broker.local|8883|u1|p1|1",
       "NETKEY:0123456789abcdef0123456789abcdef",
-      "ALIAS:0x1002|Lamp",
-      "TAG:0x1002|lights,living_room",
-      "CMD:1002|LED_ON",
+      "ALIAS:AA:BB:CC:DD:EE:02|Lamp",
+      "TAG:AA:BB:CC:DD:EE:02|lights,living_room",
+      "CMD:002|LED_ON",
       "CMD_TAG:lights|BLINK",
       "ANCHOR:AA:BB:CC:DD:EE:01|living_room|100|200",
       "ANCHOR:AA:BB:CC:DD:EE:01||0|0",
       "FENCE:desk|220|150|120",
       "FENCE:desk|0|0|0",
       "RULE:1|3|desk|45|lights|LED_ON",
-      "RULE:1|0||40|*|",
+      "RULE:1|0",
       "BLESCAN:1",
       "LOCDEMO:1",
       "LOCDEMO:2",
       "LOCDEMO:0",
-      "OTA:FFFF|7.3.1|http://192.168.1.2/fw.bin",
+      "OTA:FFF|0x00070301|http://192.168.1.2/fw.bin",
       "RESET_WIFI",
       "REBOOT",
     ]);
@@ -191,7 +191,10 @@ test("OpenNear JS SDK control commands, token rotation, TLS CA & validation", as
       return true;
     });
 
-    assert.throws(() => client.setRule(9, RuleTrigger.IN_FENCE), RangeError);
+    assert.throws(() => client.setRule(9, RuleTrigger.IN_FENCE, { cmd: "LED_ON" }), RangeError);
+    assert.throws(() => client.setRule(1, RuleTrigger.IN_FENCE, { cmd: "" }), Error);
+    assert.throws(() => client.setAlias("0x1002", "NotAMac"), Error);
+    assert.throws(() => client.sendCmd(0x1002, "OutOf12BitRange"), RangeError);
     assert.throws(() => client.setNetKey("short"), Error);
     assert.throws(() => client.setWifi("bad|ssid", "pass"), Error);
   } finally {

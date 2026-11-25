@@ -13,6 +13,7 @@ static on_mesh_ctx_t s_sdk_mesh;
 static on_gw_ctx_t s_sdk_gw;
 #ifdef OPENNEAR_ENABLE_OTA
 static on_ota_ctx_t s_sdk_ota;
+static bool         s_sdk_ota_boot_confirmed = false;
 #endif
 
 static OpenNearCmdCallback  s_sdk_cmd_cb  = nullptr;
@@ -86,16 +87,16 @@ bool OpenNearClass::begin(const OpenNearConfig &cfg) {
 
     on_esp32_net_gw_set_user_cmd_cb(sdk_cmd_trampoline, nullptr);
     on_esp32_net_gw_set_user_rule_cb(sdk_rule_trampoline, nullptr);
+    on_esp32_net_gw_set_wifi_portal_enabled(cfg.is_gateway);
+    pinMode(0, INPUT_PULLUP); /* Onboard BOOT button: hold LOW 5s after boot for factory reset */
 
-#if defined(OPENNEAR_ENABLE_WIFI_GW) || defined(OPENNEAR_ENABLE_BLE_GW)
     on_esp32_net_gw_preinit_wifi(&s_sdk_gw, cfg.wifi_ssid, cfg.wifi_pass, cfg.cloud_url);
-#endif
 
     on_esp32_cfg_t hcfg;
     hcfg.channel  = cfg.channel;
     hcfg.act_gpio = cfg.act_gpio;
 #ifdef OPENNEAR_ENABLE_WIFI_GW
-    hcfg.share_existing_wifi = true;
+    hcfg.share_existing_wifi = cfg.is_gateway;
 #else
     hcfg.share_existing_wifi = false;
 #endif
@@ -122,18 +123,16 @@ bool OpenNearClass::begin(const OpenNearConfig &cfg) {
     on_node_attach_ota(&s_sdk_node, &s_sdk_ota);
 #endif
 
-#if defined(OPENNEAR_ENABLE_WIFI_GW) || defined(OPENNEAR_ENABLE_BLE_GW)
     on_esp32_net_gw_start(&s_sdk_node, &s_sdk_gw,
                           cfg.ble_name ? cfg.ble_name : (cfg.is_gateway ? "OpenNear-G-GW" : "OpenNear-T-Node"));
-#endif
 
     if (cfg.leaderless_boot) {
         on_node_enable_leaderless_boot(&s_sdk_node, 1500u);
     }
 
     /* ESP32 queued-TX safe defaults */
-    s_sdk_node.peer_lease_timeout_sf     = 250u;
-    s_sdk_node.backup_miss_threshold     = 12u;
+    s_sdk_node.peer_lease_timeout_sf      = 250u;
+    s_sdk_node.backup_miss_threshold      = 12u;
     s_sdk_node.backup_min_sync_silence_ns = 150000000LL;
 
     uint8_t active_key[ON_SEC_KEY_LEN];
@@ -150,14 +149,39 @@ bool OpenNearClass::begin(const OpenNearConfig &cfg) {
     last_role_ = s_sdk_node.role;
     started_   = true;
 
-    xTaskCreatePinnedToCore(opennear_sdk_rt_task, "on_sdk_rt", 8192, nullptr, 5, nullptr, 1);
+    /* Initialize recursive mutex before spawning Core 1 real-time task */
+    on_esp32_node_lock();
+    on_esp32_node_unlock();
+
+    xTaskCreatePinnedToCore(opennear_sdk_rt_task, "on_sdk_rt", 8192, nullptr,
+                            configMAX_PRIORITIES - 2, nullptr, 1);
     return true;
 }
 
 void OpenNearClass::poll() {
     if (!started_) return;
-#if defined(OPENNEAR_ENABLE_WIFI_GW) || defined(OPENNEAR_ENABLE_BLE_GW)
     on_esp32_net_gw_poll(&s_sdk_node, &s_sdk_gw);
+    /* Hardware factory reset: hold onboard BOOT button (GPIO0) LOW continuously for 5 seconds */
+    static uint32_t s_boot_hold_start_ms = 0u;
+    if (millis() > 3000u && digitalRead(0) == LOW) {
+        if (s_boot_hold_start_ms == 0u) {
+            s_boot_hold_start_ms = millis();
+        } else if ((millis() - s_boot_hold_start_ms) >= 5000u) {
+            on_esp32_net_gw_factory_reset();
+        }
+    } else {
+        s_boot_hold_start_ms = 0u;
+    }
+#ifdef OPENNEAR_ENABLE_OTA
+    if (!s_sdk_ota_boot_confirmed && millis() >= 10000u) {
+        on_esp32_node_lock();
+        bool healthy = (s_sdk_node.role == ON_ROLE_G) || (s_sdk_node.sync_rx_total >= 4u) || (millis() >= 30000u);
+        on_esp32_node_unlock();
+        if (healthy) {
+            on_esp32_ota_confirm_running_app();
+            s_sdk_ota_boot_confirmed = true;
+        }
+    }
 #endif
     if (role_cb_) {
         on_esp32_node_lock();
@@ -188,11 +212,16 @@ bool OpenNearClass::sendCommand(uint16_t target_short_id, const char *payload) {
     if (!started_ || !payload || !payload[0]) return false;
     size_t n = strlen(payload);
     if (n > ON_GW_MAX_PAYLOAD_LEN) n = ON_GW_MAX_PAYLOAD_LEN;
+    const uint8_t *pbytes = reinterpret_cast<const uint8_t *>(payload);
+    on_err_t rc = ON_OK;
     on_esp32_node_lock();
-    on_err_t rc = on_node_send_gw_downlink(&s_sdk_node, target_short_id,
-                                           ON_GW_MSG_CLOUD_CMD_DOWN,
-                                           reinterpret_cast<const uint8_t *>(payload),
-                                           static_cast<uint8_t>(n));
+    if (target_short_id != ON_SHORT_ID_BROADCAST && s_sdk_node.mesh &&
+        on_mesh_lookup_next_hop(s_sdk_node.mesh, target_short_id) != ON_SHORT_ID_UNASSIGNED) {
+        rc = on_node_send_mesh_downlink(&s_sdk_node, target_short_id, pbytes, static_cast<uint8_t>(n));
+    } else {
+        rc = on_node_send_gw_downlink(&s_sdk_node, target_short_id,
+                                      ON_GW_MSG_CLOUD_CMD_DOWN, pbytes, static_cast<uint8_t>(n));
+    }
     on_esp32_node_unlock();
     return rc == ON_OK;
 }
@@ -227,11 +256,14 @@ bool OpenNearClass::setFence(const char *name, int32_t x_cm, int32_t y_cm, uint1
 
 bool OpenNearClass::setRule(uint8_t rule_id, on_loc_rule_trig_t trig, const char *zone,
                             uint8_t csi_threshold, const char *tag, const char *cmd_payload) {
+    const char *z = (zone && zone[0]) ? zone : "*";
+    const char *t = (tag && tag[0])   ? tag  : "*";
+    const char *c = (cmd_payload && cmd_payload[0]) ? cmd_payload : "NOP";
     char buf[112];
-    int n = snprintf(buf, sizeof(buf), "RULE:%u|%u|%s|%u|%s|%s",
-                     (unsigned)rule_id, (unsigned)trig,
-                     zone ? zone : "", (unsigned)csi_threshold,
-                     tag ? tag : "*", cmd_payload ? cmd_payload : "");
+    int n = (trig == ON_RULE_TRIG_NONE)
+            ? snprintf(buf, sizeof(buf), "RULE:%u|0", (unsigned)rule_id)
+            : snprintf(buf, sizeof(buf), "RULE:%u|%u|%s|%u|%s|%s",
+                       (unsigned)rule_id, (unsigned)trig, z, (unsigned)csi_threshold, t, c);
     return (n > 0 && static_cast<size_t>(n) < sizeof(buf)) && execControl(buf);
 }
 

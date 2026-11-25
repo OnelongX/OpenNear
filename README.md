@@ -296,6 +296,7 @@ print(gw.status(), gw.locate())
 gw.set_fence("desk_zone", x_cm=220, y_cm=150, radius_cm=120)
 gw.set_rule(1, RuleTrigger.IN_FENCE, zone="desk_zone", tag="lights", cmd="LED_ON")
 gw.send_tag("lights", "BLINK")
+gw.send_cmd(0x002, "LED_OFF")
 ```
 
 ### 4. JavaScript / TypeScript ESM SDK（零依赖 Fetch API，`sdk/js/`）
@@ -308,6 +309,7 @@ const loc = await gw.getLocate();
 await gw.setFence("desk_zone", 220, 150, 120);
 await gw.setRule(1, RuleTrigger.IN_FENCE, { zone: "desk_zone", tag: "lights", cmd: "LED_ON" });
 await gw.sendTag("lights", "BLINK");
+await gw.sendCmd(0x002, "LED_OFF");
 ```
 
 ---

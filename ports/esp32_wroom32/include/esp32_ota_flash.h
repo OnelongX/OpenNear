@@ -1,6 +1,7 @@
 #ifndef OPENNEAR_ESP32_OTA_FLASH_H
 #define OPENNEAR_ESP32_OTA_FLASH_H
 
+#include "opennear_config.h"
 #include "on_ota.h"
 
 #ifdef __cplusplus

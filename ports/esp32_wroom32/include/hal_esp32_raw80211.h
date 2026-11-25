@@ -1,6 +1,7 @@
 #ifndef OPENNEAR_HAL_ESP32_RAW80211_H
 #define OPENNEAR_HAL_ESP32_RAW80211_H
 
+#include "opennear_config.h"
 #include "on_hal.h"
 #include "on_node.h"
 

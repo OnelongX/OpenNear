@@ -204,8 +204,8 @@ if ((Test-Path $xbin) -and (Test-Path $sdk)) {
         "$Root\examples\03_OfflineGeofenceCsi\03_OfflineGeofenceCsi.ino"
     )
     foreach ($ex in $espExamples) {
+        # Verify zero-flag Arduino IDE compilation (features auto-enabled via opennear_config.h)
         & xtensa-esp32-elf-g++ -std=gnu++11 -Os -Wall -Wextra -Werror -mlongcalls -fno-rtti -fno-exceptions `
-            -DOPENNEAR_ENABLE_OTA=1 -DOPENNEAR_ENABLE_WIFI_GW=1 -DOPENNEAR_ENABLE_BLE_GW=1 -DOPENNEAR_LEADERLESS_BOOT=1 -DOPENNEAR_ENABLE_DEMO_APP=1 `
             -x c++ -fsyntax-only $ex @espInc
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     }

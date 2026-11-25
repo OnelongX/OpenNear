@@ -46,17 +46,80 @@ export class OpenNearAuthError extends OpenNearError {
  * @returns {string}
  */
 function formatNodeId(targetId) {
+  let val;
   if (typeof targetId === "number") {
-    if (!Number.isInteger(targetId) || targetId < 0 || targetId > 0xffff) {
-      throw new RangeError(`targetId out of 16-bit range: ${targetId}`);
+    if (!Number.isInteger(targetId)) {
+      throw new RangeError(`targetId must be an integer: ${targetId}`);
     }
-    return targetId.toString(16).toUpperCase().padStart(4, "0");
+    val = targetId;
+  } else {
+    const s = String(targetId).trim().replace(/^0x/i, "");
+    if (!s || !/^[0-9a-fA-F]+$/.test(s)) {
+      throw new Error(`Invalid hex targetId: ${targetId}`);
+    }
+    val = Number.parseInt(s, 16);
   }
-  const s = String(targetId).trim().replace(/^0x/i, "");
+  if (val === 0xffff) {
+    val = 0x0fff; // Convenience alias for 12-bit ON_SHORT_ID_BROADCAST (0xFFF)
+  }
+  if (val <= 0 || val > 0x0fff) {
+    throw new RangeError(`targetId out of 12-bit OpenNear Short-ID range (0x001..0xFFF): ${targetId}`);
+  }
+  return val.toString(16).toUpperCase().padStart(3, "0");
+}
+
+/**
+ * @param {string} mac
+ * @returns {string}
+ */
+function normalizeMac48(mac) {
+  validateField("mac", mac);
+  const hexOnly = String(mac).trim().replace(/[:-]/g, "");
+  if (!/^[0-9a-fA-F]{12}$/.test(hexOnly)) {
+    throw new Error(`mac must be a 48-bit MAC address (12 hex digits), got: ${mac}`);
+  }
+  const up = hexOnly.toUpperCase();
+  return `${up.slice(0, 2)}:${up.slice(2, 4)}:${up.slice(4, 6)}:${up.slice(6, 8)}:${up.slice(8, 10)}:${up.slice(10, 12)}`;
+}
+
+/**
+ * @param {number | string} version
+ * @returns {string}
+ */
+function formatOtaVersion(version) {
+  if (typeof version === "number") {
+    if (!Number.isInteger(version) || version <= 0 || version > 0xffffffff) {
+      throw new RangeError(`version out of 32-bit range: ${version}`);
+    }
+    return `0x${version.toString(16).toUpperCase().padStart(8, "0")}`;
+  }
+  const s = validateField("version", String(version).trim());
   if (!s) {
-    throw new Error("targetId must not be empty");
+    throw new Error("version must not be empty");
   }
-  return s.toUpperCase();
+  if (s.includes(".")) {
+    const parts = s.replace(/^[vV]/, "").split(".");
+    if (parts.length !== 2 && parts.length !== 3) {
+      throw new Error(`Invalid semantic version string: ${version}`);
+    }
+    const major = Number.parseInt(parts[0], 10);
+    const minor = Number.parseInt(parts[1], 10);
+    const patch = parts.length === 3 ? Number.parseInt(parts[2], 10) : 0;
+    if (
+      ![major, minor, patch].every((n) => Number.isInteger(n) && n >= 0 && n <= 255)
+    ) {
+      throw new RangeError(`Semantic version components must be 0..255: ${version}`);
+    }
+    const u32 = ((major << 16) | (minor << 8) | patch) >>> 0;
+    return `0x${u32.toString(16).toUpperCase().padStart(8, "0")}`;
+  }
+  const val = s.toLowerCase().startsWith("0x")
+    ? Number.parseInt(s.slice(2), 16)
+    : Number.parseInt(s, 10);
+  if (!Number.isInteger(val) || val <= 0 || val > 0xffffffff) {
+    throw new RangeError(`version out of 32-bit range: ${version}`);
+  }
+  return `0x${val.toString(16).toUpperCase().padStart(8, "0")}`;
 }
 
 /**
@@ -245,26 +308,26 @@ export class OpenNearClient {
   }
 
   /**
-   * @param {string} macOrId
+   * @param {string} mac
    * @param {string} alias
    */
-  setAlias(macOrId, alias) {
-    validateField("macOrId", macOrId);
+  setAlias(mac, alias) {
+    const normMac = normalizeMac48(mac);
     validateField("alias", alias);
-    return this.rawCmd(`ALIAS:${macOrId}|${alias}`);
+    return this.rawCmd(`ALIAS:${normMac}|${alias}`);
   }
 
   /**
-   * @param {string} macOrId
+   * @param {string} mac
    * @param {string | string[]} tags
    */
-  setTags(macOrId, tags) {
-    validateField("macOrId", macOrId);
+  setTags(mac, tags) {
+    const normMac = normalizeMac48(mac);
     const tagStr = Array.isArray(tags)
       ? tags.map((t) => String(t).trim()).filter(Boolean).join(",")
       : String(tags);
     validateField("tags", tagStr);
-    return this.rawCmd(`TAG:${macOrId}|${tagStr}`);
+    return this.rawCmd(`TAG:${normMac}|${tagStr}`);
   }
 
   /**
@@ -287,23 +350,23 @@ export class OpenNearClient {
   }
 
   /**
-   * @param {string} macOrId
+   * @param {string} mac
    * @param {string} room
    * @param {number} [xCm]
    * @param {number} [yCm]
    */
-  setAnchor(macOrId, room, xCm = 0, yCm = 0) {
-    validateField("macOrId", macOrId);
+  setAnchor(mac, room, xCm = 0, yCm = 0) {
+    const normMac = normalizeMac48(mac);
     validateField("room", room);
-    return this.rawCmd(`ANCHOR:${macOrId}|${room}|${Math.trunc(xCm)}|${Math.trunc(yCm)}`);
+    return this.rawCmd(`ANCHOR:${normMac}|${room}|${Math.trunc(xCm)}|${Math.trunc(yCm)}`);
   }
 
   /**
-   * @param {string} macOrId
+   * @param {string} mac
    */
-  removeAnchor(macOrId) {
-    validateField("macOrId", macOrId);
-    return this.rawCmd(`ANCHOR:${macOrId}||0|0`);
+  removeAnchor(mac) {
+    const normMac = normalizeMac48(mac);
+    return this.rawCmd(`ANCHOR:${normMac}||0|0`);
   }
 
   /**
@@ -342,11 +405,17 @@ export class OpenNearClient {
     if (trig < 0 || trig > 6) {
       throw new RangeError("trigger must be between 0 and 6 (see RuleTrigger)");
     }
-    const { zone = "", csiThreshold = 40, tag = "*", cmd = "" } = opts;
-    validateField("zone", zone);
-    validateField("tag", tag);
-    validateField("cmd", cmd);
-    return this.rawCmd(`RULE:${rid}|${trig}|${zone}|${Math.trunc(csiThreshold)}|${tag}|${cmd}`);
+    if (trig === 0) {
+      return this.rawCmd(`RULE:${rid}|0`);
+    }
+    const { zone = "*", csiThreshold = 40, tag = "*", cmd = "" } = opts;
+    const z = validateField("zone", String(zone).trim() || "*");
+    const t = validateField("tag", String(tag).trim() || "*");
+    const c = validateField("cmd", String(cmd).trim());
+    if (!c) {
+      throw new Error("cmd must not be empty when creating an active rule");
+    }
+    return this.rawCmd(`RULE:${rid}|${trig}|${z}|${Math.trunc(csiThreshold)}|${t}|${c}`);
   }
 
   /**
@@ -377,13 +446,12 @@ export class OpenNearClient {
 
   /**
    * @param {number | string} targetId
-   * @param {string} version
+   * @param {number | string} version
    * @param {string} url
    */
   triggerOta(targetId, version, url) {
-    validateField("version", version);
     validateField("url", url);
-    return this.rawCmd(`OTA:${formatNodeId(targetId)}|${version}|${url}`);
+    return this.rawCmd(`OTA:${formatNodeId(targetId)}|${formatOtaVersion(version)}|${url}`);
   }
 
   /**

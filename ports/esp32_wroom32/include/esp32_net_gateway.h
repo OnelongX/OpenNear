@@ -1,6 +1,7 @@
 #ifndef OPENNEAR_ESP32_NET_GATEWAY_H
 #define OPENNEAR_ESP32_NET_GATEWAY_H
 
+#include "opennear_config.h"
 #include "on_node.h"
 #include "on_gateway.h"
 
@@ -50,6 +51,9 @@ void on_esp32_net_gw_set_user_cmd_cb(void (*cb)(void *ctx, const uint8_t *payloa
 void on_esp32_net_gw_set_user_rule_cb(void (*cb)(void *ctx, uint8_t rule_id, const char *zone,
                                                  const char *tag, const char *cmd),
                                       void *ctx);
+
+/* v7.3 SDK Runtime Mode: Enable/disable Wi-Fi STA + SoftAP Web Portal at runtime (true for Gateway, false for Node) */
+void on_esp32_net_gw_set_wifi_portal_enabled(bool enabled);
 
 #ifdef __cplusplus
 }

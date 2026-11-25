@@ -23,6 +23,31 @@
 #  endif
 #endif
 
+/*
+ * When OpenNear is consumed as an external Arduino / PlatformIO library on ESP32
+ * (i.e. OPENNEAR_IS_MASTER is not defined by the internal firmware platformio.ini),
+ * enable the full v7.3 SDK feature set by default so users need zero manual -D flags.
+ * Runtime gateway vs. node behavior (e.g. SoftAP Web Portal) is controlled dynamically
+ * via OpenNearConfig::Gateway() vs. OpenNearConfig::Node().
+ */
+#if defined(ARDUINO_ARCH_ESP32) && !defined(OPENNEAR_IS_MASTER) && !defined(OPENNEAR_MINIMAL_SDK)
+#  ifndef OPENNEAR_ENABLE_OTA
+#    define OPENNEAR_ENABLE_OTA 1
+#  endif
+#  ifndef OPENNEAR_ENABLE_WIFI_GW
+#    define OPENNEAR_ENABLE_WIFI_GW 1
+#  endif
+#  ifndef OPENNEAR_ENABLE_BLE_GW
+#    define OPENNEAR_ENABLE_BLE_GW 1
+#  endif
+#  ifndef OPENNEAR_LEADERLESS_BOOT
+#    define OPENNEAR_LEADERLESS_BOOT 1
+#  endif
+#  ifndef OPENNEAR_ENABLE_DEMO_APP
+#    define OPENNEAR_ENABLE_DEMO_APP 1
+#  endif
+#endif
+
 /* Core security (AES-128-CCM AEAD + Beacon CBC-MAC + X25519 ECDH) */
 #ifndef ON_CFG_SECURITY
 #  ifdef CONFIG_OPENNEAR_ENABLE_SECURITY

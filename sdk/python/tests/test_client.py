@@ -116,9 +116,9 @@ class TestOpenNearPythonSDK(unittest.TestCase):
         self.client.set_wifi("MySSID", "MyPass", "https://hook.local/ingest")
         self.client.set_mqtt("broker.local", 8883, "u1", "p1", tls=True)
         self.client.set_netkey("0123456789abcdef0123456789abcdef")
-        self.client.set_alias("0x1002", "Lamp")
-        self.client.set_tags("0x1002", ["lights", "living_room"])
-        self.client.send_cmd(0x1002, "LED_ON")
+        self.client.set_alias("AA-BB-CC-DD-EE-02", "Lamp")
+        self.client.set_tags("AABBCCDDEE02", ["lights", "living_room"])
+        self.client.send_cmd(0x002, "LED_ON")
         self.client.send_tag("lights", "BLINK")
         self.client.set_anchor("AA:BB:CC:DD:EE:01", "living_room", 100, 200)
         self.client.remove_anchor("AA:BB:CC:DD:EE:01")
@@ -130,7 +130,7 @@ class TestOpenNearPythonSDK(unittest.TestCase):
         self.client.start_demo()
         self.client.step_demo()
         self.client.stop_demo()
-        self.client.trigger_ota(0xFFFF, "7.3.1", "http://192.168.1.2/fw.bin")
+        self.client.trigger_ota(0xFFF, "7.3.1", "http://192.168.1.2/fw.bin")
         self.client.reset_wifi()
         self.client.reboot()
 
@@ -140,21 +140,21 @@ class TestOpenNearPythonSDK(unittest.TestCase):
                 "WIFI:MySSID|MyPass|https://hook.local/ingest",
                 "MQTT:broker.local|8883|u1|p1|1",
                 "NETKEY:0123456789abcdef0123456789abcdef",
-                "ALIAS:0x1002|Lamp",
-                "TAG:0x1002|lights,living_room",
-                "CMD:1002|LED_ON",
+                "ALIAS:AA:BB:CC:DD:EE:02|Lamp",
+                "TAG:AA:BB:CC:DD:EE:02|lights,living_room",
+                "CMD:002|LED_ON",
                 "CMD_TAG:lights|BLINK",
                 "ANCHOR:AA:BB:CC:DD:EE:01|living_room|100|200",
                 "ANCHOR:AA:BB:CC:DD:EE:01||0|0",
                 "FENCE:desk|220|150|120",
                 "FENCE:desk|0|0|0",
                 "RULE:1|3|desk|45|lights|LED_ON",
-                "RULE:1|0||40|*|",
+                "RULE:1|0",
                 "BLESCAN:1",
                 "LOCDEMO:1",
                 "LOCDEMO:2",
                 "LOCDEMO:0",
-                "OTA:FFFF|7.3.1|http://192.168.1.2/fw.bin",
+                "OTA:FFF|0x00070301|http://192.168.1.2/fw.bin",
                 "RESET_WIFI",
                 "REBOOT",
             ],
@@ -174,7 +174,13 @@ class TestOpenNearPythonSDK(unittest.TestCase):
 
     def test_input_validation(self) -> None:
         with self.assertRaises(ValueError):
-            self.client.set_rule(9, RuleTrigger.IN_FENCE)
+            self.client.set_rule(9, RuleTrigger.IN_FENCE, cmd="LED_ON")
+        with self.assertRaises(ValueError):
+            self.client.set_rule(1, RuleTrigger.IN_FENCE, cmd="")
+        with self.assertRaises(ValueError):
+            self.client.set_alias("0x1002", "NotAMac")
+        with self.assertRaises(ValueError):
+            self.client.send_cmd(0x1002, "OutOf12BitRange")
         with self.assertRaises(ValueError):
             self.client.set_netkey("short")
         with self.assertRaises(ValueError):

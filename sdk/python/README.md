@@ -35,9 +35,9 @@ gw.set_rule(
     cmd="LED_ON",
 )
 
-# Trigger a tag group or a single node
+# Trigger a tag group or a single node (12-bit Short-ID 0x001..0xFFF)
 gw.send_tag("lights", "BLINK")
-gw.send_cmd(0x1002, "LED_OFF")
+gw.send_cmd(0x002, "LED_OFF")
 ```
 
 ## Run Unit Tests

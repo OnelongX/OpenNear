@@ -38,15 +38,55 @@ class RuleTrigger(IntEnum):
 
 def _format_node_id(target_id: Union[int, str]) -> str:
     if isinstance(target_id, int):
-        if target_id < 0 or target_id > 0xFFFF:
-            raise ValueError(f"target_id out of 16-bit range: {target_id}")
-        return f"{target_id:04X}"
-    s = target_id.strip()
-    if s.lower().startswith("0x"):
-        s = s[2:]
+        val = target_id
+    else:
+        s = target_id.strip()
+        if not s:
+            raise ValueError("target_id must not be empty")
+        val = int(s, 16) if not s.lower().startswith("0x") else int(s, 16)
+    if val == 0xFFFF:
+        val = 0x0FFF  # Convenience alias for 12-bit ON_SHORT_ID_BROADCAST (0xFFF)
+    if val <= 0 or val > 0x0FFF:
+        raise ValueError(f"target_id out of 12-bit OpenNear Short-ID range (0x001..0xFFF): {target_id}")
+    return f"{val:03X}"
+
+
+def _normalize_mac48(mac: str) -> str:
+    _validate_no_pipe_or_newline("mac", mac)
+    hex_only = "".join(ch for ch in mac.strip() if ch not in (":", "-"))
+    if len(hex_only) != 12:
+        raise ValueError(f"mac must be a 48-bit MAC address (12 hex digits), got: {mac!r}")
+    try:
+        int(hex_only, 16)
+    except ValueError as exc:
+        raise ValueError(f"mac contains non-hex characters: {mac!r}") from exc
+    up = hex_only.upper()
+    return ":".join(up[i : i + 2] for i in range(0, 12, 2))
+
+
+def _format_ota_version(version: Union[int, str]) -> str:
+    if isinstance(version, int):
+        if version <= 0 or version > 0xFFFFFFFF:
+            raise ValueError(f"version out of 32-bit range: {version}")
+        return f"0x{version:08X}"
+    s = _validate_no_pipe_or_newline("version", str(version).strip())
     if not s:
-        raise ValueError("target_id must not be empty")
-    return s.upper()
+        raise ValueError("version must not be empty")
+    if "." in s:
+        parts = s.lstrip("vV").split(".")
+        if len(parts) not in (2, 3):
+            raise ValueError(f"Invalid semantic version string: {version!r}")
+        major = int(parts[0], 10)
+        minor = int(parts[1], 10)
+        patch = int(parts[2], 10) if len(parts) == 3 else 0
+        if not (0 <= major <= 255 and 0 <= minor <= 255 and 0 <= patch <= 255):
+            raise ValueError(f"Semantic version components must be 0..255: {version!r}")
+        u32 = (major << 16) | (minor << 8) | patch
+        return f"0x{u32:08X}"
+    val = int(s, 0)
+    if val <= 0 or val > 0xFFFFFFFF:
+        raise ValueError(f"version out of 32-bit range: {version}")
+    return f"0x{val:08X}"
 
 
 def _validate_no_pipe_or_newline(name: str, value: str) -> str:
@@ -229,24 +269,24 @@ class OpenNearClient:
             int(key, 16)
         return self.raw_cmd(f"NETKEY:{key}")
 
-    def set_alias(self, mac_or_id: str, alias: str) -> Dict[str, Any]:
-        """Assign a human-readable alias to a node or BLE device."""
-        _validate_no_pipe_or_newline("mac_or_id", mac_or_id)
+    def set_alias(self, mac: str, alias: str) -> Dict[str, Any]:
+        """Assign a human-readable alias to a 48-bit hardware MAC address (e.g. ``'AA:BB:CC:DD:EE:01'``)."""
+        norm_mac = _normalize_mac48(mac)
         _validate_no_pipe_or_newline("alias", alias)
-        return self.raw_cmd(f"ALIAS:{mac_or_id}|{alias}")
+        return self.raw_cmd(f"ALIAS:{norm_mac}|{alias}")
 
-    def set_tags(self, mac_or_id: str, tags: Union[str, Iterable[str]]) -> Dict[str, Any]:
-        """Assign comma-separated tags (e.g. ``['lights', 'living_room']``) to a node."""
-        _validate_no_pipe_or_newline("mac_or_id", mac_or_id)
+    def set_tags(self, mac: str, tags: Union[str, Iterable[str]]) -> Dict[str, Any]:
+        """Assign comma-separated tags (e.g. ``['lights', 'living_room']``) to a 48-bit MAC address."""
+        norm_mac = _normalize_mac48(mac)
         if isinstance(tags, str):
             tag_str = tags
         else:
             tag_str = ",".join(t.strip() for t in tags if t and t.strip())
         _validate_no_pipe_or_newline("tags", tag_str)
-        return self.raw_cmd(f"TAG:{mac_or_id}|{tag_str}")
+        return self.raw_cmd(f"TAG:{norm_mac}|{tag_str}")
 
     def send_cmd(self, target_id: Union[int, str], payload: str) -> Dict[str, Any]:
-        """Send a point-to-point downlink command to a specific 16-bit node ID (e.g. ``0x1002``)."""
+        """Send a point-to-point downlink command to a 12-bit Short-ID (``0x001..0xFFF``)."""
         _validate_no_pipe_or_newline("payload", payload)
         return self.raw_cmd(f"CMD:{_format_node_id(target_id)}|{payload}")
 
@@ -258,20 +298,20 @@ class OpenNearClient:
 
     def set_anchor(
         self,
-        mac_or_id: str,
+        mac: str,
         room: str,
         x_cm: int = 0,
         y_cm: int = 0,
     ) -> Dict[str, Any]:
-        """Register or update a fixed positioning anchor coordinate (centimeters)."""
-        _validate_no_pipe_or_newline("mac_or_id", mac_or_id)
+        """Register or update a fixed positioning anchor coordinate (centimeters) by 48-bit MAC."""
+        norm_mac = _normalize_mac48(mac)
         _validate_no_pipe_or_newline("room", room)
-        return self.raw_cmd(f"ANCHOR:{mac_or_id}|{room}|{int(x_cm)}|{int(y_cm)}")
+        return self.raw_cmd(f"ANCHOR:{norm_mac}|{room}|{int(x_cm)}|{int(y_cm)}")
 
-    def remove_anchor(self, mac_or_id: str) -> Dict[str, Any]:
+    def remove_anchor(self, mac: str) -> Dict[str, Any]:
         """Delete a registered positioning anchor by leaving its room empty."""
-        _validate_no_pipe_or_newline("mac_or_id", mac_or_id)
-        return self.raw_cmd(f"ANCHOR:{mac_or_id}||0|0")
+        norm_mac = _normalize_mac48(mac)
+        return self.raw_cmd(f"ANCHOR:{norm_mac}||0|0")
 
     def set_fence(self, name: str, x_cm: int, y_cm: int, radius_cm: int) -> Dict[str, Any]:
         """Create or update a circular 2D geofence (centimeters)."""
@@ -288,7 +328,7 @@ class OpenNearClient:
         self,
         rule_id: int,
         trigger: Union[RuleTrigger, int],
-        zone: str = "",
+        zone: str = "*",
         csi_threshold: int = 40,
         tag: str = "*",
         cmd: str = "",
@@ -300,10 +340,14 @@ class OpenNearClient:
         trig_val = int(trigger)
         if not (0 <= trig_val <= 6):
             raise ValueError("trigger must be between 0 and 6 (see RuleTrigger)")
-        _validate_no_pipe_or_newline("zone", zone)
-        _validate_no_pipe_or_newline("tag", tag)
-        _validate_no_pipe_or_newline("cmd", cmd)
-        return self.raw_cmd(f"RULE:{rid}|{trig_val}|{zone}|{int(csi_threshold)}|{tag}|{cmd}")
+        if trig_val == 0:
+            return self.raw_cmd(f"RULE:{rid}|0")
+        z = _validate_no_pipe_or_newline("zone", zone.strip() or "*")
+        t = _validate_no_pipe_or_newline("tag", tag.strip() or "*")
+        c = _validate_no_pipe_or_newline("cmd", cmd.strip())
+        if not c:
+            raise ValueError("cmd must not be empty when creating an active rule")
+        return self.raw_cmd(f"RULE:{rid}|{trig_val}|{z}|{int(csi_threshold)}|{t}|{c}")
 
     def remove_rule(self, rule_id: int) -> Dict[str, Any]:
         """Delete an offline automation rule (``rule_id`` in ``1..8``)."""
@@ -325,11 +369,10 @@ class OpenNearClient:
         """Stop the interactive demo and clear simulated demo state."""
         return self.raw_cmd("LOCDEMO:0")
 
-    def trigger_ota(self, target_id: Union[int, str], version: str, url: str) -> Dict[str, Any]:
-        """Trigger a synchronized Mesh OTA update for ``target_id`` (use ``0xFFFF`` for broadcast)."""
-        _validate_no_pipe_or_newline("version", version)
+    def trigger_ota(self, target_id: Union[int, str], version: Union[int, str], url: str) -> Dict[str, Any]:
+        """Trigger a synchronized Mesh OTA update for ``target_id`` (use ``0xFFF`` for broadcast)."""
         _validate_no_pipe_or_newline("url", url)
-        return self.raw_cmd(f"OTA:{_format_node_id(target_id)}|{version}|{url}")
+        return self.raw_cmd(f"OTA:{_format_node_id(target_id)}|{_format_ota_version(version)}|{url}")
 
     def upload_tls_ca(self, pem_cert: str) -> Dict[str, Any]:
         """POST /api/tls_ca — upload a PEM root CA certificate for MQTTS verification."""

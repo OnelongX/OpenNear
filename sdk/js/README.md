@@ -32,9 +32,9 @@ await gw.setRule(1, RuleTrigger.IN_FENCE, {
   cmd: "LED_ON",
 });
 
-// Trigger tag group or single node
+// Trigger tag group or single node (12-bit Short-ID 0x001..0xFFF)
 await gw.sendTag("lights", "BLINK");
-await gw.sendCmd(0x1002, "LED_OFF");
+await gw.sendCmd(0x002, "LED_OFF");
 ```
 
 ## Run Unit Tests

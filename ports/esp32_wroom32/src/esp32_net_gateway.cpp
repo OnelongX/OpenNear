@@ -45,6 +45,11 @@ static void *s_user_cmd_ctx = nullptr;
 static void (*s_user_rule_cb)(void *ctx, uint8_t rule_id, const char *zone,
                               const char *tag, const char *cmd) = nullptr;
 static void *s_user_rule_ctx = nullptr;
+static bool  s_wifi_portal_runtime_en = true;
+
+void on_esp32_net_gw_set_wifi_portal_enabled(bool enabled) {
+    s_wifi_portal_runtime_en = enabled;
+}
 
 void on_esp32_net_gw_set_user_cmd_cb(void (*cb)(void *ctx, const uint8_t *payload, size_t len),
                                      void *ctx) {
@@ -532,6 +537,7 @@ static uint32_t dispatch_tag_or_local_cmd(on_node_t *node, const char *tag,
             if (!all_tags && !mac_has_tag(cn->mac48, tag)) continue;
             if (cn->short_id == node->short_id) {
                 on_esp32_demo_on_cmd(pay, plen);
+                if (s_user_cmd_cb) s_user_cmd_cb(s_user_cmd_ctx, pay, plen);
                 sent_cnt++;
             } else {
                 on_esp32_node_lock();
@@ -920,12 +926,18 @@ static void esp32_mqtt_poll(on_node_t *node, on_gw_ctx_t *gw) {
                             target_id = on_node_find_short_id_by_mac(node, target_mac);
                         }
                         if (target_id != ON_SHORT_ID_UNASSIGNED) {
-                            if (node->mesh &&
-                                on_mesh_lookup_next_hop(node->mesh, target_id) != ON_SHORT_ID_UNASSIGNED) {
-                                on_node_send_mesh_downlink(node, target_id, pub.payload, plen);
-                            } else {
-                                on_node_send_gw_downlink(node, target_id, ON_GW_MSG_CLOUD_CMD_DOWN,
-                                                         pub.payload, plen);
+                            if (target_id == node->short_id || target_id == ON_SHORT_ID_BROADCAST) {
+                                on_esp32_demo_on_cmd(pub.payload, plen);
+                                if (s_user_cmd_cb) s_user_cmd_cb(s_user_cmd_ctx, pub.payload, plen);
+                            }
+                            if (target_id != node->short_id) {
+                                if (node->mesh &&
+                                    on_mesh_lookup_next_hop(node->mesh, target_id) != ON_SHORT_ID_UNASSIGNED) {
+                                    on_node_send_mesh_downlink(node, target_id, pub.payload, plen);
+                                } else {
+                                    on_node_send_gw_downlink(node, target_id, ON_GW_MSG_CLOUD_CMD_DOWN,
+                                                             pub.payload, plen);
+                                }
                             }
                         }
                         on_esp32_node_unlock();
@@ -1248,7 +1260,9 @@ static void start_local_http_api(void) {
                     uint16_t tid = static_cast<uint16_t>(strtoul(id_s.c_str(), nullptr, 16) & ON_SHORT_ID_MASK);
                     if (tid == ON_SHORT_ID_BROADCAST || tid == s_node_ref->short_id) {
                         String pay = body.substring(bar + 1);
-                        on_esp32_demo_on_cmd(reinterpret_cast<const uint8_t *>(pay.c_str()), pay.length());
+                        const uint8_t *pbytes = reinterpret_cast<const uint8_t *>(pay.c_str());
+                        on_esp32_demo_on_cmd(pbytes, pay.length());
+                        if (s_user_cmd_cb) s_user_cmd_cb(s_user_cmd_ctx, pbytes, pay.length());
                     }
                 }
             }
@@ -1599,9 +1613,9 @@ void on_esp32_net_gw_preinit_wifi(on_gw_ctx_t *gw, const char *default_ssid,
     if (!gw) return;
     on_gw_mode_t mode = ON_GW_MODE_OFF;
 #if defined(OPENNEAR_ENABLE_WIFI_GW) && defined(OPENNEAR_ENABLE_BLE_GW)
-    mode = ON_GW_MODE_WIFI_AND_BLE;
+    mode = s_wifi_portal_runtime_en ? ON_GW_MODE_WIFI_AND_BLE : ON_GW_MODE_BLE_GATT;
 #elif defined(OPENNEAR_ENABLE_WIFI_GW)
-    mode = ON_GW_MODE_WIFI_STA;
+    mode = s_wifi_portal_runtime_en ? ON_GW_MODE_WIFI_STA : ON_GW_MODE_OFF;
 #elif defined(OPENNEAR_ENABLE_BLE_GW)
     mode = ON_GW_MODE_BLE_GATT;
 #endif
@@ -1611,10 +1625,12 @@ void on_esp32_net_gw_preinit_wifi(on_gw_ctx_t *gw, const char *default_ssid,
     ops.user_ctx              = gw;
     ops.on_downlink_delivered = esp32_downlink_cb;
 #ifdef OPENNEAR_ENABLE_WIFI_GW
-    ops.wifi_connect          = esp32_wifi_connect_cb;
-    ops.cloud_post_json       = esp32_cloud_post_cb;
-    ops.mqtt_publish          = esp32_mqtt_publish_cb;
-    ops.on_channel_align      = esp32_channel_align_cb;
+    if (s_wifi_portal_runtime_en) {
+        ops.wifi_connect      = esp32_wifi_connect_cb;
+        ops.cloud_post_json   = esp32_cloud_post_cb;
+        ops.mqtt_publish      = esp32_mqtt_publish_cb;
+        ops.on_channel_align  = esp32_channel_align_cb;
+    }
 #endif
 #ifdef OPENNEAR_ENABLE_BLE_GW
     ops.ble_notify            = esp32_ble_notify_cb;
@@ -1622,6 +1638,9 @@ void on_esp32_net_gw_preinit_wifi(on_gw_ctx_t *gw, const char *default_ssid,
     on_gw_init(gw, mode, &ops);
 
 #ifdef OPENNEAR_ENABLE_WIFI_GW
+    if (!s_wifi_portal_runtime_en) {
+        return;
+    }
     String ssid = default_ssid ? String(default_ssid) : String("");
     String pass = default_pass ? String(default_pass) : String("");
     String url  = default_cloud_url ? String(default_cloud_url) : String("");
@@ -1684,13 +1703,15 @@ void on_esp32_net_gw_start(on_node_t *node, on_gw_ctx_t *gw, const char *ble_nam
         on_node_attach_gateway(node, gw);
     }
 #ifdef OPENNEAR_ENABLE_WIFI_GW
-    load_anchors_from_nvs();
-    load_fences_from_nvs();
-    load_rules_from_nvs();
-    if (node) {
-        on_node_set_rssi_observer(node, esp32_on_rssi_observed_cb, node);
-        on_node_set_ble_beacon_observer(node, esp32_on_ble_beacon_observed_cb, node);
-        on_node_set_csi_observer(node, esp32_on_csi_observed_cb, node);
+    if (s_wifi_portal_runtime_en) {
+        load_anchors_from_nvs();
+        load_fences_from_nvs();
+        load_rules_from_nvs();
+        if (node) {
+            on_node_set_rssi_observer(node, esp32_on_rssi_observed_cb, node);
+            on_node_set_ble_beacon_observer(node, esp32_on_ble_beacon_observed_cb, node);
+            on_node_set_csi_observer(node, esp32_on_csi_observed_cb, node);
+        }
     }
 #endif
 #ifdef OPENNEAR_ENABLE_BLE_GW
@@ -1701,7 +1722,9 @@ void on_esp32_net_gw_start(on_node_t *node, on_gw_ctx_t *gw, const char *ble_nam
     if (gw) gw->cfg.ble_scan_enabled = s_ble_scan_enabled;
     /* Guarantee Wi-Fi modem sleep is enabled before starting BT controller under ESP-IDF SW coexist */
 #ifdef OPENNEAR_ENABLE_WIFI_GW
-    apply_wifi_coex_ps();
+    if (s_wifi_portal_runtime_en) {
+        apply_wifi_coex_ps();
+    }
 #endif
     /* Start BT controller in BLE-only mode & release unused Classic BT DRAM (~36 KB saved for TLS/Web) */
     if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_IDLE) {
@@ -1761,6 +1784,7 @@ void on_esp32_net_gw_start(on_node_t *node, on_gw_ctx_t *gw, const char *ble_nam
 void on_esp32_net_gw_poll(on_node_t *node, on_gw_ctx_t *gw) {
     if (!gw) return;
 #ifdef OPENNEAR_ENABLE_WIFI_GW
+    if (s_wifi_portal_runtime_en) {
     bool connected = (WiFi.status() == WL_CONNECTED);
     if (connected && !s_wifi_was_connected) {
         s_wifi_was_connected = true;
@@ -2097,6 +2121,7 @@ void on_esp32_net_gw_poll(on_node_t *node, on_gw_ctx_t *gw) {
             Serial.println("[OpenNear OTA] All targets READY -> scheduled synchronized cluster commit (+8 SFs)");
         }
     }
+    } /* s_wifi_portal_runtime_en */
 #else
     (void)node;
 #endif
