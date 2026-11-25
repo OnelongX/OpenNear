@@ -1,0 +1,83 @@
+{
+  "name": "OpenNear",
+  "version": "7.3.0",
+  "description": "Zero-dependency NearLink-class deterministic wireless SDK: sub-us sync, 1~6-hop self-healing mesh, multi-anchor 2D indoor positioning, BLE iBeacon/Eddystone, Wi-Fi CSI radar, offline geofencing, and N-gateway encrypted air-sync.",
+  "keywords": [
+    "opennear",
+    "nearlink",
+    "wireless",
+    "tdma",
+    "mesh",
+    "esp32",
+    "nrf52840",
+    "indoor-positioning",
+    "wifi-csi",
+    "geofence",
+    "ibeacon",
+    "mqtt",
+    "home-assistant"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/OnelongX/OpenNear.git"
+  },
+  "authors": [
+    {
+      "name": "Onelong",
+      "url": "https://github.com/OnelongX/OpenNear",
+      "maintainer": true
+    }
+  ],
+  "license": "MIT",
+  "homepage": "https://onelongx.github.io/OpenNear/",
+  "frameworks": [
+    "arduino",
+    "espidf"
+  ],
+  "platforms": [
+    "espressif32",
+    "nordicnrf52",
+    "native"
+  ],
+  "headers": [
+    "opennear_core.h",
+    "OpenNear.h"
+  ],
+  "examples": [
+    {
+      "name": "Simple Sync Node",
+      "base": "examples/01_SimpleSyncNode",
+      "files": ["01_SimpleSyncNode.ino"]
+    },
+    {
+      "name": "Custom Gateway",
+      "base": "examples/02_CustomGateway",
+      "files": ["02_CustomGateway.ino"]
+    },
+    {
+      "name": "Offline Geofence & Wi-Fi CSI Radar",
+      "base": "examples/03_OfflineGeofenceCsi",
+      "files": ["03_OfflineGeofenceCsi.ino"]
+    }
+  ],
+  "build": {
+    "includeDir": "include",
+    "srcDir": ".",
+    "flags": [
+      "-Iinclude",
+      "-Icore/include",
+      "-Ihal",
+      "-Iports/esp32_wroom32/include"
+    ],
+    "srcFilter": [
+      "-<*>",
+      "+<core/src/*.c>",
+      "+<ports/esp32_wroom32/src/hal_esp32_raw80211.c>",
+      "+<ports/esp32_wroom32/src/esp32_ota_flash.cpp>",
+      "+<ports/esp32_wroom32/src/esp32_demo_app.cpp>",
+      "+<ports/esp32_wroom32/src/esp32_tls_transport.cpp>",
+      "+<ports/esp32_wroom32/src/esp32_net_gateway.cpp>",
+      "+<ports/esp32_wroom32/src/opennear_esp32_sdk.cpp>"
+    ]
+  }
+}

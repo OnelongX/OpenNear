@@ -1,0 +1,40 @@
+{
+  "name": "opennear-sdk",
+  "version": "7.3.0",
+  "description": "Zero-dependency JavaScript / TypeScript ESM SDK for OpenNear wireless mesh gateways (Node.js 18+ and modern browsers)",
+  "type": "module",
+  "main": "./src/index.mjs",
+  "types": "./src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "import": "./src/index.mjs"
+    }
+  },
+  "files": [
+    "src/",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test test/client.test.mjs"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "opennear",
+    "iot",
+    "esp32",
+    "mesh",
+    "tdma",
+    "csi",
+    "geofence",
+    "indoor-positioning"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/OnelongX/OpenNear.git",
+    "directory": "sdk/js"
+  }
+}

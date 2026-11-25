@@ -1,0 +1,31 @@
+menu "OpenNear SDK Configuration"
+
+    config OPENNEAR_ENABLE_SECURITY
+        bool "Enable AES-128-CCM AEAD, Beacon CBC-MAC & X25519 ECDH"
+        default y
+
+    config OPENNEAR_ENABLE_MESH
+        bool "Enable 3~6-Hop Hybrid Mesh & 256-Node Epoch-TDMA"
+        default y
+
+    config OPENNEAR_ENABLE_OTA
+        bool "Enable Authenticated Multi-Hop Cluster OTA (A/B Rollback)"
+        default y
+
+    config OPENNEAR_ENABLE_LOCATE
+        bool "Enable 2D Multi-Anchor Positioning, BLE Beacons, Geofences & Wi-Fi CSI Radar"
+        default y
+
+    config OPENNEAR_ENABLE_WIFI_GW
+        bool "Enable Embedded Web Portal, HTTP API & MQTT/Home Assistant Gateway"
+        default y
+
+    config OPENNEAR_ENABLE_BLE_GW
+        bool "Enable BLE GATT 0xFFE0 Bridge & Passive iBeacon/Eddystone Scanner"
+        default y
+
+    config OPENNEAR_ENABLE_TLS
+        bool "Enable MQTTS (8883) & HTTPS TLS Support (WiFiClientSecure + NVS Root CA)"
+        default n
+
+endmenu

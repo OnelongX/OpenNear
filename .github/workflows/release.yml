@@ -1,0 +1,74 @@
+name: Release OpenNear SDK & Firmware
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  package-sdks-and-firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python & PlatformIO
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run SDK & C11 Smoke Verification
+        run: |
+          cmake -S . -B build_cmake -DOPENNEAR_BUILD_TESTS=ON
+          cmake --build build_cmake -j
+          ctest --test-dir build_cmake --output-on-failure
+          python3 -m unittest discover -s sdk/python/tests -v
+          node --test sdk/js/test/client.test.mjs
+
+      - name: Package C11, Arduino, Python & JS/TS SDK Archives
+        run: |
+          mkdir -p dist
+          tar -czf dist/opennear-core-c11.tar.gz \
+            include core hal ports/template CMakeLists.txt Kconfig idf_component.yml LICENSE README.md
+          zip -r dist/opennear-arduino-sdk.zip \
+            library.properties library.json include core hal examples \
+            ports/esp32_wroom32/include ports/esp32_wroom32/src \
+            LICENSE README.md -x "ports/esp32_wroom32/src/main.cpp"
+          tar -czf dist/opennear-python-sdk.tar.gz -C sdk python
+          tar -czf dist/opennear-js-sdk.tar.gz -C sdk js
+
+      - name: Install PlatformIO CLI
+        run: pip install -U platformio esptool
+
+      - name: Build & Merge 4 ESP32 Production Firmwares
+        run: |
+          pio run -d ports/esp32_wroom32 \
+            -e esp32_iot_mesh_gw \
+            -e esp32_iot_mesh_gw_tls \
+            -e esp32_demo_sync_node \
+            -e esp32_node_t_ota
+          for env in esp32_iot_mesh_gw esp32_iot_mesh_gw_tls esp32_demo_sync_node esp32_node_t_ota; do
+            BUILD_DIR="ports/esp32_wroom32/.pio/build/${env}"
+            python3 -m esptool --chip esp32 merge_bin \
+              -o "dist/opennear-${env}-merged.bin" \
+              --flash_mode dio --flash_freq 40m --flash_size 4MB \
+              0x1000 "${BUILD_DIR}/bootloader.bin" \
+              0x8000 "${BUILD_DIR}/partitions.bin" \
+              0x10000 "${BUILD_DIR}/firmware.bin"
+          done
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: dist/*

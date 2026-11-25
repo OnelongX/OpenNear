@@ -57,9 +57,30 @@ jobs:
           make -C ports/nrf52840_bare clean
           make -C ports/nrf52840_bare MASTER=1
 
-      - name: Run Python Real-Hardware Log Analyzer & GPIO Sync Unit Tests
+      - name: Verify Unified C11 SDK Header & HAL Porting Template (-Werror)
+        run: |
+          gcc -std=c11 -O2 -Wall -Wextra -Werror -fsyntax-only \
+            -Iinclude -Icore/include -Ihal \
+            ports/template/hal_port_template.c
+
+      - name: Build & Verify CMake Host Library & CTest
+        run: |
+          cmake -S . -B build_cmake -DOPENNEAR_BUILD_TESTS=ON -DOPENNEAR_BUILD_SIM=ON
+          cmake --build build_cmake -j
+          ctest --test-dir build_cmake --output-on-failure
+
+      - name: Run Python Tool & Python SDK Unit Tests
         run: |
           python3 -m unittest -v tests/test_analyze_esp32_hw_log.py tests/test_measure_esp32_gpio_sync.py
+          python3 -m unittest discover -s sdk/python/tests -v
+
+      - name: Run JavaScript / TypeScript SDK Unit Tests
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Execute Node.js SDK Test Suite
+        run: node --test sdk/js/test/client.test.mjs
 
   build-esp32-firmware:
     runs-on: ubuntu-latest

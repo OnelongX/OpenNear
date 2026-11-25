@@ -1,0 +1,14 @@
+version: "7.3.0"
+description: "OpenNear NearLink-class deterministic wireless SDK: sub-us sync, 1~6-hop mesh, Wi-Fi CSI radar, offline 2D geofencing, and N-gateway encrypted failover."
+url: "https://github.com/OnelongX/OpenNear"
+repository: "https://github.com/OnelongX/OpenNear.git"
+issues: "https://github.com/OnelongX/OpenNear/issues"
+license: "MIT"
+dependencies:
+  idf:
+    version: ">=4.4.0"
+targets:
+  - esp32
+  - esp32s3
+  - esp32c3
+  - esp32c6

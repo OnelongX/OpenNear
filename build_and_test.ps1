@@ -12,6 +12,7 @@ if (Test-Path $gccBin) {
 }
 
 $inc = @(
+    "-I$Root\include",
     "-I$Root\core\include",
     "-I$Root\hal",
     "-I$Root\sim"
@@ -63,7 +64,13 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 & "$BuildDir\l1_phy_bench.exe"
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-Write-Host "`n[4/4] Cross-Compile Check: ESP32-WROOM-32 (Xtensa) + nRF52840 Bare-Metal C11..." -ForegroundColor Cyan
+Write-Host "`n[4/4] Cross-Compile Check: C11 SDK Template + ESP32-WROOM-32 (Xtensa + SDK) + nRF52840 Bare-Metal..." -ForegroundColor Cyan
+& gcc -std=c11 -O2 -Wall -Wextra -Werror -D__USE_MINGW_ANSI_STDIO=1 -fsyntax-only `
+    "-I$Root\include" "-I$Root\core\include" "-I$Root\hal" `
+    "$Root\ports\template\hal_port_template.c"
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+Write-Host "  OK: C11 unified SDK header (include/opennear_core.h) + HAL porting template passed (-Werror)." -ForegroundColor Green
+
 & gcc -std=c11 -O2 -Wall -Wextra -fsyntax-only `
     "-I$Root\core\include" "-I$Root\hal" "-I$Root\ports\nrf52840_bare\include" `
     "$Root\ports\nrf52840_bare\src\startup_nrf52840.c" `
@@ -79,6 +86,7 @@ $sdk  = Join-Path $fw "tools\sdk\esp32"
 if ((Test-Path $xbin) -and (Test-Path $sdk)) {
     $env:PATH = "$xbin;$env:PATH"
     $espInc = @(
+        "-I$Root\include",
         "-I$Root\core\include",
         "-I$Root\hal",
         "-I$Root\ports\esp32_wroom32\include",
@@ -180,6 +188,7 @@ if ((Test-Path $xbin) -and (Test-Path $sdk)) {
         "$Root\ports\esp32_wroom32\src\esp32_tls_transport.cpp",
         "$Root\ports\esp32_wroom32\src\esp32_demo_app.cpp",
         "$Root\ports\esp32_wroom32\src\esp32_net_gateway.cpp",
+        "$Root\ports\esp32_wroom32\src\opennear_esp32_sdk.cpp",
         "$Root\ports\esp32_wroom32\src\main.cpp"
     )
     foreach ($f in $espCpp) {
@@ -187,6 +196,17 @@ if ((Test-Path $xbin) -and (Test-Path $sdk)) {
         & xtensa-esp32-elf-g++ -std=gnu++11 -Os -Wall -Wextra -mlongcalls -fno-rtti -fno-exceptions `
             -DOPENNEAR_ENABLE_OTA=1 -DOPENNEAR_ENABLE_WIFI_GW=1 -DOPENNEAR_ENABLE_BLE_GW=1 -DOPENNEAR_LEADERLESS_BOOT=1 -DOPENNEAR_ENABLE_DEMO_APP=1 `
             -c $f @espInc -o $obj
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    }
+    $espExamples = @(
+        "$Root\examples\01_SimpleSyncNode\01_SimpleSyncNode.ino",
+        "$Root\examples\02_CustomGateway\02_CustomGateway.ino",
+        "$Root\examples\03_OfflineGeofenceCsi\03_OfflineGeofenceCsi.ino"
+    )
+    foreach ($ex in $espExamples) {
+        & xtensa-esp32-elf-g++ -std=gnu++11 -Os -Wall -Wextra -Werror -mlongcalls -fno-rtti -fno-exceptions `
+            -DOPENNEAR_ENABLE_OTA=1 -DOPENNEAR_ENABLE_WIFI_GW=1 -DOPENNEAR_ENABLE_BLE_GW=1 -DOPENNEAR_LEADERLESS_BOOT=1 -DOPENNEAR_ENABLE_DEMO_APP=1 `
+            -x c++ -fsyntax-only $ex @espInc
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     }
     # Verify optional MQTTS/HTTPS TLS module (-DOPENNEAR_ENABLE_TLS=1) & BLE coexistence HAL (-DOPENNEAR_ENABLE_BLE_GW=1)
@@ -197,7 +217,7 @@ if ((Test-Path $xbin) -and (Test-Path $sdk)) {
         -DOPENNEAR_ENABLE_OTA=1 -DOPENNEAR_ENABLE_WIFI_GW=1 -DOPENNEAR_ENABLE_BLE_GW=1 -DOPENNEAR_LEADERLESS_BOOT=1 -DOPENNEAR_ENABLE_TLS=1 -DOPENNEAR_ENABLE_DEMO_APP=1 `
         -c "$Root\ports\esp32_wroom32\src\esp32_tls_transport.cpp" @espInc -o "$BuildDir\esp32_obj\esp32_tls_transport_tls.o"
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    Write-Host "  OK: Route C ESP32-WROOM-32 Xtensa cross-compilation passed (23/23 objs + BLE/Demo HAL + optional MQTTS/TLS)." -ForegroundColor Green
+    Write-Host "  OK: Route C ESP32-WROOM-32 Xtensa cross-compilation passed (24/24 objs + 3 SDK examples + BLE/Demo HAL + MQTTS/TLS)." -ForegroundColor Green
 } else {
     Write-Host "  SKIP: ESP32 Xtensa toolchain not found in default PlatformIO path." -ForegroundColor Yellow
 }

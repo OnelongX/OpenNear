@@ -5,8 +5,9 @@
 **零历史包袱、从零设计的开源类星闪（NearLink-Class）确定性无线协议栈与万物互联混合 Mesh 平台**
 
 [![OpenNear CI](https://github.com/OnelongX/OpenNear/actions/workflows/ci.yml/badge.svg)](https://github.com/OnelongX/OpenNear/actions/workflows/ci.yml)
-![Version](https://img.shields.io/badge/version-v7.2-0ea5e9?style=flat)
+![Version](https://img.shields.io/badge/version-v7.3%20SDK-0ea5e9?style=flat)
 ![Core](https://img.shields.io/badge/core-Pure%20C11%20%7C%20Zero%20Deps-10b981?style=flat)
+![SDKs](https://img.shields.io/badge/SDK-Arduino%20%7C%20PlatformIO%20%7C%20ESP--IDF%20%7C%20CMake%20%7C%20Python%20%7C%20JS%2FTS-6366f1?style=flat)
 ![Tests](https://img.shields.io/badge/tests-42%20Suites%20%7C%20512%20Assertions-22c55e?style=flat)
 ![Platforms](https://img.shields.io/badge/hardware-ESP32%20%7C%20nRF52840%20%7C%20FPGA%20RTL-8b5cf6?style=flat)
 [![Web Flasher](https://img.shields.io/badge/ESP32%20Web%20Flasher-%E4%B8%80%E9%94%AE%E5%9C%A8%E7%BA%BF%E5%88%B7%E6%9C%BA-f97316?style=flat)](https://onelongx.github.io/OpenNear/)
@@ -148,14 +149,14 @@ sequenceDiagram
 
 | 验证项 | 实测指标 | 结论 |
 |---|---|---|
-| **核心协议单测与集成套件**（`tests/test_opennear.c`） | **38 套测试 / 391 项断言全部通过**（`0 failed`，`-Wall -Wextra -Wshadow -Wformat=2 -Wundef` 0 告警） | PASS |
+| **核心协议单测与集成套件**（`tests/test_opennear.c`） | **42 套测试 / 512 项断言全部通过**（含离线围栏/CSI/N-网关热备，`0 failed`，`-Wall -Wextra` 0 告警） | PASS |
 | **10 节点多跳全生命周期仿真**（含 2 堵墙 2-Hop） | 稳态最大偏差 **90 ns** · 10 帧断联保持 **100 ns** · 主节点宕机热切后 **84 ns** · **0 碰撞** | PASS |
 | **ESP32 队列毛刺抗抖动验证**（`[TEST 25]`） | 1800 us Wi-Fi TX 排队毛刺下时钟相位误差 **323 ns**（Lookahead ACT 误差 **343 ns**） | PASS |
 | **L1 8 us 短前导捕获**（+40 ppm CFO + 2-Tap 瑞利多径） | `-3 dB` 命中 **88.0%** · `0 dB` 命中 **99.0%**（定时误差 **33.8 ns**）· `+6 dB` **100.0%（0 ns）** | PASS |
 | **L1 CA-Polar (N=128, K=48) BLER** | `Es/N0 = -3 dB`：Q4.4 定点 **98.5%** · 2-TX 软合并 HARQ **100.0% (200/200)** | PASS |
 | **星闪 2.0 ISAC 测距与防中继**（`[TEST 18]`） | 真实 `1.650 m` → MCPD `1.648 m`（误差 **0.23 cm**）；中继放大攻击 100% 拦截 | PASS |
 | **256 节点 Epoch-TDMA 占空比**（`[TEST 30/32]`） | 8 共享时隙 × 32 周期 = **256 节点 0 碰撞**，32 周期休眠射频占空比 **0.31%** | PASS |
-| **跨平台真机交叉编译 + Python 测试** | nRF52840 裸机 **PASS** · ESP32 明文 & TLS (`-Werror`) **21/21 PASS** · Python 日志/同步测试 **6/6 PASS** | PASS |
+| **跨平台真机交叉编译 + SDK 套件** | nRF52840 裸机 **PASS** · ESP32 (`24/24` objs + 3 SDK 示例 + MQTTS/TLS) **PASS** · C11 HAL 模板 `-Werror` **PASS** · Python & JS/TS SDK 单测 **PASS** | PASS |
 
 ---
 
@@ -175,7 +176,17 @@ sequenceDiagram
 
 ```text
 opennear/
-├── build_and_test.ps1                 # 一键构建：38 组单测 + 10 节点仿真 + L1 基准 + ESP32(明文/BLE/TLS)/nRF52 交叉编译
+├── build_and_test.ps1                 # 一键构建：42 组单测 + 10 节点仿真 + L1 基准 + C11 SDK/ESP32/nRF52 交叉编译
+├── library.json / library.properties  # PlatformIO Registry & Arduino Library Manager SDK 清单（v7.3.0）
+├── CMakeLists.txt / idf_component.yml # 双模 CMake（纯 C11 OpenNear::core 静态库 + ESP-IDF 原生组件 + Kconfig）
+├── include/                           # 统一 SDK 顶层头文件（开发者只需 #include 单个入口）
+│   ├── opennear_config.h              # 全量 ON_CFG_* 功能裁剪开关（自动桥接 ESP-IDF sdkconfig.h）
+│   ├── opennear_core.h                # 纯 C11 统一 SDK 单头文件入口（跨 Win/macOS/Linux 无大小写冲突）
+│   └── OpenNear.h                     # ESP32 / Arduino 10 行接入 C++ Facade
+├── examples/                          # 3 个开箱即用 SDK 示例（同步节点 / 自定义网关 / 离线围栏+CSI 雷达）
+├── sdk/                               # 零外部依赖的上位机 / 云端控制 SDK（直连网关 HTTP REST API）
+│   ├── python/                        # Python 3.9+ SDK（pyproject.toml + opennear.OpenNearClient + Mock 单测）
+│   └── js/                            # Node.js 18+ & 浏览器 ESM/TypeScript SDK（Fetch API + index.d.ts + node:test）
 ├── core/                              # 零外部依赖的纯 C11 可移植协议核（Host / ESP32 / nRF52 共用）
 │   ├── include/
 │   │   ├── on_types.h                 # 12-bit Short-ID、四段式超帧时隙常量与角色定义
@@ -223,8 +234,80 @@ opennear/
     │   ├── src/
     │   └── platformio.ini             # 11 个开箱即用环境（含 esp32_iot_mesh_gw / esp32_iot_mesh_gw_tls 等）
     ├── nrf52840_bare/                 # 路线 A：nRF52840 裸 RADIO+PPI + RTC0 双时钟微安休眠 + 启动/链接脚本
-    └── sdr_fpga_ref/                  # 路线 B：CFO(+40ppm)+多径短前导 + 定点 Q4.4 CA-Polar + 可综合 Verilog RTL
-        └── rtl/                       # opennear_preamble_correlator.v + opennear_polar_encoder/decoder_n128.v + tb
+    ├── sdr_fpga_ref/                  # 路线 B：CFO(+40ppm)+多径短前导 + 定点 Q4.4 CA-Polar + 可综合 Verilog RTL
+    │   └── rtl/                       # opennear_preamble_correlator.v + opennear_polar_encoder/decoder_n128.v + tb
+    └── template/                      # 新 MCU 7 函数最小 HAL 移植模板（hal_port_template.c，适配 STM32/CH32/RP2040 等）
+```
+
+---
+
+## 六点五、OpenNear v7.3 SDK 快速集成指南
+
+OpenNear 现已完整 SDK 化，支持 **6 种开发生态零痛点接入**（嵌入式 C11 / Arduino / PlatformIO / ESP-IDF / CMake + 上位机 Python / JavaScript & TypeScript）：
+
+### 1. PlatformIO / Arduino（10 行代码集成）
+
+在你的 `platformio.ini` 中直接引用仓库：
+
+```ini
+lib_deps =
+  https://github.com/OnelongX/OpenNear.git
+```
+
+然后在你的业务 `main.cpp` / `.ino` 中只需 `#include <OpenNear.h>`（完整示例见 [examples/](./examples/)）：
+
+```cpp
+#include <OpenNear.h>
+
+void setup() {
+  Serial.begin(115200);
+  OpenNear.begin(OpenNearConfig::Gateway()
+    .withBleName("MyGateway")
+    .onCommand([](const char *cmd, size_t len) {
+      Serial.printf("RX cmd: %.*s\n", (int)len, cmd);
+    })
+    .onRuleFired([](uint8_t ruleId, const char *zone, const char *tag, const char *cmd) {
+      Serial.printf("Offline Rule #%u @ %s [%s] -> %s\n", ruleId, zone, tag, cmd);
+    }));
+}
+
+void loop() {
+  OpenNear.poll(); // Core 0 处理 Web/MQTT/BLE；Core 1 实时射频核由 SDK 自动托管
+}
+```
+
+### 2. ESP-IDF / CMake / 裸机 MCU（C11 零依赖核）
+
+- **CMake 桌面/Linux/RTOS**：`add_subdirectory(opennear)` 后链接 `OpenNear::core`，代码仅需 `#include "opennear_core.h"`。
+- **ESP-IDF 组件**：直接将仓库放入 `components/opennear`（内置 `CMakeLists.txt`、`idf_component.yml` 与 `Kconfig`，支持 `idf.py menuconfig` 裁剪功能）。
+- **自定义 MCU 移植**（STM32 / CH32 / RP2040 / EFR32 等）：复制 [ports/template/hal_port_template.c](./ports/template/hal_port_template.c)，仅需实现 **7 个 HAL 函数**（`now_us`、`delay_us`、`rf_set_channel`、`rf_tx`、`rf_rx_poll`、`gpio_act`、`random_u32`）。
+
+### 3. Python SDK（零第三方依赖，`sdk/python/`）
+
+```bash
+pip install -e ./sdk/python
+```
+
+```python
+from opennear import OpenNearClient, RuleTrigger
+
+gw = OpenNearClient("http://192.168.4.1", token="my-token")
+print(gw.status(), gw.locate())
+gw.set_fence("desk_zone", x_cm=220, y_cm=150, radius_cm=120)
+gw.set_rule(1, RuleTrigger.IN_FENCE, zone="desk_zone", tag="lights", cmd="LED_ON")
+gw.send_tag("lights", "BLINK")
+```
+
+### 4. JavaScript / TypeScript ESM SDK（零依赖 Fetch API，`sdk/js/`）
+
+```js
+import { OpenNearClient, RuleTrigger } from "./sdk/js/src/index.mjs";
+
+const gw = new OpenNearClient("http://192.168.4.1", { token: "my-token" });
+const loc = await gw.getLocate();
+await gw.setFence("desk_zone", 220, 150, 120);
+await gw.setRule(1, RuleTrigger.IN_FENCE, { zone: "desk_zone", tag: "lights", cmd: "LED_ON" });
+await gw.sendTag("lights", "BLINK");
 ```
 
 ---

@@ -40,6 +40,25 @@ static on_gw_ctx_t      *s_gw_ref     = nullptr;
 static on_node_t        *s_node_ref   = nullptr;
 static SemaphoreHandle_t s_node_mutex = nullptr;
 
+static void (*s_user_cmd_cb)(void *ctx, const uint8_t *payload, size_t len) = nullptr;
+static void *s_user_cmd_ctx = nullptr;
+static void (*s_user_rule_cb)(void *ctx, uint8_t rule_id, const char *zone,
+                              const char *tag, const char *cmd) = nullptr;
+static void *s_user_rule_ctx = nullptr;
+
+void on_esp32_net_gw_set_user_cmd_cb(void (*cb)(void *ctx, const uint8_t *payload, size_t len),
+                                     void *ctx) {
+    s_user_cmd_cb  = cb;
+    s_user_cmd_ctx = ctx;
+}
+
+void on_esp32_net_gw_set_user_rule_cb(void (*cb)(void *ctx, uint8_t rule_id, const char *zone,
+                                                 const char *tag, const char *cmd),
+                                      void *ctx) {
+    s_user_rule_cb  = cb;
+    s_user_rule_ctx = ctx;
+}
+
 static void ensure_node_mutex(void) {
     if (!s_node_mutex) {
         s_node_mutex = xSemaphoreCreateRecursiveMutex();
@@ -531,6 +550,7 @@ static uint32_t dispatch_tag_or_local_cmd(on_node_t *node, const char *tag,
      * also trigger local demo LED/Relay AND broadcast over OpenNear so all demo boards actuate in sync! */
     if (sent_cnt == 0u) {
         on_esp32_demo_on_cmd(pay, plen);
+        if (s_user_cmd_cb) s_user_cmd_cb(s_user_cmd_ctx, pay, plen);
         if (node && (all_tags || s_loc_demo_running)) {
             on_esp32_node_lock();
             on_node_send_gw_downlink(node, ON_SHORT_ID_BROADCAST, ON_GW_MSG_CLOUD_CMD_DOWN, pay, plen);
@@ -547,6 +567,9 @@ static void esp32_on_rule_fired_cb(void *user_ctx, const on_loc_rule_t *rule) {
     size_t clen = strlen(rule->cmd_payload);
     if (clen == 0u || clen > ON_GW_MAX_PAYLOAD_LEN) return;
     const char *tag = rule->cmd_tag[0] ? rule->cmd_tag : "*";
+    if (s_user_rule_cb) {
+        s_user_rule_cb(s_user_rule_ctx, rule->id, rule->zone, tag, rule->cmd_payload);
+    }
     uint32_t sent = dispatch_tag_or_local_cmd(node, tag,
                                               reinterpret_cast<const uint8_t *>(rule->cmd_payload),
                                               static_cast<uint8_t>(clen));
@@ -1563,6 +1586,7 @@ static on_err_t esp32_downlink_cb(void *ctx, const on_gw_bridge_msg_t *msg) {
         return ON_OK;
     }
     on_esp32_demo_on_cmd(msg->payload, msg->payload_len);
+    if (s_user_cmd_cb) s_user_cmd_cb(s_user_cmd_ctx, msg->payload, msg->payload_len);
     Serial.printf("[OpenNear GW] Downlink cmd seq=%u type=%u len=%u: %.*s\n",
                   (unsigned)msg->seq, (unsigned)msg->bridge_type,
                   (unsigned)msg->payload_len, (int)msg->payload_len,

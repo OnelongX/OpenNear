@@ -44,6 +44,13 @@ bool on_esp32_net_gw_load_netkey(uint8_t out_key[16]);
 /* v6.8: Clear all gateway NVS namespaces (Wi-Fi/Token/NETKEY/Aliases) & reboot into SoftAP Setup */
 void on_esp32_net_gw_factory_reset(void);
 
+/* v7.3 SDK Hooks: Register application callbacks for downlink commands and offline geofence/CSI rules */
+void on_esp32_net_gw_set_user_cmd_cb(void (*cb)(void *ctx, const uint8_t *payload, size_t len),
+                                     void *ctx);
+void on_esp32_net_gw_set_user_rule_cb(void (*cb)(void *ctx, uint8_t rule_id, const char *zone,
+                                                 const char *tag, const char *cmd),
+                                      void *ctx);
+
 #ifdef __cplusplus
 }
 #endif
