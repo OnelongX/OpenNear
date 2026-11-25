@@ -21,6 +21,12 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Cache PlatformIO Packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: ${{ runner.os }}-pio-esp32-${{ hashFiles('ports/esp32_wroom32/platformio.ini') }}
+
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -34,37 +40,54 @@ jobs:
           python3 -m unittest discover -s sdk/python/tests -v
           node --test sdk/js/test/client.test.mjs
 
-      - name: Package C11, Arduino, Python & JS/TS SDK Archives
+      - name: Package C11, Arduino IDE (.ZIP), Python & JS/TS SDK Archives
         run: |
           mkdir -p dist
           tar -czf dist/opennear-core-c11.tar.gz \
             include core hal ports/template CMakeLists.txt Kconfig idf_component.yml LICENSE README.md
-          zip -r dist/opennear-arduino-sdk.zip \
-            library.properties library.json include core hal examples \
-            ports/esp32_wroom32/include ports/esp32_wroom32/src \
-            LICENSE README.md -x "ports/esp32_wroom32/src/main.cpp"
+
+          # Build standard Arduino IDE 1.5 layout (OpenNear/library.properties + OpenNear/src/* + OpenNear/examples/*)
+          rm -rf build_arduino_pkg
+          mkdir -p build_arduino_pkg/OpenNear/src
+          cp library.properties library.json LICENSE README.md build_arduino_pkg/OpenNear/
+          cp -r examples build_arduino_pkg/OpenNear/
+          cp include/*.h core/include/*.h hal/*.h ports/esp32_wroom32/include/*.h build_arduino_pkg/OpenNear/src/
+          cp core/src/*.c build_arduino_pkg/OpenNear/src/
+          cp ports/esp32_wroom32/src/hal_esp32_raw80211.c \
+             ports/esp32_wroom32/src/esp32_ota_flash.cpp \
+             ports/esp32_wroom32/src/esp32_demo_app.cpp \
+             ports/esp32_wroom32/src/esp32_tls_transport.cpp \
+             ports/esp32_wroom32/src/esp32_net_gateway.cpp \
+             ports/esp32_wroom32/src/opennear_esp32_sdk.cpp \
+             build_arduino_pkg/OpenNear/src/
+          (cd build_arduino_pkg && zip -r ../dist/opennear-arduino-sdk.zip OpenNear)
+
           tar -czf dist/opennear-python-sdk.tar.gz -C sdk python
           tar -czf dist/opennear-js-sdk.tar.gz -C sdk js
 
-      - name: Install PlatformIO CLI
+      - name: Install PlatformIO CLI & esptool
         run: pip install -U platformio esptool
 
-      - name: Build & Merge 4 ESP32 Production Firmwares
+      - name: Build & Merge 4 ESP32 Production Firmwares (with boot_app0.bin at 0xe000)
         run: |
           pio run -d ports/esp32_wroom32 \
             -e esp32_iot_mesh_gw \
             -e esp32_iot_mesh_gw_tls \
             -e esp32_demo_sync_node \
             -e esp32_node_t_ota
+          BOOT_APP0=$(find ~/.platformio/packages/framework-arduinoespressif32 -name boot_app0.bin | head -n 1)
+          echo "Using boot_app0: $BOOT_APP0"
           for env in esp32_iot_mesh_gw esp32_iot_mesh_gw_tls esp32_demo_sync_node esp32_node_t_ota; do
             BUILD_DIR="ports/esp32_wroom32/.pio/build/${env}"
             python3 -m esptool --chip esp32 merge_bin \
               -o "dist/opennear-${env}-merged.bin" \
               --flash_mode dio --flash_freq 40m --flash_size 4MB \
-              0x1000 "${BUILD_DIR}/bootloader.bin" \
-              0x8000 "${BUILD_DIR}/partitions.bin" \
+              0x1000  "${BUILD_DIR}/bootloader.bin" \
+              0x8000  "${BUILD_DIR}/partitions.bin" \
+              0xe000  "${BOOT_APP0}" \
               0x10000 "${BUILD_DIR}/firmware.bin"
           done
+          ls -lh dist/
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
