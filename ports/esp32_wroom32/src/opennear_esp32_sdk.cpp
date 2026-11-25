@@ -4,6 +4,7 @@
 #include "hal_esp32_raw80211.h"
 #include "esp32_net_gateway.h"
 #include "esp32_ota_flash.h"
+#include "esp32_demo_app.h"
 #include <nvs_flash.h>
 #include <stdio.h>
 #include <string.h>
@@ -125,6 +126,9 @@ bool OpenNearClass::begin(const OpenNearConfig &cfg) {
 
     on_esp32_net_gw_start(&s_sdk_node, &s_sdk_gw,
                           cfg.ble_name ? cfg.ble_name : (cfg.is_gateway ? "OpenNear-G-GW" : "OpenNear-T-Node"));
+#ifdef OPENNEAR_ENABLE_DEMO_APP
+    on_esp32_demo_init();
+#endif
 
     if (cfg.leaderless_boot) {
         on_node_enable_leaderless_boot(&s_sdk_node, 1500u);
