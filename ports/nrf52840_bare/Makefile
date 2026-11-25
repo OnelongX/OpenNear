@@ -5,7 +5,7 @@ MASTER  ?= 0
 
 CFLAGS  := -std=c11 -Os -Wall -Wextra -ffunction-sections -fdata-sections \
            -mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=hard \
-           -I../../core/include -I../../hal -Iinclude -DOPENNEAR_IS_MASTER=$(MASTER)
+           -I../../include -I../../core/include -I../../hal -Iinclude -DOPENNEAR_IS_MASTER=$(MASTER)
 LDFLAGS := -T nrf52840.ld -nostartfiles -Wl,--gc-sections -lm -lc -lnosys
 
 SRCS := \
@@ -22,6 +22,7 @@ SRCS := \
     ../../core/src/on_gateway.c \
     ../../core/src/on_mesh.c \
     ../../core/src/on_mqtt.c \
+    ../../core/src/on_locate.c \
     ../../core/src/on_node.c \
     src/startup_nrf52840.c \
     src/hal_nrf52_radio_ppi.c \

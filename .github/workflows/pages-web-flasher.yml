@@ -4,6 +4,7 @@ on:
   push:
     branches: [ main ]
     paths:
+      - 'include/**'
       - 'core/**'
       - 'hal/**'
       - 'ports/esp32_wroom32/**'
@@ -69,8 +70,8 @@ jobs:
 
             cat > "site/firmware/manifest-${ENV}.json" <<EOF
           {
-            "name": "OpenNear v7.2 (${ENV})",
-            "version": "7.2.0",
+            "name": "OpenNear v7.3 (${ENV})",
+            "version": "7.3.0",
             "new_install_prompt_erase": true,
             "builds": [
               {
