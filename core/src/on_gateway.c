@@ -564,6 +564,15 @@ on_err_t on_gw_handle_control_text(on_gw_ctx_t *gw, const char *text, size_t len
         return ON_OK;
     }
 
+    /* Format 18: LRMODE:<0|1|2> -> Switch 4ms/54M Fast (0), 20ms/1M 500m (1), or 20ms/250K 700m+ LR (2) */
+    if (clean_len >= 8u && memcmp(text, "LRMODE:", 7u) == 0) {
+        char c = text[7];
+        if (c < '0' || c > '2') return ON_ERR_INVALID_ARG;
+        gw->cfg.lr_mode         = (uint8_t)(c - '0');
+        gw->cfg.lr_mode_updated = true;
+        return ON_OK;
+    }
+
     return ON_ERR_INVALID_ARG;
 }
 

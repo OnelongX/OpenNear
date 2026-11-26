@@ -30,6 +30,10 @@ void          on_amc_init(on_amc_ctx_t *ctx, on_phy_mode_t initial_mode);
 on_phy_mode_t on_amc_update(on_amc_ctx_t *ctx, float inst_snr_db, bool rx_ok);
 uint32_t      on_amc_air_time_us(on_phy_mode_t mode, size_t frame_bytes);
 
+/* v7.3 Long-Range Link Budget Helpers: receiver sensitivity (dBm) & estimated open-air LOS range (m) */
+int8_t        on_amc_sensitivity_dbm(on_phy_mode_t mode);
+uint32_t      on_amc_est_los_range_m(on_phy_mode_t mode, int8_t tx_power_dbm);
+
 #ifdef __cplusplus
 }
 #endif

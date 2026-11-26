@@ -8,7 +8,7 @@
 ![Version](https://img.shields.io/badge/version-v7.3%20SDK-0ea5e9?style=flat)
 ![Core](https://img.shields.io/badge/core-Pure%20C11%20%7C%20Zero%20Deps-10b981?style=flat)
 ![SDKs](https://img.shields.io/badge/SDK-Arduino%20%7C%20PlatformIO%20%7C%20ESP--IDF%20%7C%20CMake%20%7C%20Python%20%7C%20JS%2FTS-6366f1?style=flat)
-![Tests](https://img.shields.io/badge/tests-42%20Suites%20%7C%20512%20Assertions-22c55e?style=flat)
+![Tests](https://img.shields.io/badge/tests-43%20Suites%20%7C%20528%20Assertions-22c55e?style=flat)
 ![Platforms](https://img.shields.io/badge/hardware-ESP32%20%7C%20nRF52840%20%7C%20FPGA%20RTL-8b5cf6?style=flat)
 [![Web Flasher](https://img.shields.io/badge/ESP32%20Web%20Flasher-%E4%B8%80%E9%94%AE%E5%9C%A8%E7%BA%BF%E5%88%B7%E6%9C%BA-f97316?style=flat)](https://onelongx.github.io/OpenNear/)
 ![License](https://img.shields.io/badge/license-MIT-f59e0b?style=flat)
@@ -149,7 +149,7 @@ sequenceDiagram
 
 | 验证项 | 实测指标 | 结论 |
 |---|---|---|
-| **核心协议单测与集成套件**（`tests/test_opennear.c`） | **42 套测试 / 512 项断言全部通过**（含离线围栏/CSI/N-网关热备，`0 failed`，`-Wall -Wextra` 0 告警） | PASS |
+| **核心协议单测与集成套件**（`tests/test_opennear.c`） | **43 套测试 / 528 项断言全部通过**（含离线围栏/CSI/N-网关热备/700m+ 远距模式，`0 failed`，`-Wall -Wextra` 0 告警） | PASS |
 | **10 节点多跳全生命周期仿真**（含 2 堵墙 2-Hop） | 稳态最大偏差 **90 ns** · 10 帧断联保持 **100 ns** · 主节点宕机热切后 **84 ns** · **0 碰撞** | PASS |
 | **ESP32 队列毛刺抗抖动验证**（`[TEST 25]`） | 1800 us Wi-Fi TX 排队毛刺下时钟相位误差 **323 ns**（Lookahead ACT 误差 **343 ns**） | PASS |
 | **L1 8 us 短前导捕获**（+40 ppm CFO + 2-Tap 瑞利多径） | `-3 dB` 命中 **88.0%** · `0 dB` 命中 **99.0%**（定时误差 **33.8 ns**）· `+6 dB` **100.0%（0 ns）** | PASS |
@@ -373,6 +373,7 @@ pio run -d .\ports\esp32_wroom32 -e esp32_node_t -t upload
   - `RULE:<id:1..8>|<trig:0..6>|<zone>|<csi_th>|<tag>|<cmd>`（v7.2：纯 ESP32 离线边缘自动化规则：`1=进入房间`、`2=离开房间`、`3=进入围栏`、`4=离开围栏`、`5=CSI 有人活动 ≥ 阈值`、`6=CSI 安静无人 < 阈值`、`0=删除`，触发后本地毫秒级直驱 `CMD_TAG:` 或板载 LED/继电器）
   - `LOCDEMO:<0|1|2>`（v7.2：`1`=一键载入 4 房间+2 围栏+4 规则+Wi-Fi CSI 联动演示并自动演进，`2`=单步推进下一幕，`0`=停止演示并恢复 NVS 配置）
   - `BLESCAN:<0|1>`（开关共存被动 BLE iBeacon / Eddystone 信标扫描，写入 NVS 持久化）
+  - `LRMODE:<0|1|2>`（v7.3 700m+ 远距射频档位：`0`=标准 4ms/54M OFDM，`1`=远距 20ms/1M DSSS `+20 dBm` ~500m 兼容路由器，`2`=超远距 20ms/250K LR 扩频 `+20 dBm` 700m+ LOS；主控在下一超帧 `0 us` 边界原子切换，全网 1~2 跳节点与热备网关自动跟随并持久化至 NVS）
   - `OTA:<target_hex>|<ver>|<http_or_https_url>`（`FFF` 为全网广播）
   - `CMD:<target_hex>|<payload>`（1~6 跳自动选路下发）
   - `TOPO?` / `DATA?`（串口 `115200` 与蓝牙均支持，在任意节点查询全网拓扑与实时数据）

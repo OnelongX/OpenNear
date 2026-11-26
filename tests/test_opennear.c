@@ -3342,9 +3342,91 @@ static void test_v72_wifi_csi_geofence_and_offline_rules(void) {
            (unsigned)static_score, (unsigned)moving_score);
 }
 
+/* 43. Test v7.3 700m+ Long-Range 20ms Superframe Gear, AMC -105dBm Budget & Cluster Auto-Follow */
+static void test_v73_long_range_700m_mode(void) {
+    printf("[TEST 43] v7.3 700m+ Long-Range Mode (20ms Superframe + 1M/250K LR PHY + Cluster Auto-Follow)...\n");
+
+    /* Part A: 20ms Long-Range Superframe validation (all 11 1-hop slots + 4 Sub-G 2-hop slots intact) */
+    on_sf_cfg_t lr_sf;
+    EXPECT(on_sf_cfg_set_gear(&lr_sf, ON_SF_GEAR_LONGRANGE_20MS) == ON_OK,
+           "ON_SF_GEAR_LONGRANGE_20MS passes strict superframe validation");
+    EXPECT(lr_sf.t_sf_us == 20000u && lr_sf.slot_len_us == 900u && lr_sf.max_slots == 11u &&
+           lr_sf.sub_g_len_us == 5600u && lr_sf.act_fire_off_us == 19200u,
+           "20ms Long-Range gear provides 900 us slots, 11 1-hop slots & 5.6ms Sub-G window");
+    EXPECT(on_sf_subg_slot_start_us(&lr_sf, 0u) == 12200u &&
+           on_sf_subg_slot_start_us(&lr_sf, 3u) == 14900u &&
+           on_sf_subg_cra_start_us(&lr_sf) == 15800u,
+           "20ms Sub-G child slot offsets scale cleanly to 1000us Sub-SYNC + 4x900us Sub-TDMA");
+
+    /* Part B: AMC deep-fade step-down into 1M DSSS (-98dBm / 500m) & 250K LR (-105dBm / 700m+) */
+    on_amc_ctx_t amc;
+    on_amc_init(&amc, ON_PHY_LE_MSK_2M);
+    for (int i = 0; i < 16; ++i) on_amc_update(&amc, -3.5f, true);
+    EXPECT(amc.current_mode == ON_PHY_LR_DSSS_1M,
+           "AMC steps down to 1M DSSS (-98 dBm) at negative SNR (-3.5 dB)");
+    for (int i = 0; i < 16; ++i) on_amc_update(&amc, -7.0f, true);
+    EXPECT(amc.current_mode == ON_PHY_LR_SPREAD_250K,
+           "AMC steps down to 250K LR Spread (-105 dBm) at deep fade (-7.0 dB)");
+    for (int i = 0; i < 16; ++i) on_amc_update(&amc, 0.0f, true);
+    EXPECT(amc.current_mode == ON_PHY_LR_DSSS_1M,
+           "AMC recovers 250K LR -> 1M DSSS when SNR improves to 0 dB");
+    for (int i = 0; i < 16; ++i) on_amc_update(&amc, 5.0f, true);
+    EXPECT(amc.current_mode == ON_PHY_LE_MSK_2M,
+           "AMC recovers 1M DSSS -> 2M MSK when SNR improves to +5 dB");
+
+    uint32_t range_54m  = on_amc_est_los_range_m(ON_PHY_ESP32_RAW54M, 20);
+    uint32_t range_1m   = on_amc_est_los_range_m(ON_PHY_LR_DSSS_1M, 20);
+    uint32_t range_250k = on_amc_est_los_range_m(ON_PHY_LR_SPREAD_250K, 20);
+    EXPECT(on_amc_sensitivity_dbm(ON_PHY_LR_SPREAD_250K) == -105 &&
+           range_54m <= 100u && range_1m >= 450u && range_250k >= 700u,
+           "250K LR + Polar (-105 dBm @ +20 dBm TX) achieves 700m+ LOS link budget");
+
+    /* Part C: Live 10-node cluster hot-switches 4ms -> 20ms Ultra-Long-Range (LRMODE:2) via beacon */
+    sim_world_t w;
+    sim_world_init(&w, 0x7300700AULL);
+    sim_world_setup_10node_demo(&w, true);
+    sim_world_run_us(&w, 120000, 10); /* 30 SFs in 4ms fast mode */
+
+    on_node_set_long_range_mode(&w.nodes[0], 2u); /* Primary G switches to 700m+ 20ms / 250K LR */
+    sim_world_run_us(&w, 400000, 20); /* 20 superframes @ 20ms = 400ms */
+
+    EXPECT(w.nodes[0].lr_mode == 2u && w.nodes[0].sf_cfg.t_sf_us == 20000u,
+           "Primary G operates cleanly in 20ms 700m+ Long-Range mode");
+    EXPECT(w.nodes[1].lr_mode == 2u && w.nodes[1].sf_cfg.t_sf_us == 20000u &&
+           w.nodes[1].sf_cfg.slot_len_us == 900u,
+           "Backup_ID (T1) auto-follows 20ms / 900us slot gear & LRMODE=2 from SYNC_MAP");
+    EXPECT(w.nodes[2].lr_mode == 2u && w.nodes[8].lr_mode == 2u &&
+           w.nodes[8].sf_cfg.t_sf_us == 20000u,
+           "2-hop wall-blocked edge node (T8 via Sub-G T2) auto-follows 20ms LRMODE=2");
+    EXPECT(w.tdma_subg_collisions == 0u && w.cra_collisions == 0u,
+           "Zero RF collisions across 10 nodes during live 4ms -> 20ms Long-Range switch");
+
+    /* Kill Primary G in 20ms LR mode -> verify Backup_ID inherits 20ms LRMODE=2 on takeover! */
+    w.alive[0] = false;
+    sim_world_run_us(&w, 300000, 20); /* 15 SFs @ 20ms */
+    EXPECT(w.nodes[1].role == ON_ROLE_G && w.nodes[1].lr_mode == 2u &&
+           w.nodes[1].sf_cfg.t_sf_us == 20000u,
+           "Backup_ID seamlessly inherits 20ms 700m+ Long-Range mode after Primary G failover");
+
+    /* Part D: Gateway LRMODE:<0|1|2> control command & admin_token authentication */
+    on_gw_ctx_t gw;
+    on_gw_init(&gw, ON_GW_MODE_WIFI_AND_BLE, NULL);
+    on_gw_set_admin_token(&gw, "lr700");
+    EXPECT(on_gw_handle_control_text(&gw, "LRMODE:2", 8u, false) == ON_ERR_DECODE_FAIL,
+           "Unauthenticated LRMODE rejected when admin_token is set");
+    EXPECT(on_gw_handle_control_text(&gw, "AUTH:lr700|LRMODE:2", 19u, false) == ON_OK &&
+           gw.cfg.lr_mode == 2u && gw.cfg.lr_mode_updated,
+           "Authenticated LRMODE:2 parsed cleanly");
+    EXPECT(on_gw_handle_control_text(&gw, "AUTH:lr700|LRMODE:9", 19u, false) == ON_ERR_INVALID_ARG,
+           "Invalid LRMODE:9 cleanly rejected");
+
+    printf("    -> 20ms Gear (11x900us + Sub-G) | LOS Budget: 54M=%um -> 1M=%um -> 250K=%um | 10-Node Live Switch & Failover Inheritance OK (0 coll)\n",
+           (unsigned)range_54m, (unsigned)range_1m, (unsigned)range_250k);
+}
+
 int main(void) {
     printf("============================================================\n");
-    printf("       OpenNear v7.2 Core Protocol Automated Test Suite     \n");
+    printf("       OpenNear v7.3 Core Protocol Automated Test Suite     \n");
     printf("============================================================\n");
 
     test_6byte_header_and_frame();
@@ -3390,6 +3472,7 @@ int main(void) {
     test_v71_ble_ibeacon_eddystone_and_relay();
     test_v71_deep_audit_2hop_anchor_and_stale_gc();
     test_v72_wifi_csi_geofence_and_offline_rules();
+    test_v73_long_range_700m_mode();
 
     printf("\n------------------------------------------------------------\n");
     printf("SUMMARY: %d passed, %d failed\n", g_tests_passed, g_tests_failed);

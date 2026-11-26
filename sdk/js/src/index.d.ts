@@ -12,6 +12,14 @@ export declare const RuleTrigger: Readonly<{
 
 export type RuleTriggerValue = (typeof RuleTrigger)[keyof typeof RuleTrigger];
 
+export declare const LongRangeMode: Readonly<{
+  FAST_4MS: 0;
+  LONG_RANGE_500M: 1;
+  ULTRA_LONG_RANGE_700M: 2;
+}>;
+
+export type LongRangeModeValue = (typeof LongRangeMode)[keyof typeof LongRangeMode];
+
 export interface OpenNearClientOptions {
   token?: string | null;
   timeoutMs?: number;
@@ -73,6 +81,7 @@ export declare class OpenNearClient {
   setRule(ruleId: number, trigger: RuleTriggerValue | number, opts?: RuleOptions): Promise<Record<string, any>>;
   removeRule(ruleId: number): Promise<Record<string, any>>;
   setBleScan(enabled: boolean): Promise<Record<string, any>>;
+  setLongRangeMode(mode: LongRangeModeValue | number): Promise<Record<string, any>>;
   startDemo(): Promise<Record<string, any>>;
   stepDemo(): Promise<Record<string, any>>;
   stopDemo(): Promise<Record<string, any>>;

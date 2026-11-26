@@ -57,12 +57,14 @@ uint32_t on_sf_subg_sync_start_us(const on_sf_cfg_t *cfg) {
 }
 
 uint32_t on_sf_subg_slot_start_us(const on_sf_cfg_t *cfg, uint8_t sub_slot_idx) {
-    return (uint32_t)cfg->sub_g_start_us + ON_DEFAULT_SUBG_SYNC_US +
+    uint32_t sub_sync_us = (cfg && cfg->t_sf_us >= 20000u) ? 1000u : ON_DEFAULT_SUBG_SYNC_US;
+    return (uint32_t)cfg->sub_g_start_us + sub_sync_us +
            (uint32_t)sub_slot_idx * cfg->slot_len_us;
 }
 
 uint32_t on_sf_subg_cra_start_us(const on_sf_cfg_t *cfg) {
-    return (uint32_t)cfg->sub_g_start_us + ON_DEFAULT_SUBG_CRA_OFF;
+    uint32_t cra_off = (cfg && cfg->t_sf_us >= 20000u) ? 4600u : ON_DEFAULT_SUBG_CRA_OFF;
+    return (uint32_t)cfg->sub_g_start_us + cra_off;
 }
 
 uint32_t on_sf_cra_slot_start_us(const on_sf_cfg_t *cfg, uint8_t micro_slot) {
@@ -101,6 +103,22 @@ on_err_t on_sf_cfg_set_gear(on_sf_cfg_t *cfg, on_sf_gear_t gear) {
             cfg->cra_end_us      = 900u;
             cfg->act_start_us    = 900u;
             cfg->act_fire_off_us = 950u;
+            return on_sf_cfg_validate(cfg);
+
+        case ON_SF_GEAR_LONGRANGE_20MS:
+            /* 20,000 us (50 Hz) 700m+ Long-Range 4-phase superframe (1M DSSS / 250K LR + CA-Polar):
+             * Preserves all 11 1-hop D-TDMA slots (900 us each) + 4 Sub-G 2-hop slots (900 us each)! */
+            cfg->t_sf_us         = 20000u;
+            cfg->sync_end_us     = 1200u;
+            cfg->tdma_start_us   = 1200u;
+            cfg->slot_len_us     = 900u;
+            cfg->max_slots       = 11u;   /* 1200..11100 us */
+            cfg->sub_g_start_us  = 11200u;/* 11200..16800 us (1000 us Sub-SYNC + 4x900 us Sub-TDMA + 1000 us Sub-CRA) */
+            cfg->sub_g_len_us    = 5600u;
+            cfg->cra_start_us    = 17000u;/* 17000..18800 us (2 x 900 us C-RA contention slots) */
+            cfg->cra_end_us      = 18800u;
+            cfg->act_start_us    = 18800u;
+            cfg->act_fire_off_us = 19200u;
             return on_sf_cfg_validate(cfg);
 
         case ON_SF_GEAR_MESH_4MS:

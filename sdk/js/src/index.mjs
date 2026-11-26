@@ -16,6 +16,13 @@ export const RuleTrigger = Object.freeze({
   CSI_QUIET: 6,
 });
 
+/** OpenNear v7.3 700m+ Long-Range PHY & Superframe Gear modes. */
+export const LongRangeMode = Object.freeze({
+  FAST_4MS: 0,
+  LONG_RANGE_500M: 1,
+  ULTRA_LONG_RANGE_700M: 2,
+});
+
 export class OpenNearError extends Error {
   /**
    * @param {string} message
@@ -430,6 +437,18 @@ export class OpenNearClient {
    */
   setBleScan(enabled) {
     return this.rawCmd(`BLESCAN:${enabled ? 1 : 0}`);
+  }
+
+  /**
+   * Switch cluster PHY & superframe gear: 0=4ms/54M, 1=20ms/1M 500m, 2=20ms/250K 700m+.
+   * @param {number} mode
+   */
+  setLongRangeMode(mode) {
+    const m = Math.trunc(mode);
+    if (m !== 0 && m !== 1 && m !== 2) {
+      throw new RangeError(`mode must be 0, 1, or 2 (see LongRangeMode), got: ${mode}`);
+    }
+    return this.rawCmd(`LRMODE:${m}`);
   }
 
   startDemo() {

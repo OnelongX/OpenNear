@@ -14,7 +14,14 @@ SDK_ROOT = Path(__file__).resolve().parents[1]
 if str(SDK_ROOT) not in sys.path:
     sys.path.insert(0, str(SDK_ROOT))
 
-from opennear import OpenNearAuthError, OpenNearClient, OpenNearError, RuleTrigger, __version__
+from opennear import (
+    LongRangeMode,
+    OpenNearAuthError,
+    OpenNearClient,
+    OpenNearError,
+    RuleTrigger,
+    __version__,
+)
 
 
 class _MockGatewayState:
@@ -127,6 +134,7 @@ class TestOpenNearPythonSDK(unittest.TestCase):
         self.client.set_rule(1, RuleTrigger.IN_FENCE, zone="desk", csi_threshold=45, tag="lights", cmd="LED_ON")
         self.client.remove_rule(1)
         self.client.set_ble_scan(True)
+        self.client.set_long_range_mode(LongRangeMode.ULTRA_LONG_RANGE_700M)
         self.client.start_demo()
         self.client.step_demo()
         self.client.stop_demo()
@@ -151,6 +159,7 @@ class TestOpenNearPythonSDK(unittest.TestCase):
                 "RULE:1|3|desk|45|lights|LED_ON",
                 "RULE:1|0",
                 "BLESCAN:1",
+                "LRMODE:2",
                 "LOCDEMO:1",
                 "LOCDEMO:2",
                 "LOCDEMO:0",
@@ -185,6 +194,8 @@ class TestOpenNearPythonSDK(unittest.TestCase):
             self.client.set_netkey("short")
         with self.assertRaises(ValueError):
             self.client.set_wifi("bad|ssid", "pass")
+        with self.assertRaises(ValueError):
+            self.client.set_long_range_mode(3)
 
 
 if __name__ == "__main__":

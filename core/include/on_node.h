@@ -285,6 +285,11 @@ typedef struct {
     void (*on_csi_observed)(void *ctx, uint16_t anchor_id, uint8_t motion_score,
                             const uint8_t bins16[16]);
     void             *csi_obs_ctx;
+
+    /* v7.3: 700m+ Long-Range Mode (0 = 4ms/54M Fast, 1 = 20ms/1M DSSS 500m, 2 = 20ms/250K LR 700m+) */
+    uint8_t           lr_mode;
+    uint8_t           pending_lr_mode;
+    bool              has_pending_lr_mode;
 } on_node_t;
 
 /* Initialize node as Primary G coordinator or Unjoined Terminal */
@@ -400,6 +405,10 @@ on_err_t on_node_send_mesh_uplink(on_node_t *node, const uint8_t *payload, uint8
 on_err_t on_node_send_mesh_topo_mac(on_node_t *node);
 on_err_t on_node_send_mesh_downlink(on_node_t *node, uint16_t target_id,
                                     const uint8_t *payload, uint8_t len);
+
+/* v7.3: 700m+ Long-Range Mode (0 = 4ms Fast, 1 = 20ms 1M DSSS ~500m, 2 = 20ms 250K LR Spread 700m+) */
+void     on_node_set_long_range_mode(on_node_t *node, uint8_t lr_mode);
+uint8_t  on_node_get_long_range_mode(const on_node_t *node);
 
 #ifdef __cplusplus
 }

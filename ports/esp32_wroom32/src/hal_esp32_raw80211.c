@@ -252,6 +252,33 @@ static void esp32_radio_sleep(void *ctx) {
 
 static bool             s_wifi_ch_locked = false;
 static uint8_t          s_wifi_cur_ch = ON_ESP32_DEFAULT_CHANNEL;
+static uint8_t          s_esp32_lr_mode = 0u;
+
+void on_esp32_hal_set_long_range_mode(uint8_t lr_mode) {
+    if (lr_mode > 2u) lr_mode = 2u;
+    s_esp32_lr_mode = lr_mode;
+    if (lr_mode == 0u) {
+        (void)esp_wifi_config_80211_tx_rate(WIFI_IF_STA, WIFI_PHY_RATE_54M);
+    } else if (lr_mode == 1u) {
+        /* +20 dBm max PA (80 * 0.25 dBm) + 1 Mbps DSSS (-98 dBm, +23 dB budget, Wi-Fi AP compatible) */
+        (void)esp_wifi_set_max_tx_power(80);
+        (void)esp_wifi_config_80211_tx_rate(WIFI_IF_STA, WIFI_PHY_RATE_1M_L);
+    } else {
+        /* +20 dBm max PA + Espressif LR 250 Kbps spread (-105 dBm, 700m+ LOS; falls back to 1M if AP active) */
+        (void)esp_wifi_set_max_tx_power(80);
+        if (!s_wifi_ch_locked) {
+            (void)esp_wifi_set_protocol(WIFI_IF_STA,
+                WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR);
+        }
+        if (esp_wifi_config_80211_tx_rate(WIFI_IF_STA, WIFI_PHY_RATE_LORA_250K) != ESP_OK) {
+            (void)esp_wifi_config_80211_tx_rate(WIFI_IF_STA, WIFI_PHY_RATE_1M_L);
+        }
+    }
+}
+
+uint8_t on_esp32_hal_get_long_range_mode(void) {
+    return s_esp32_lr_mode;
+}
 
 void on_esp32_hal_lock_wifi_channel(bool lock, uint8_t wifi_ch) {
     s_wifi_ch_locked = lock;
@@ -467,5 +494,9 @@ void on_esp32_hal_poll_rx(on_node_t *node) {
         __sync_synchronize();
         s_csi_dirty = false;
         on_node_report_csi(node, s_csi_score, s_csi_bins);
+    }
+    /* v7.3: Auto-sync ESP32 hardware PHY rate & +20 dBm PA whenever cluster beacon switches LR mode */
+    if (node && node->lr_mode != s_esp32_lr_mode) {
+        on_esp32_hal_set_long_range_mode(node->lr_mode);
     }
 }

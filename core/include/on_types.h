@@ -47,10 +47,12 @@ extern "C" {
 
 /* L1 Physical waveform modes */
 typedef enum {
-    ON_PHY_LE_MSK_2M  = 0,  /* Ultra-low-power single-carrier (zero PAPR, 60-120 us air time) */
-    ON_PHY_LE_QPSK_4M = 1,
-    ON_PHY_HS_OFDM_20M = 2, /* High-throughput multi-carrier OFDM (15-25 us air time) */
-    ON_PHY_ESP32_RAW54M = 3 /* Route C: ESP32 802.11 0xD0 Vendor Action @ 54 Mbps */
+    ON_PHY_LE_MSK_2M      = 0, /* Ultra-low-power single-carrier (zero PAPR, 60-120 us air time) */
+    ON_PHY_LE_QPSK_4M     = 1,
+    ON_PHY_HS_OFDM_20M    = 2, /* High-throughput multi-carrier OFDM (15-25 us air time) */
+    ON_PHY_ESP32_RAW54M   = 3, /* Route C: ESP32 802.11 0xD0 Vendor Action @ 54 Mbps */
+    ON_PHY_LR_DSSS_1M     = 4, /* v7.3 Long-Range 1 Mbps DSSS (-98 dBm, ~450-550m LOS) */
+    ON_PHY_LR_SPREAD_250K = 5  /* v7.3 Ultra-Long-Range 250 Kbps DSSS/Coded + CA-Polar (-105 dBm, 700m+ LOS) */
 } on_phy_mode_t;
 
 /* Frame types (4-bit field inside FrameCtrl) */

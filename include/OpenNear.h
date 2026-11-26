@@ -43,6 +43,7 @@ struct OpenNearConfig {
     uint8_t     channel;
     int         act_gpio;
     uint8_t     capabilities;
+    uint8_t     lr_mode;       /* 0 = 4ms/54M Fast, 1 = 20ms/1M 500m, 2 = 20ms/250K 700m+ */
     const char *wifi_ssid;
     const char *wifi_pass;
     const char *cloud_url;
@@ -59,6 +60,7 @@ struct OpenNearConfig {
         c.channel         = 1u;
         c.act_gpio        = 2;
         c.capabilities    = 0x07u; /* Backup + Sub-G + Gateway Hot-Standby Priority */
+        c.lr_mode         = 0u;
         c.wifi_ssid       = "";
         c.wifi_pass       = "";
         c.cloud_url       = "";
@@ -81,6 +83,7 @@ struct OpenNearConfig {
     OpenNearConfig &withChannel(uint8_t ch)                  { channel = ch; return *this; }
     OpenNearConfig &withActGpio(int gpio)                    { act_gpio = gpio; return *this; }
     OpenNearConfig &withLeaderless(bool en)                  { leaderless_boot = en; return *this; }
+    OpenNearConfig &withLongRangeMode(uint8_t mode)          { lr_mode = mode; return *this; }
     OpenNearConfig &withWifi(const char *ssid, const char *pass, const char *url = "") {
         wifi_ssid = ssid ? ssid : "";
         wifi_pass = pass ? pass : "";
@@ -123,6 +126,10 @@ public:
                  uint8_t csi_threshold, const char *tag, const char *cmd_payload);
     bool startShowcaseDemo();
     bool stopShowcaseDemo();
+
+    /* v7.3 700m+ Long-Range PHY Control (0 = 4ms Fast, 1 = 20ms/1M 500m, 2 = 20ms/250K 700m+) */
+    bool    setLongRangeMode(uint8_t mode);
+    uint8_t longRangeMode() const;
 
     /* Inspect live node state safely (thread-safe across Core 0 / Core 1) */
     on_role_t role() const;

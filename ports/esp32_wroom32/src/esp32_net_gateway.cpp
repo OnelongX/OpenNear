@@ -1004,8 +1004,10 @@ static void start_local_http_api(void) {
 
         append_cstr(json, sizeof(json), &pos, "{\"role\":\"");
         append_cstr(json, sizeof(json), &pos, role_s);
-        snprintf(num, sizeof(num), "\",\"id\":\"0x%03X\",\"mac\":\"%s\",\"ble_mac\":\"%s\",\"sf\":%u,\"fw_ver\":\"v7.2\",\"uptime_s\":%u",
-                 (unsigned)short_id, mac_s, bmac_s, (unsigned)sf_seq, (unsigned)(millis() / 1000u));
+        snprintf(num, sizeof(num), "\",\"id\":\"0x%03X\",\"mac\":\"%s\",\"ble_mac\":\"%s\",\"sf\":%u,\"fw_ver\":\"v7.3\",\"lr_mode\":%u,\"uptime_s\":%u",
+                 (unsigned)short_id, mac_s, bmac_s, (unsigned)sf_seq,
+                 (unsigned)(s_node_ref ? s_node_ref->lr_mode : on_esp32_hal_get_long_range_mode()),
+                 (unsigned)(millis() / 1000u));
         append_cstr(json, sizeof(json), &pos, num);
 
         snprintf(num, sizeof(num), ",\"free_heap\":%u,\"min_heap\":%u,\"tx_ok\":%u,\"tx_fail\":%u,\"rx_drops\":%u,\"mdns\":\"",
@@ -1707,6 +1709,21 @@ void on_esp32_net_gw_start(on_node_t *node, on_gw_ctx_t *gw, const char *ble_nam
         load_anchors_from_nvs();
         load_fences_from_nvs();
         load_rules_from_nvs();
+        if (s_prefs.begin("opennear_gw", true)) {
+            uint8_t saved_lr = s_prefs.getUChar("lrmode", 0u);
+            s_prefs.end();
+            if (saved_lr > 0u && saved_lr <= 2u) {
+                if (gw) gw->cfg.lr_mode = saved_lr;
+                if (node) {
+                    on_esp32_node_lock();
+                    on_node_set_long_range_mode(node, saved_lr);
+                    on_esp32_node_unlock();
+                }
+                on_esp32_hal_set_long_range_mode(saved_lr);
+                Serial.printf("[OpenNear PHY] Restored NVS Long-Range mode=%u (20ms superframe, +20dBm)\n",
+                              (unsigned)saved_lr);
+            }
+        }
         if (node) {
             on_node_set_rssi_observer(node, esp32_on_rssi_observed_cb, node);
             on_node_set_ble_beacon_observer(node, esp32_on_ble_beacon_observed_cb, node);
@@ -1849,7 +1866,7 @@ void on_esp32_net_gw_poll(on_node_t *node, on_gw_ctx_t *gw) {
             WiFi.softAPdisconnect(true);
             WiFi.mode(WIFI_STA);
             apply_wifi_coex_ps();
-            esp_wifi_config_80211_tx_rate(WIFI_IF_STA, WIFI_PHY_RATE_54M);
+            on_esp32_hal_set_long_range_mode(on_esp32_hal_get_long_range_mode());
             s_ap_active = false;
             Serial.println("[OpenNear Portal] Fallback SoftAP closed; Web Portal stays live on LAN STA IP");
         }
@@ -2197,6 +2214,29 @@ void on_esp32_net_gw_poll(on_node_t *node, on_gw_ctx_t *gw) {
         }
         Serial.printf("[OpenNear Sec] Cluster AES-128 key %s in NVS & applied live\n",
                       s_netkey_custom ? "CUSTOM saved" : "reset to DEFAULT");
+    }
+
+    if (gw->cfg.lr_mode_updated) {
+        gw->cfg.lr_mode_updated = false;
+        uint8_t lm = (gw->cfg.lr_mode <= 2u) ? gw->cfg.lr_mode : 2u;
+        if (s_prefs.begin("opennear_gw", false)) {
+            s_prefs.putUChar("lrmode", lm);
+            s_prefs.end();
+        }
+        if (node) {
+            on_esp32_node_lock();
+            on_node_set_long_range_mode(node, lm);
+            on_esp32_node_unlock();
+        }
+        on_esp32_hal_set_long_range_mode(lm);
+#ifdef OPENNEAR_ENABLE_WIFI_GW
+        char pbuf[16];
+        int ln = snprintf(pbuf, sizeof(pbuf), "LRMODE:%u", (unsigned)lm);
+        if (ln == 8) sync_prov_to_standby_gw(node, pbuf, static_cast<size_t>(ln));
+#endif
+        Serial.printf("[OpenNear PHY] Long-Range mode -> %u (%s)\n", (unsigned)lm,
+                      lm == 2u ? "20ms 250K LR +20dBm 700m+"
+                               : (lm == 1u ? "20ms 1M DSSS +20dBm 500m" : "4ms 54M Fast"));
     }
 #endif
 

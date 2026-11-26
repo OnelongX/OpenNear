@@ -119,6 +119,8 @@ typedef struct {
     bool     rule_updated;
     uint8_t  loc_demo_mode;    /* v7.2 Showcase demo (LOCDEMO:<0|1|2>) */
     bool     loc_demo_updated;
+    uint8_t  lr_mode;          /* v7.3 700m+ Long-Range PHY mode (LRMODE:<0|1|2>) */
+    bool     lr_mode_updated;
 } on_gw_config_t;
 
 /* Lock-free SPSC ring buffer for cross-core/cross-task decoupling (ON_GW_RING_DEPTH must be power of 2) */

@@ -133,6 +133,10 @@ bool OpenNearClass::begin(const OpenNearConfig &cfg) {
     if (cfg.leaderless_boot) {
         on_node_enable_leaderless_boot(&s_sdk_node, 1500u);
     }
+    if (cfg.lr_mode > 0u) {
+        on_node_set_long_range_mode(&s_sdk_node, cfg.lr_mode);
+        on_esp32_hal_set_long_range_mode(cfg.lr_mode);
+    }
 
     /* ESP32 queued-TX safe defaults */
     s_sdk_node.peer_lease_timeout_sf      = 250u;
@@ -273,6 +277,20 @@ bool OpenNearClass::setRule(uint8_t rule_id, on_loc_rule_trig_t trig, const char
 
 bool OpenNearClass::startShowcaseDemo() { return execControl("LOCDEMO:1"); }
 bool OpenNearClass::stopShowcaseDemo()  { return execControl("LOCDEMO:0"); }
+
+bool OpenNearClass::setLongRangeMode(uint8_t mode) {
+    if (mode > 2u) mode = 2u;
+    char buf[16];
+    snprintf(buf, sizeof(buf), "LRMODE:%u", (unsigned)mode);
+    return execControl(buf);
+}
+
+uint8_t OpenNearClass::longRangeMode() const {
+    on_esp32_node_lock();
+    uint8_t m = s_sdk_node.lr_mode;
+    on_esp32_node_unlock();
+    return m;
+}
 
 on_role_t OpenNearClass::role() const {
     on_esp32_node_lock();

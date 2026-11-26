@@ -43,6 +43,13 @@ void     on_esp32_hal_poll_rx(on_node_t *node);
 void     on_esp32_hal_tx_counts(uint32_t *accepted, uint32_t *failed);
 uint32_t on_esp32_hal_rx_drops(void);
 
+/* v7.3 700m+ Long-Range PHY Control:
+ *   0 = Fast 4ms (54 Mbps OFDM, -75 dBm)
+ *   1 = Long-Range 500m (20ms, +20 dBm, 1 Mbps DSSS -98 dBm, router STA compatible)
+ *   2 = Ultra-Long-Range 700m+ (20ms, +20 dBm, Espressif LR 250K -105 dBm with 1M fallback) */
+void     on_esp32_hal_set_long_range_mode(uint8_t lr_mode);
+uint8_t  on_esp32_hal_get_long_range_mode(void);
+
 #ifdef OPENNEAR_ACT_TRACE
 typedef struct {
     uint32_t seq, act_sf, beacon_sf, rx_hw_us;

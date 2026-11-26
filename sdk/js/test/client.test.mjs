@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import {
+  LongRangeMode,
   OpenNearAuthError,
   OpenNearClient,
   OpenNearError,
@@ -148,6 +149,7 @@ test("OpenNear JS SDK control commands, token rotation, TLS CA & validation", as
     });
     await client.removeRule(1);
     await client.setBleScan(true);
+    await client.setLongRangeMode(LongRangeMode.ULTRA_LONG_RANGE_700M);
     await client.startDemo();
     await client.stepDemo();
     await client.stopDemo();
@@ -170,6 +172,7 @@ test("OpenNear JS SDK control commands, token rotation, TLS CA & validation", as
       "RULE:1|3|desk|45|lights|LED_ON",
       "RULE:1|0",
       "BLESCAN:1",
+      "LRMODE:2",
       "LOCDEMO:1",
       "LOCDEMO:2",
       "LOCDEMO:0",
@@ -197,6 +200,7 @@ test("OpenNear JS SDK control commands, token rotation, TLS CA & validation", as
     assert.throws(() => client.sendCmd(0x1002, "OutOf12BitRange"), RangeError);
     assert.throws(() => client.setNetKey("short"), Error);
     assert.throws(() => client.setWifi("bad|ssid", "pass"), Error);
+    assert.throws(() => client.setLongRangeMode(3), RangeError);
   } finally {
     await gw.close();
   }

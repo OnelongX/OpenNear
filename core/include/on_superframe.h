@@ -46,15 +46,17 @@ uint32_t   on_sf_subg_cra_start_us(const on_sf_cfg_t *cfg);
 uint32_t   on_sf_cra_slot_start_us(const on_sf_cfg_t *cfg, uint8_t micro_slot);
 
 /*
- * v4.0 Multi-Gear Dynamic Superframe Profiles (NearLink SLB/SLE multi-rate scheduling):
- * - ON_SF_GEAR_FAST_500US : 500 us (2,000 Hz) ultra-low-latency 2k/4k esports HID / control
- * - ON_SF_GEAR_AUDIO_1MS  : 1,000 us (1,000 Hz) lossless spatial audio & industrial PLC
- * - ON_SF_GEAR_MESH_4MS   : 4,000 us (250 Hz) full 4-phase multi-hop Sub-G & low-power sensor
+ * v4.0 / v7.3 Multi-Gear Dynamic Superframe Profiles (NearLink SLB/SLE multi-rate scheduling):
+ * - ON_SF_GEAR_FAST_500US     : 500 us (2,000 Hz) ultra-low-latency 2k/4k esports HID / control
+ * - ON_SF_GEAR_AUDIO_1MS      : 1,000 us (1,000 Hz) lossless spatial audio & industrial PLC
+ * - ON_SF_GEAR_MESH_4MS       : 4,000 us (250 Hz) full 4-phase multi-hop Sub-G & low-power sensor
+ * - ON_SF_GEAR_LONGRANGE_20MS : 20,000 us (50 Hz) 700m+ Long-Range 1M DSSS / 250K LR (900 us slots)
  */
 typedef enum {
-    ON_SF_GEAR_FAST_500US = 0,
-    ON_SF_GEAR_AUDIO_1MS  = 1,
-    ON_SF_GEAR_MESH_4MS   = 2
+    ON_SF_GEAR_FAST_500US     = 0,
+    ON_SF_GEAR_AUDIO_1MS      = 1,
+    ON_SF_GEAR_MESH_4MS       = 2,
+    ON_SF_GEAR_LONGRANGE_20MS = 3
 } on_sf_gear_t;
 
 on_err_t   on_sf_cfg_set_gear(on_sf_cfg_t *cfg, on_sf_gear_t gear);

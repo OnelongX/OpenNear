@@ -275,6 +275,19 @@ th{color:var(--mut);font-weight:600;font-size:12px}
     </div>
 
     <div class="card">
+      <div class="row" style="justify-content:space-between">
+        <h2 style="margin:0">700m+ 远距射频档位（Long-Range PHY &amp; +20 dBm PA）</h2>
+        <span class="badge" id="lr-state-badge">当前: 4ms 极速 (54M)</span>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button class="btn sec sm" onclick="setLrMode(0)">标准 4ms 极速 (54M OFDM)</button>
+        <button class="btn sm" onclick="setLrMode(1)">远距 20ms · 500m (1M DSSS +20dBm)</button>
+        <button class="btn ok sm" onclick="setLrMode(2)">超远距 20ms · 700m+ (250K LR +20dBm)</button>
+      </div>
+      <div class="muted" style="margin-top:8px">全网从机与热备网关将通过下一帧 SYNC_MAP 信标自动跟随切换超帧周期与物理层速率（写入 NVS 掉电保持）</div>
+    </div>
+
+    <div class="card">
       <h2>多跳空中固件升级（Authenticated Cluster OTA）</h2>
       <div class="grid">
         <div><label>目标节点（FFF=全网，或指定 Short-ID）</label><input id="o-id" class="mono" value="FFF"></div>
@@ -356,7 +369,9 @@ async function fetchStatus(){
     const r=await fetch('/api/status');
     const s=await r.json();
     $('b-role').textContent=(s.role||'NODE')+' '+s.id;
-    $('b-fw').textContent=s.fw_ver||'v6.6';
+    $('b-fw').textContent=s.fw_ver||'v7.3';
+    const lrNames=['4ms 极速 (54M)','20ms 远距 500m (1M +20dBm)','20ms 超远距 700m+ (250K LR)'];
+    if($('lr-state-badge'))$('lr-state-badge').textContent='当前: '+(lrNames[s.lr_mode||0]||lrNames[0]);
     const pills=[];
     if(s.mac)pills.push('<span class="badge mono">MAC: '+esc(s.mac)+(s.ble_mac?' (BLE '+esc(s.ble_mac)+')':'')+'</span>');
     pills.push(s.wifi_ok
@@ -857,6 +872,13 @@ async function quickPreset(pay){
   $('c-pay').value=pay;
   if(await postCmd('CMD:'+id+'|'+pay)){
     toast('已向 0x'+id.toUpperCase()+' 下发演示模式: '+pay);
+  }
+}
+async function setLrMode(mode){
+  if(await postCmd('LRMODE:'+mode)){
+    const lbl=mode===2?'超远距 700m+ (20ms / 250K LR +20dBm)':(mode===1?'远距 500m (20ms / 1M DSSS +20dBm)':'标准极速 (4ms / 54M OFDM)');
+    toast('全网射频已切换为: '+lbl);
+    fetchStatus();
   }
 }
 async function triggerOta(){

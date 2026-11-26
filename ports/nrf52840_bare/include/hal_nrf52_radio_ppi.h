@@ -37,6 +37,10 @@ void     on_nrf52_radio_isr(on_node_t *node);
 /* Program hardware PPI CH2 to toggle ACT GPIO at exact TIMER0 compare tick (sub-us jitter) */
 void     on_nrf52_arm_hw_act_ns(int64_t target_local_ns);
 
+/* v7.3 700m+ Long-Range PHY Control: switches NRF_RADIO between 2M GFSK (-93 dBm) and
+ * 125 Kbps Coded S=8 FEC (-103 dBm) @ +8 dBm PA (111 dB native link budget -> 700m+ LOS) */
+void     on_nrf52_set_long_range_mode(bool enable);
+
 /*
  * v3.0 Dual-Clock Micro-Amp Deep Sleep Handoff (RTC0 32.768 kHz <-> HFCLK TIMER0 16 MHz):
  * Shuts down RADIO + 64 MHz HFCLK during idle TDMA sleep (>90% of superframe, ~1.5 uA),

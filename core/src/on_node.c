@@ -563,9 +563,11 @@ static void send_sync_map(on_node_t *node, bool is_sub_sync) {
             (on_gw_ring_count(&node->topo_resp_q) > 0u) ||
             (node->mesh_tx_pending) ||
             (node->gw && on_gw_ring_count(&node->gw->downlink_q) > 0u)));
+    uint8_t phy_ind = (node->lr_mode == 2u) ? (uint8_t)ON_PHY_LR_SPREAD_250K
+                    : ((node->lr_mode == 1u) ? (uint8_t)ON_PHY_LR_DSSS_1M : (uint8_t)ON_PHY_LE_MSK_2M);
     sp.flags              = (uint8_t)(((node->afh_countdown & 0x0Fu) << 4) |
                                       (has_dl_service ? 0x08u : 0x00u) |
-                                      (ON_PHY_LE_MSK_2M & 0x07u));
+                                      (phy_ind & 0x07u));
 
     uint8_t pbuf[ON_SYNC_PAYLOAD_WIRE_LEN];
     size_t plen = 0u;
@@ -706,6 +708,26 @@ void on_node_trigger_alert(on_node_t *node, uint8_t alert_code) {
     node->alert_code    = alert_code;
 }
 
+void on_node_set_long_range_mode(on_node_t *node, uint8_t lr_mode) {
+    if (!node) return;
+    if (lr_mode > 2u) lr_mode = 2u;
+    if (node->role == ON_ROLE_G && node->sync_rx_this_sf) {
+        /* Defer gear transition to exact next 0 us superframe boundary so in-flight
+         * D-TDMA/Sub-G slots finish cleanly and Backup_ID never false-triggers failover! */
+        node->pending_lr_mode     = lr_mode;
+        node->has_pending_lr_mode = true;
+    } else {
+        node->lr_mode             = lr_mode;
+        node->has_pending_lr_mode = false;
+        (void)on_sf_cfg_set_gear(&node->sf_cfg,
+                                 (lr_mode > 0u) ? ON_SF_GEAR_LONGRANGE_20MS : ON_SF_GEAR_MESH_4MS);
+    }
+}
+
+uint8_t on_node_get_long_range_mode(const on_node_t *node) {
+    return node ? node->lr_mode : 0u;
+}
+
 /* Handle JOIN_REQ received by Primary G or Sub-G proxy */
 static void handle_join_req(on_node_t *node, const on_mac_hdr_t *hdr,
                             const uint8_t *payload, size_t plen, int64_t rx_local_ns) {
@@ -790,6 +812,13 @@ static void handle_join_req(on_node_t *node, const on_mac_hdr_t *hdr,
             if (tlen > 6 && (size_t)tlen <= ON_GW_MAX_PAYLOAD_LEN) {
                 on_node_send_gw_downlink(node, pe->short_id, ON_GW_MSG_WIFI_PROV,
                                          (const uint8_t *)pbuf, (uint8_t)tlen);
+            }
+        }
+        if (node->lr_mode > 0u) {
+            int llen = snprintf(pbuf, sizeof(pbuf), "LRMODE:%u", (unsigned)node->lr_mode);
+            if (llen == 8) {
+                on_node_send_gw_downlink(node, pe->short_id, ON_GW_MSG_WIFI_PROV,
+                                         (const uint8_t *)pbuf, (uint8_t)llen);
             }
         }
     }
@@ -1091,6 +1120,21 @@ void on_node_on_rx_raw_timed_rssi(on_node_t *node, const uint8_t *frame, size_t 
             }
             node->parent_id         = hdr.src_id;
             node->current_sf_seq    = sp.sf_seq;
+            uint8_t rx_phy = (uint8_t)(sp.flags & 0x07u);
+            if (rx_phy == (uint8_t)ON_PHY_LR_SPREAD_250K) {
+                node->lr_mode = 2u;
+            } else if (rx_phy == (uint8_t)ON_PHY_LR_DSSS_1M || sp.t_sf_us >= 20000u) {
+                node->lr_mode = 1u;
+            } else {
+                node->lr_mode = 0u;
+            }
+            if (sp.t_sf_us != node->sf_cfg.t_sf_us) {
+                on_sf_gear_t gear = (sp.t_sf_us >= 20000u) ? ON_SF_GEAR_LONGRANGE_20MS
+                                  : (sp.t_sf_us == 1000u   ? ON_SF_GEAR_AUDIO_1MS
+                                  : (sp.t_sf_us == 500u    ? ON_SF_GEAR_FAST_500US
+                                                           : ON_SF_GEAR_MESH_4MS));
+                (void)on_sf_cfg_set_gear(&node->sf_cfg, gear);
+            }
             node->sf_cfg.t_sf_us         = sp.t_sf_us;
             node->sf_cfg.sub_g_start_us  = sp.sub_g_win_start_us;
             node->sf_cfg.sub_g_len_us    = sp.sub_g_win_len_us;
@@ -1703,6 +1747,15 @@ void on_node_step(on_node_t *node, int64_t now_local_ns) {
                     uint8_t next_ep = (uint8_t)(node->sec.key_epoch + 1u);
                     on_sec_set_session(&node->sec, node->sec.session_salt, next_ep);
                     emit_event(node, "KEY_EPOCH_ROTATED", next_ep, (int64_t)node->current_sf_seq);
+                }
+
+                /* v7.3 Atomic 4ms <-> 20ms Long-Range gear switch at exact 0 us superframe boundary */
+                if (node->has_pending_lr_mode) {
+                    node->has_pending_lr_mode = false;
+                    node->lr_mode = node->pending_lr_mode;
+                    (void)on_sf_cfg_set_gear(&node->sf_cfg,
+                        (node->lr_mode > 0u) ? ON_SF_GEAR_LONGRANGE_20MS : ON_SF_GEAR_MESH_4MS);
+                    emit_event(node, "LR_MODE_SWITCHED", node->lr_mode, (int64_t)node->current_sf_seq);
                 }
 
                 /* v3.0 Lease Expiry GC & fast automatic Sub-G / Backup_ID re-election */

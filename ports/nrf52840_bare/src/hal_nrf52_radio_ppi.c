@@ -93,6 +93,21 @@ static uint64_t s_timer_high_ticks   = 0u;
 static uint32_t s_timer_last_ticks   = 0u;
 static uint64_t s_sleep_offset_ticks = 0u; /* Accumulated 16 MHz ticks elapsed while TIMER0 was stopped */
 static volatile bool s_tx_active     = false;
+static bool          s_nrf_lr_mode   = false;
+
+void on_nrf52_set_long_range_mode(bool enable) {
+    s_nrf_lr_mode = enable;
+    REG32(RADIO_TASKS_DISABLE) = 1UL;
+    if (enable) {
+        /* nRF52840 Ble_LR125Kbit (mode=5, S=8 Coded FEC, -103 dBm) + max +8 dBm TX power */
+        RADIO_MODE    = 5UL;
+        RADIO_TXPOWER = 8UL;
+    } else {
+        /* Standard 2 Mbps GFSK fast mode (-93 dBm) */
+        RADIO_MODE    = 4UL;
+        RADIO_TXPOWER = 4UL;
+    }
+}
 
 /* Convert 16 MHz TIMER0 ticks (62.5 ns/tick) <-> monotonic 64-bit nanoseconds (bidirectional!) */
 static int64_t ticks16m_to_ns(uint32_t ticks32) {
@@ -336,5 +351,8 @@ void on_nrf52_radio_isr(on_node_t *node) {
         /* Read exact 62.5 ns hardware timestamp captured by PPI CH0 at preamble ADDRESS match! */
         int64_t hw_rx_ns = ticks16m_to_ns(TIMER0_CC0);
         on_node_on_rx_raw(node, &s_dma_pkt[1], s_dma_pkt[0], hw_rx_ns);
+        if (node && ((node->lr_mode > 0u) != s_nrf_lr_mode)) {
+            on_nrf52_set_long_range_mode(node->lr_mode > 0u);
+        }
     }
 }

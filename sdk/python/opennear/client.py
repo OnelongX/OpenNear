@@ -36,6 +36,14 @@ class RuleTrigger(IntEnum):
     CSI_QUIET = 6
 
 
+class LongRangeMode(IntEnum):
+    """OpenNear v7.3 700m+ Long-Range PHY & Superframe Gear modes."""
+
+    FAST_4MS = 0               # 4 ms superframe, 54M OFDM (-75 dBm)
+    LONG_RANGE_500M = 1        # 20 ms superframe, +20 dBm, 1M DSSS (-98 dBm, router compatible)
+    ULTRA_LONG_RANGE_700M = 2  # 20 ms superframe, +20 dBm, 250K LR Spread (-105 dBm, 700m+ LOS)
+
+
 def _format_node_id(target_id: Union[int, str]) -> str:
     if isinstance(target_id, int):
         val = target_id
@@ -356,6 +364,13 @@ class OpenNearClient:
     def set_ble_scan(self, enabled: bool) -> Dict[str, Any]:
         """Enable or disable gateway BLE iBeacon / tag passive scanning."""
         return self.raw_cmd(f"BLESCAN:{1 if enabled else 0}")
+
+    def set_long_range_mode(self, mode: Union[LongRangeMode, int]) -> Dict[str, Any]:
+        """Switch cluster PHY & superframe gear: 0=4ms/54M, 1=20ms/1M 500m, 2=20ms/250K 700m+."""
+        m = int(mode)
+        if m not in (0, 1, 2):
+            raise ValueError(f"mode must be 0, 1, or 2 (see LongRangeMode), got: {mode}")
+        return self.raw_cmd(f"LRMODE:{m}")
 
     def start_demo(self) -> Dict[str, Any]:
         """Start the built-in interactive 2D positioning + geofence + CSI radar demo."""
